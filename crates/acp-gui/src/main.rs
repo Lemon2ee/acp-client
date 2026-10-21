@@ -581,7 +581,11 @@ impl ChatView {
                             .role(Role::Button)
                             .aria_label("New session")
                             .h(px(32.))
-                            .px_3()
+                            // The plus starts 1.5px further into its icon than a title's
+                            // first letter does into its text, so the left padding is
+                            // 1.5px short of the cards' to line the plus up with them.
+                            .pl(px(10.5))
+                            .pr_3()
                             .flex()
                             .items_center()
                             .gap_2()
