@@ -299,14 +299,31 @@ impl ChatView {
     }
 }
 
+const SIDEBAR_WIDTH: f32 = 240.;
+
+impl ChatView {
+    fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .w(px(SIDEBAR_WIDTH))
+            .flex_none()
+            .h_full()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .p_2()
+            .text_color(cx.theme().sidebar_foreground)
+    }
+}
+
 impl Render for ChatView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
-        let (background, foreground, muted, border) = (
+        let (background, foreground, muted, border, sidebar) = (
             theme.background,
             theme.foreground,
             theme.muted_foreground,
             theme.border,
+            theme.sidebar,
         );
         let action = if self.busy {
             Button::new("stop")
@@ -319,12 +336,19 @@ impl Render for ChatView {
                 .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.send(window, cx)))
         };
 
-        div()
-            .size_full()
+        // The chat floats as a card on the sidebar's color, so no divider line is needed.
+        let chat = div()
+            .flex_1()
+            .min_w(px(0.))
+            .my_2()
+            .mr_2()
             .flex()
             .flex_col()
+            .overflow_hidden()
+            .rounded_lg()
+            .border_1()
+            .border_color(border)
             .bg(background)
-            .text_color(foreground)
             .child(
                 div()
                     .px_4()
@@ -354,7 +378,15 @@ impl Render for ChatView {
                     .border_color(border)
                     .child(div().flex_1().child(Textarea::new(&self.input)))
                     .child(action),
-            )
+            );
+
+        div()
+            .size_full()
+            .flex()
+            .bg(sidebar)
+            .text_color(foreground)
+            .child(self.render_sidebar(cx))
+            .child(chat)
     }
 }
 
@@ -376,7 +408,7 @@ fn main() {
             let options = WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
                     None,
-                    size(px(760.), px(820.)),
+                    size(px(1000.), px(820.)),
                     cx,
                 ))),
                 titlebar: Some(TitlebarOptions {
