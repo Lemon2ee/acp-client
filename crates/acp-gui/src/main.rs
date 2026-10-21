@@ -2,6 +2,7 @@
 //! Usage: `acp-gui [claude | codex | "<agent command>"]`.
 
 use std::path::PathBuf;
+use std::rc::Rc;
 
 use acp_core::{
     AcpAgent, Command, Event as AgentEvent, PermissionRequest, Sender, SessionEvent, SessionKey,
@@ -12,7 +13,7 @@ use gpui_kit::component::input::{
     TextareaState,
 };
 use gpui_kit::component::message_scroller::{MessageScroller, MessageScrollerState};
-use gpui_kit::component::{ActiveTheme as _, Icon, IconName, Sizable as _, Theme};
+use gpui_kit::component::{ActiveTheme as _, Icon, IconName, Sizable as _, Theme, ThemeConfig};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
@@ -456,9 +457,9 @@ impl ChatView {
 
 const SIDEBAR_WIDTH: f32 = 240.;
 
-/// On macOS the window has no title bar row: the sidebar starts at the top edge with
-/// the traffic lights in its top row, and the chat card keeps its 8px margin all round.
-/// Elsewhere the system title bar stays.
+/// On macOS the window has no title bar row: the sidebar and the chat both start at the
+/// top edge, with the traffic lights in the sidebar's top row. Elsewhere the system
+/// title bar stays.
 const OWN_TITLE_BAR: bool = cfg!(target_os = "macos");
 
 /// Where the traffic lights go, and the sidebar's top row that holds them, with as much
@@ -520,8 +521,7 @@ fn as_title_bar(strip: Div) -> Div {
 impl ChatView {
     fn render_sidebar(&self, title_bar: bool, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
-        let (foreground, background, hover) =
-            (theme.sidebar_foreground, theme.background, theme.secondary);
+        let (foreground, hover) = (theme.sidebar_foreground, theme.secondary);
         let (accent, accent_foreground) = (theme.sidebar_accent, theme.sidebar_accent_foreground);
         // Newest first; the session on screen gets a filled card.
         let cards =
@@ -590,7 +590,6 @@ impl ChatView {
                             .items_center()
                             .gap_2()
                             .rounded_md()
-                            .bg(background)
                             .text_sm()
                             .cursor_pointer()
                             .hover(|style| style.bg(hover))
@@ -622,10 +621,10 @@ impl Render for ChatView {
         // slides down over the window, so the window keeps none of its own.
         let title_bar = OWN_TITLE_BAR && !window.is_fullscreen();
         let theme = cx.theme();
-        let (background, foreground, border, sidebar) = (
+        let (background, foreground, divider, sidebar) = (
             theme.background,
             theme.foreground,
-            theme.border,
+            theme.sidebar_border,
             theme.sidebar,
         );
         let session = &self.sessions[self.active];
@@ -641,18 +640,15 @@ impl Render for ChatView {
                 .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.send(window, cx)))
         };
 
-        // The chat floats as a card on the sidebar's color, so no divider line is needed.
+        // The chat fills the window right of the sidebar, with a line between the two.
         let chat = div()
             .flex_1()
             .min_w(px(0.))
-            .my_2()
-            .mr_2()
             .flex()
             .flex_col()
             .overflow_hidden()
-            .rounded_lg()
-            .border_1()
-            .border_color(border)
+            .border_l_1()
+            .border_color(divider)
             .bg(background)
             .child(
                 MessageScroller::new(
@@ -706,6 +702,13 @@ fn main() {
         .with_assets(gpui_kit::assets::Assets)
         .run(move |cx: &mut App| {
             gpui_kit::init(cx);
+            // In dark mode the sidebar and the chat are two grays, the sidebar the darker.
+            Theme::update(cx, |theme| {
+                let mut dark = ThemeConfig::clone(&theme.dark_theme);
+                dark.colors.sidebar = Some("#111111".into());
+                dark.colors.background = Some("#151515".into());
+                theme.dark_theme = Rc::new(dark);
+            });
             let lights = TrafficLights::new(traffic_light_size());
             let options = WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
