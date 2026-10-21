@@ -571,7 +571,10 @@ impl ChatView {
 }
 
 impl Render for ChatView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // In full screen the traffic lights go back to the system's title bar, which
+        // slides down over the window, so the window keeps none of its own.
+        let title_bar = OWN_TITLE_BAR && !window.is_fullscreen();
         let theme = cx.theme();
         let (background, foreground, muted, border, sidebar) = (
             theme.background,
@@ -618,7 +621,7 @@ impl Render for ChatView {
                     .text_sm()
                     .text_color(muted)
                     .child(self.status.clone())
-                    .when(OWN_TITLE_BAR, |header| Self::as_title_bar(header, cx)),
+                    .when(title_bar, |header| Self::as_title_bar(header, cx)),
             )
             .child(
                 MessageScroller::new(
@@ -652,7 +655,7 @@ impl Render for ChatView {
             .flex()
             .bg(sidebar)
             .text_color(foreground)
-            .child(self.render_sidebar(OWN_TITLE_BAR, cx))
+            .child(self.render_sidebar(title_bar, cx))
             .child(chat)
     }
 }
