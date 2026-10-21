@@ -27,6 +27,8 @@ enum Row {
     },
     Permission {
         request: PermissionRequest,
+        /// Replaces the option buttons once the request is closed: how it was answered,
+        /// or that it was cancelled.
         decided: Option<String>,
     },
     Notice(String),
@@ -103,13 +105,30 @@ impl Session {
             ),
             SessionEvent::TurnEnded { stop_reason } => {
                 self.busy = false;
+                self.cancel_open_permissions(cx);
                 if stop_reason != "EndTurn" {
                     self.push(Row::Notice(format!("turn ended: {stop_reason}")), cx);
                 }
             }
             SessionEvent::TurnFailed(message) => {
                 self.busy = false;
+                self.cancel_open_permissions(cx);
                 self.push(Row::Error(message), cx);
+            }
+        }
+    }
+
+    /// acp-core stops taking answers to a turn's permission requests once the turn is
+    /// over, so the cards still open show as cancelled instead of offering options.
+    fn cancel_open_permissions(&mut self, cx: &mut App) {
+        for ix in 0..self.rows.len() {
+            if let Row::Permission {
+                decided: decided @ None,
+                ..
+            } = &mut self.rows[ix]
+            {
+                *decided = Some("cancelled".into());
+                self.remeasure(ix, cx);
             }
         }
     }
@@ -121,7 +140,7 @@ impl Session {
                 .and_then(|id| request.options.iter().find(|option| option.id == *id))
                 .map_or_else(|| "rejected".to_string(), |option| option.name.clone());
             request.answer(choice);
-            *decided = Some(label);
+            *decided = Some(format!("answered: {label}"));
             self.remeasure(ix, cx);
         }
     }
@@ -305,6 +324,8 @@ impl ChatView {
                 self.status = "agent disconnected".into();
                 for session in &mut self.sessions {
                     session.busy = true;
+                    // A turn cut off with the connection may never report its end.
+                    session.cancel_open_permissions(cx);
                 }
             }
         }
@@ -376,12 +397,7 @@ impl ChatView {
                     .border_color(border)
                     .child(format!("Permission requested: {}", request.title));
                 let card = match decided {
-                    Some(label) => card.child(
-                        div()
-                            .text_sm()
-                            .text_color(muted)
-                            .child(format!("answered: {label}")),
-                    ),
+                    Some(note) => card.child(div().text_sm().text_color(muted).child(note.clone())),
                     None => card.child(
                         div()
                             .flex()
