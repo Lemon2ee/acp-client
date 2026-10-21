@@ -1,0 +1,8 @@
+[package]
+name = "acp-cli"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+acp-core.workspace = true

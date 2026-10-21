@@ -1,0 +1,11 @@
+[package]
+name = "acp-gui"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+acp-core.workspace = true
+# Pins a gpui-pre snapshot of Zed's gpui and re-exports it with gpui-component.
+# (crates.io `gpui` itself stopped at 0.2.2 in 2025-10.)
+gpui-kit = "0.8"
