@@ -11,8 +11,8 @@ use agent_client_protocol::schema::v1::{
     RequestPermissionResponse, SelectedPermissionOutcome, SessionNotification, SessionUpdate,
 };
 use agent_client_protocol::util::MatchDispatch;
-use agent_client_protocol::{ActiveSession, Agent, Client, ConnectionTo, Dispatch, SessionMessage};
 pub use agent_client_protocol::{AcpAgent, Error};
+use agent_client_protocol::{ActiveSession, Agent, Client, ConnectionTo, Dispatch, SessionMessage};
 use futures::channel::oneshot;
 pub use smol::channel::{Receiver, Sender};
 
@@ -26,14 +26,26 @@ pub enum Command {
 /// What the agent reports, flattened for display.
 pub enum Event {
     /// Initialized and a session exists.
-    Ready { agent: String },
+    Ready {
+        agent: String,
+    },
     AgentText(String),
     AgentThought(String),
-    ToolCall { id: String, title: String, status: String },
-    ToolCallUpdate { id: String, title: Option<String>, status: Option<String> },
+    ToolCall {
+        id: String,
+        title: String,
+        status: String,
+    },
+    ToolCallUpdate {
+        id: String,
+        title: Option<String>,
+        status: Option<String>,
+    },
     Plan(Vec<String>),
     Permission(PermissionRequest),
-    TurnEnded { stop_reason: String },
+    TurnEnded {
+        stop_reason: String,
+    },
     /// The connection failed (missing login, agent crashed, ...).
     Error(String),
     /// No more events will follow.
@@ -95,7 +107,10 @@ pub fn spawn(agent: AcpAgent, cwd: PathBuf) -> AgentHandle {
             emit(&event_tx, Event::Closed);
         })
         .expect("failed to spawn the ACP thread");
-    AgentHandle { commands: command_tx, events: event_rx }
+    AgentHandle {
+        commands: command_tx,
+        events: event_rx,
+    }
 }
 
 async fn run(
@@ -115,7 +130,12 @@ async fn run(
                 .await?;
             auth_methods = init.auth_methods;
             let mut session = cx.build_session(cwd).block_task().start_session().await?;
-            emit(events, Event::Ready { agent: describe(init.agent_info.as_ref()) });
+            emit(
+                events,
+                Event::Ready {
+                    agent: describe(init.agent_info.as_ref()),
+                },
+            );
 
             while let Ok(command) = commands.recv().await {
                 if let Command::Prompt(text) = command {
@@ -143,15 +163,19 @@ async fn run_turn(
     }
     loop {
         // Both arms are cancel-safe: a dropped `recv`/`read_update` loses no message.
-        let next = smol::future::or(
-            async { Next::Update(session.read_update().await) },
-            async { Next::Command(commands.recv().await.ok()) },
-        )
+        let next = smol::future::or(async { Next::Update(session.read_update().await) }, async {
+            Next::Command(commands.recv().await.ok())
+        })
         .await;
         match next {
             Next::Update(update) => match update? {
                 SessionMessage::StopReason(reason) => {
-                    emit(events, Event::TurnEnded { stop_reason: format!("{reason:?}") });
+                    emit(
+                        events,
+                        Event::TurnEnded {
+                            stop_reason: format!("{reason:?}"),
+                        },
+                    );
                     return Ok(true);
                 }
                 SessionMessage::SessionMessage(dispatch) => handle(dispatch, events).await?,
@@ -183,7 +207,9 @@ async fn handle(dispatch: Dispatch, events: &Sender<Event>) -> Result<(), Error>
         .await
         .otherwise(async |message| match message {
             // We advertise no fs/terminal capabilities, so anything else is unexpected.
-            Dispatch::Request(_, responder) => responder.respond_with_error(Error::method_not_found()),
+            Dispatch::Request(_, responder) => {
+                responder.respond_with_error(Error::method_not_found())
+            }
             _ => Ok(()),
         })
         .await
@@ -206,12 +232,30 @@ async fn ask_permission(
             ),
         })
         .collect();
-    let title = request.tool_call.fields.title.clone().unwrap_or_else(|| "tool call".into());
-    emit(events, Event::Permission(PermissionRequest { title, options, respond: Some(respond) }));
+    let title = request
+        .tool_call
+        .fields
+        .title
+        .clone()
+        .unwrap_or_else(|| "tool call".into());
+    emit(
+        events,
+        Event::Permission(PermissionRequest {
+            title,
+            options,
+            respond: Some(respond),
+        }),
+    );
 
     let chosen = choice.await.ok().flatten();
-    match request.options.into_iter().find(|option| Some(option.option_id.0.as_ref()) == chosen.as_deref()) {
-        Some(option) => RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(option.option_id)),
+    match request
+        .options
+        .into_iter()
+        .find(|option| Some(option.option_id.0.as_ref()) == chosen.as_deref())
+    {
+        Some(option) => {
+            RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(option.option_id))
+        }
         None => RequestPermissionOutcome::Cancelled,
     }
 }
@@ -251,7 +295,11 @@ fn text_of(block: &ContentBlock) -> String {
 
 fn describe(info: Option<&Implementation>) -> String {
     match info {
-        Some(info) => format!("{} {}", info.title.as_deref().unwrap_or(&info.name), info.version),
+        Some(info) => format!(
+            "{} {}",
+            info.title.as_deref().unwrap_or(&info.name),
+            info.version
+        ),
         None => "unknown agent".into(),
     }
 }

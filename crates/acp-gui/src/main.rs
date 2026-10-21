@@ -14,8 +14,15 @@ enum Row {
     User(String),
     Agent(String),
     Thought(String),
-    Tool { id: String, title: String, status: String },
-    Permission { request: PermissionRequest, decided: Option<String> },
+    Tool {
+        id: String,
+        title: String,
+        status: String,
+    },
+    Permission {
+        request: PermissionRequest,
+        decided: Option<String>,
+    },
     Notice(String),
     Error(String),
 }
@@ -102,24 +109,41 @@ impl ChatView {
                 self.push(Row::Tool { id, title, status }, cx)
             }
             AgentEvent::ToolCallUpdate { id, title, status } => {
-                let found = self.rows.iter_mut().enumerate().rev().find_map(|(ix, row)| match row {
-                    Row::Tool { id: row_id, title: row_title, status: row_status } if *row_id == id => {
-                        if let Some(title) = title.clone() {
-                            *row_title = title;
-                        }
-                        if let Some(status) = status.clone() {
-                            *row_status = status;
-                        }
-                        Some(ix)
-                    }
-                    _ => None,
-                });
+                let found =
+                    self.rows
+                        .iter_mut()
+                        .enumerate()
+                        .rev()
+                        .find_map(|(ix, row)| match row {
+                            Row::Tool {
+                                id: row_id,
+                                title: row_title,
+                                status: row_status,
+                            } if *row_id == id => {
+                                if let Some(title) = title.clone() {
+                                    *row_title = title;
+                                }
+                                if let Some(status) = status.clone() {
+                                    *row_status = status;
+                                }
+                                Some(ix)
+                            }
+                            _ => None,
+                        });
                 if let Some(ix) = found {
                     self.remeasure(ix, cx);
                 }
             }
-            AgentEvent::Plan(entries) => self.push(Row::Notice(format!("plan\n{}", entries.join("\n"))), cx),
-            AgentEvent::Permission(request) => self.push(Row::Permission { request, decided: None }, cx),
+            AgentEvent::Plan(entries) => {
+                self.push(Row::Notice(format!("plan\n{}", entries.join("\n"))), cx)
+            }
+            AgentEvent::Permission(request) => self.push(
+                Row::Permission {
+                    request,
+                    decided: None,
+                },
+                cx,
+            ),
             AgentEvent::TurnEnded { stop_reason } => {
                 self.busy = false;
                 if stop_reason != "EndTurn" {
@@ -156,7 +180,11 @@ impl ChatView {
             // Agents often open a block with a bare "\n\n" chunk; don't start a row with it.
             _ if text.trim().is_empty() => return,
             _ => {
-                let row = if thought { Row::Thought(text.into()) } else { Row::Agent(text.into()) };
+                let row = if thought {
+                    Row::Thought(text.into())
+                } else {
+                    Row::Agent(text.into())
+                };
                 return self.push(row, cx);
             }
         }
@@ -176,7 +204,12 @@ impl ChatView {
         });
     }
 
-    fn render_row(&mut self, ix: usize, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    fn render_row(
+        &mut self,
+        ix: usize,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let theme = cx.theme();
         let (muted, border, bubble) = (theme.muted_foreground, theme.border, theme.secondary);
         let row = div().w_full().px_4().py_1p5();
@@ -194,7 +227,9 @@ impl ChatView {
                         .child(SharedString::from(text.clone())),
                 )
                 .into_any_element(),
-            Row::Agent(text) => row.child(SharedString::from(text.trim().to_string())).into_any_element(),
+            Row::Agent(text) => row
+                .child(SharedString::from(text.trim().to_string()))
+                .into_any_element(),
             Row::Thought(text) => row
                 .text_sm()
                 .italic()
@@ -219,18 +254,34 @@ impl ChatView {
                     .border_color(border)
                     .child(format!("Permission requested: {}", request.title));
                 let card = match decided {
-                    Some(label) => card.child(div().text_sm().text_color(muted).child(format!("answered: {label}"))),
-                    None => card.child(div().flex().gap_2().children(
-                        request.options.iter().enumerate().map(|(option_ix, option)| {
-                            let id = option.id.clone();
-                            let button = Button::new(ElementId::Name(format!("permission-{ix}-{option_ix}").into()))
-                                .label(option.name.clone())
-                                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                                    this.answer(ix, Some(id.clone()), cx)
-                                }));
-                            if option.allow { button.primary() } else { button }
-                        }),
-                    )),
+                    Some(label) => card.child(
+                        div()
+                            .text_sm()
+                            .text_color(muted)
+                            .child(format!("answered: {label}")),
+                    ),
+                    None => card.child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .children(request.options.iter().enumerate().map(
+                                |(option_ix, option)| {
+                                    let id = option.id.clone();
+                                    let button = Button::new(ElementId::Name(
+                                        format!("permission-{ix}-{option_ix}").into(),
+                                    ))
+                                    .label(option.name.clone())
+                                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                        this.answer(ix, Some(id.clone()), cx)
+                                    }));
+                                    if option.allow {
+                                        button.primary()
+                                    } else {
+                                        button
+                                    }
+                                },
+                            )),
+                    ),
                 };
                 card.into_any_element()
             }
@@ -251,8 +302,12 @@ impl ChatView {
 impl Render for ChatView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
-        let (background, foreground, muted, border) =
-            (theme.background, theme.foreground, theme.muted_foreground, theme.border);
+        let (background, foreground, muted, border) = (
+            theme.background,
+            theme.foreground,
+            theme.muted_foreground,
+            theme.border,
+        );
         let action = if self.busy {
             Button::new("stop")
                 .label("Stop")

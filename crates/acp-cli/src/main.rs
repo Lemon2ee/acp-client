@@ -28,7 +28,11 @@ fn main() -> ExitCode {
         if line.trim().is_empty() {
             continue;
         }
-        if handle.commands.send_blocking(Command::Prompt(line)).is_err() {
+        if handle
+            .commands
+            .send_blocking(Command::Prompt(line))
+            .is_err()
+        {
             break;
         }
         alive = pump(&handle.events, &mut lines);
@@ -47,14 +51,15 @@ fn main() -> ExitCode {
             _ => {}
         }
     }
-    if failed { ExitCode::FAILURE } else { ExitCode::SUCCESS }
+    if failed {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
 }
 
 /// Prints events until the agent is ready for the next prompt. `false` means it is gone.
-fn pump(
-    events: &Receiver<Event>,
-    lines: &mut impl Iterator<Item = io::Result<String>>,
-) -> bool {
+fn pump(events: &Receiver<Event>, lines: &mut impl Iterator<Item = io::Result<String>>) -> bool {
     let mut tool_titles = HashMap::new();
     while let Ok(event) = events.recv_blocking() {
         match event {
