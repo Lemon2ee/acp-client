@@ -526,12 +526,8 @@ fn as_title_bar(strip: Div) -> Div {
 impl ChatView {
     fn render_sidebar(&self, title_bar: bool, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
-        let (foreground, border, background, hover) = (
-            theme.sidebar_foreground,
-            theme.border,
-            theme.background,
-            theme.secondary,
-        );
+        let (foreground, background, hover) =
+            (theme.sidebar_foreground, theme.background, theme.secondary);
         let (accent, accent_foreground) = (theme.sidebar_accent, theme.sidebar_accent_foreground);
         // Newest first; the session on screen gets a filled card.
         let cards =
@@ -596,8 +592,6 @@ impl ChatView {
                             .items_center()
                             .gap_2()
                             .rounded_md()
-                            .border_1()
-                            .border_color(border)
                             .bg(background)
                             .text_sm()
                             .cursor_pointer()
