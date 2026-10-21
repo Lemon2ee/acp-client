@@ -700,6 +700,19 @@ impl Render for ChatView {
     }
 }
 
+/// `config` with the sidebar and the chat in two grays. In both modes the sidebar is the
+/// darker one, by about the same small step in lightness.
+fn with_panel_colors(
+    config: &ThemeConfig,
+    sidebar: &'static str,
+    chat: &'static str,
+) -> Rc<ThemeConfig> {
+    let mut config = config.clone();
+    config.colors.sidebar = Some(sidebar.into());
+    config.colors.background = Some(chat.into());
+    Rc::new(config)
+}
+
 fn main() {
     let name = std::env::args().nth(1).unwrap_or_else(|| "claude".into());
     let agent = match acp_core::agent_for(&name) {
@@ -715,12 +728,9 @@ fn main() {
         .with_assets(gpui_kit::assets::Assets)
         .run(move |cx: &mut App| {
             gpui_kit::init(cx);
-            // In dark mode the sidebar and the chat are two grays, the sidebar the darker.
             Theme::update(cx, |theme| {
-                let mut dark = ThemeConfig::clone(&theme.dark_theme);
-                dark.colors.sidebar = Some("#111111".into());
-                dark.colors.background = Some("#151515".into());
-                theme.dark_theme = Rc::new(dark);
+                theme.light_theme = with_panel_colors(&theme.light_theme, "#f7f7f7", "#fcfcfc");
+                theme.dark_theme = with_panel_colors(&theme.dark_theme, "#111111", "#151515");
             });
             let lights = TrafficLights::new(traffic_light_size());
             let options = WindowOptions {
