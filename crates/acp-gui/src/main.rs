@@ -119,7 +119,7 @@ impl Session {
     }
 
     /// acp-core stops taking answers to a turn's permission requests once the turn is
-    /// over, so the cards still open show as cancelled instead of offering options.
+    /// stopped or over, so the cards still open show as cancelled instead of offering options.
     fn cancel_open_permissions(&mut self, cx: &mut App) {
         for ix in 0..self.rows.len() {
             if let Row::Permission {
@@ -293,8 +293,10 @@ impl ChatView {
     }
 
     fn stop(&mut self, cx: &mut Context<Self>) {
-        let key = self.sessions[self.active].key;
-        let _ = self.commands.try_send(Command::Cancel(key));
+        let session = &mut self.sessions[self.active];
+        let _ = self.commands.try_send(Command::Cancel(session.key));
+        // Stopping makes acp-core answer the turn's open permission requests as cancelled.
+        session.cancel_open_permissions(cx);
         cx.notify();
     }
 
