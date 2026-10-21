@@ -172,6 +172,7 @@ struct ChatView {
     window_move_pending: bool,
     _events: Task<()>,
     _input_events: Subscription,
+    _window_activation: Subscription,
 }
 
 impl ChatView {
@@ -190,6 +191,13 @@ impl ChatView {
         window.on_window_should_close(cx, |_, cx| {
             cx.quit();
             true
+        });
+        // The system can take a press away without a mouse-up, e.g. when another app
+        // comes to the front; a file dragged in later must not move the window.
+        let window_activation = cx.observe_window_activation(window, |this, window, _| {
+            if !window.is_window_active() {
+                this.window_move_pending = false;
+            }
         });
 
         let agent = acp_core::spawn(agent, cwd);
@@ -212,6 +220,7 @@ impl ChatView {
             window_move_pending: false,
             _events: events_task,
             _input_events: input_events,
+            _window_activation: window_activation,
         };
         view.new_session(window, cx);
         view
@@ -422,8 +431,9 @@ const SIDEBAR_WIDTH: f32 = 240.;
 /// The chat's status header, including the line under it.
 const HEADER_HEIGHT: f32 = 26.;
 
-/// On macOS the window has no title bar row: the content reaches the top edge and
-/// the traffic lights sit at the top of the sidebar. Elsewhere the system title bar stays.
+/// On macOS the window has no title bar row: the sidebar starts at the top edge with
+/// the traffic lights in its top row, and the chat card keeps its 8px margin all round.
+/// Elsewhere the system title bar stays.
 const OWN_TITLE_BAR: bool = cfg!(target_os = "macos");
 /// The traffic lights' diameter on macOS 27.
 const TRAFFIC_LIGHT_SIZE: f32 = 14.;
@@ -445,6 +455,11 @@ impl ChatView {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _: &MouseDownEvent, _, _| this.window_move_pending = true),
+            )
+            // Any other press starts a new gesture, which ends an earlier press that never
+            // got its mouse-up. This runs before the other strip's mouse-down sets the flag.
+            .on_mouse_down_out(
+                cx.listener(|this, _: &MouseDownEvent, _, _| this.window_move_pending = false),
             )
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, _| {
                 if this.window_move_pending && event.dragging() {
