@@ -419,18 +419,22 @@ impl ChatView {
 }
 
 const SIDEBAR_WIDTH: f32 = 240.;
-/// The chat's status header.
-const HEADER_HEIGHT: f32 = 40.;
+/// The chat's status header, including the line under it.
+const HEADER_HEIGHT: f32 = 26.;
 
 /// On macOS the window has no title bar row: the content reaches the top edge and
 /// the traffic lights sit at the top of the sidebar. Elsewhere the system title bar stays.
 const OWN_TITLE_BAR: bool = cfg!(target_os = "macos");
-/// The sidebar's top row, which holds the traffic lights. It ends at the line under
-/// the chat's header, which starts below the chat card's 8px top margin.
-const TITLE_BAR_HEIGHT: f32 = 8. + HEADER_HEIGHT;
-/// The close button's top-left corner. With macOS 27's 16pt buttons this centers the
-/// traffic lights on the header's text, and the close button over the New session icon.
-const TRAFFIC_LIGHTS: Point<Pixels> = point(px(21.), px(21.));
+/// The traffic lights' diameter on macOS 27.
+const TRAFFIC_LIGHT_SIZE: f32 = 14.;
+/// Space between the traffic lights and the window's top and left edges, set so the
+/// lights are centered on the header's text (below the chat card's 8px margin and border).
+const TRAFFIC_LIGHT_INSET: f32 = 9. + (HEADER_HEIGHT - 1.) / 2. - TRAFFIC_LIGHT_SIZE / 2.;
+/// Where the first traffic light starts.
+const TRAFFIC_LIGHTS: Point<Pixels> = point(px(TRAFFIC_LIGHT_INSET), px(TRAFFIC_LIGHT_INSET));
+/// The sidebar's top row, which holds the traffic lights with as much space below
+/// them as above.
+const TITLE_BAR_HEIGHT: f32 = 2. * TRAFFIC_LIGHT_INSET + TRAFFIC_LIGHT_SIZE;
 
 impl ChatView {
     /// Makes `strip` stand in for the title bar the window doesn't have: dragging it
