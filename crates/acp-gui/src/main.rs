@@ -437,6 +437,8 @@ impl ChatView {
                                         format!("permission-{ix}-{option_ix}").into(),
                                     ))
                                     .label(option.name.clone())
+                                    // A pointing hand, as over the send button.
+                                    .cursor_pointer()
                                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                                         this.answer(key, ix, Some(id.clone()), cx)
                                     }));
@@ -754,7 +756,9 @@ impl Render for ChatView {
                                 .align(InputGroupAddonAlignment::InlineEnd)
                                 // Keep the button in the bottom corner as the box grows.
                                 .self_end()
-                                .child(action.primary().small().rounded_full()),
+                                // A pointing hand over it, where the component's buttons
+                                // keep the arrow.
+                                .child(action.primary().small().rounded_full().cursor_pointer()),
                         ),
                 ),
             );
