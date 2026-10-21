@@ -7,6 +7,7 @@ use std::rc::Rc;
 use acp_core::{
     AcpAgent, Command, Event as AgentEvent, PermissionRequest, Sender, SessionEvent, SessionKey,
 };
+use gpui_kit::base::{Transition, transition};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{
     InputEvent, InputGroup, InputGroupAddon, InputGroupAddonAlignment, InputGroupButton, Textarea,
@@ -193,8 +194,12 @@ struct ChatView {
     next_key: u64,
     input: Entity<TextareaState>,
     commands: Sender<Command>,
-    /// The sidebar's top row, which holds the traffic lights on macOS.
+    /// The window's top row, which holds the traffic lights on macOS and the sidebar
+    /// button: across the sidebar, or across the chat while the sidebar is hidden.
     title_bar_height: Pixels,
+    /// Where the traffic lights end, from the window's left edge.
+    traffic_lights_end: Pixels,
+    sidebar_open: bool,
     _events: Task<()>,
     _input_events: Subscription,
 }
@@ -204,6 +209,7 @@ impl ChatView {
         agent: AcpAgent,
         cwd: PathBuf,
         title_bar_height: Pixels,
+        traffic_lights_end: Pixels,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -240,6 +246,8 @@ impl ChatView {
             input,
             commands: agent.commands,
             title_bar_height,
+            traffic_lights_end,
+            sidebar_open: true,
             _events: events_task,
             _input_events: input_events,
         };
@@ -459,17 +467,22 @@ impl ChatView {
 
 const SIDEBAR_WIDTH: f32 = 240.;
 
+/// The sidebar button's icon: a window outline with a short bar near its right side.
+const SIDEBAR_ICON: &[u8] = include_bytes!("../assets/sidebar.svg");
+
 /// On macOS the window has no title bar row: the sidebar and the chat both start at the
-/// top edge, with the traffic lights in the sidebar's top row. Elsewhere the system
+/// top edge, with the traffic lights in the window's top row. Elsewhere the system
 /// title bar stays.
 const OWN_TITLE_BAR: bool = cfg!(target_os = "macos");
 
-/// Where the traffic lights go, and the sidebar's top row that holds them, with as much
-/// space to the lights' left and below them as above.
+/// Where the traffic lights go, and the top row that holds them, with as much space to
+/// the lights' left and below them as above.
 #[derive(Clone, Copy)]
 struct TrafficLights {
     /// The close button's top-left corner.
     origin: Point<Pixels>,
+    /// Each light's width and height.
+    size: Pixels,
     row_height: Pixels,
 }
 
@@ -479,8 +492,36 @@ impl TrafficLights {
         let inset = 21.5 - size / 2.;
         Self {
             origin: point(px(inset), px(inset)),
+            size: px(size),
             row_height: px(2. * inset + size),
         }
+    }
+
+    /// Where the zoom button ends, from the window's left edge. gpui puts the close
+    /// button at `origin` and keeps AppKit's spacing for the other two, which leaves
+    /// 9pt between lights on macOS 27 (the fallback).
+    fn end(&self, window: &Window) -> Pixels {
+        #[cfg(target_os = "macos")]
+        {
+            use objc2_app_kit::{NSView, NSWindowButton};
+            use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+            // `Window::window_handle` is gpui's own handle, not the platform's.
+            if let Ok(handle) = HasWindowHandle::window_handle(window)
+                && let RawWindowHandle::AppKit(handle) = handle.as_raw()
+                // SAFETY: the handle's view is the window's content view, which lives as
+                // long as the window.
+                && let Some(ns_window) = unsafe { handle.ns_view.cast::<NSView>().as_ref() }.window()
+                && let Some(close) = ns_window.standardWindowButton(NSWindowButton::CloseButton)
+                && let Some(zoom) = ns_window.standardWindowButton(NSWindowButton::ZoomButton)
+            {
+                let (close, zoom) = (close.frame(), zoom.frame());
+                return self.origin.x
+                    + px((zoom.origin.x + zoom.size.width - close.origin.x) as f32);
+            }
+        }
+        let _ = window;
+        self.origin.x + self.size * 3. + px(2. * 9.)
     }
 }
 
@@ -521,9 +562,13 @@ fn as_title_bar(strip: Div) -> Div {
 }
 
 impl ChatView {
-    fn render_sidebar(&self, title_bar: bool, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_sidebar(&self, title_bar: bool, cx: &mut Context<Self>) -> Div {
         let theme = cx.theme();
-        let (foreground, hover) = (theme.sidebar_foreground, theme.secondary);
+        let (foreground, hover, divider) = (
+            theme.sidebar_foreground,
+            theme.secondary,
+            theme.sidebar_border,
+        );
         let (accent, accent_foreground) = (theme.sidebar_accent, theme.sidebar_accent_foreground);
         // Newest first; the session on screen gets a filled card.
         let cards =
@@ -562,11 +607,18 @@ impl ChatView {
             .h_full()
             .flex()
             .flex_col()
+            // The line between the sidebar and the chat, which goes with the sidebar.
+            .border_r_1()
+            .border_color(divider)
             .text_color(foreground)
-            .when(title_bar, |sidebar| {
-                // Nothing goes here: the traffic lights are drawn over this row.
-                sidebar.child(as_title_bar(div().flex_none().h(self.title_bar_height)))
-            })
+            .child(
+                // Nothing goes here: the traffic lights and the sidebar button are drawn
+                // over this row.
+                div()
+                    .flex_none()
+                    .h(self.title_bar_height)
+                    .when(title_bar, as_title_bar),
+            )
             .child(
                 div()
                     .flex_1()
@@ -574,8 +626,8 @@ impl ChatView {
                     .flex()
                     .flex_col()
                     .gap_1()
-                    .p_2()
-                    .when(title_bar, |content| content.pt_0())
+                    .px_2()
+                    .pb_2()
                     .child(
                         // A plain div: the component Button always centers its label.
                         div()
@@ -623,13 +675,24 @@ impl Render for ChatView {
         // slides down over the window, so the window keeps none of its own.
         let title_bar = OWN_TITLE_BAR && !window.is_fullscreen();
         let theme = cx.theme();
-        let (background, foreground, divider, sidebar, input_border) = (
+        let (background, foreground, sidebar, input_border) = (
             theme.background,
             theme.foreground,
-            theme.sidebar_border,
             theme.sidebar,
             theme.input,
         );
+        let (muted, hover) = (theme.muted_foreground, theme.secondary);
+        let motion = theme.motion_tokens();
+        let slide = Transition::new(motion.duration_slow).easing(motion.easing_move.clone());
+        // 0 while the sidebar is shown and 1 while it is hidden, in between as it slides.
+        let hidden = transition(
+            "sidebar-hidden",
+            if self.sidebar_open { 0. } else { 1. },
+            slide,
+            window,
+            cx,
+        );
+        let sidebar_width = SIDEBAR_WIDTH * (1. - hidden);
         let session = &self.sessions[self.active];
         let action = if session.busy {
             InputGroupButton::new("stop")
@@ -643,16 +706,22 @@ impl Render for ChatView {
                 .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.send(window, cx)))
         };
 
-        // The chat fills the window right of the sidebar, with a line between the two.
+        // The chat fills the window right of the sidebar.
         let chat = div()
             .flex_1()
             .min_w(px(0.))
             .flex()
             .flex_col()
             .overflow_hidden()
-            .border_l_1()
-            .border_color(divider)
             .bg(background)
+            .child(
+                // Opens up as the sidebar goes, for the traffic lights and the sidebar
+                // button to sit in.
+                div()
+                    .flex_none()
+                    .h(self.title_bar_height * hidden)
+                    .when(title_bar, as_title_bar),
+            )
             .child(
                 MessageScroller::new(
                     // Keyed per session, so a switch never reuses another session's list state.
@@ -690,13 +759,68 @@ impl Render for ChatView {
                 ),
             );
 
+        // Stays beside the traffic lights, over the sidebar or the chat, while the sidebar
+        // slides.
+        let toggle = div()
+            .id("toggle-sidebar")
+            .role(Role::Button)
+            .aria_label(if self.sidebar_open {
+                "Hide sidebar"
+            } else {
+                "Show sidebar"
+            })
+            .absolute()
+            .top((self.title_bar_height - px(28.)) / 2.)
+            // 6px past the zoom button leaves about 12px before the icon's outline.
+            // Without the traffic lights, the outline lines up with the sidebar's rows.
+            .left(if title_bar {
+                self.traffic_lights_end + px(6.)
+            } else {
+                px(14.25)
+            })
+            .size(px(28.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_md()
+            .cursor_pointer()
+            .hover(|style| style.bg(hover))
+            // Keeps presses from the title bar strip underneath, which would move the
+            // window instead.
+            .occlude()
+            // A little larger than the traffic lights, since an outline looks smaller
+            // than a filled circle of the same size.
+            .child(
+                Icon::empty()
+                    .data(SIDEBAR_ICON)
+                    .size(px(18.))
+                    .text_color(muted),
+            )
+            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                this.sidebar_open = !this.sidebar_open;
+                cx.notify();
+            }));
+
         div()
             .size_full()
+            .relative()
             .flex()
             .bg(sidebar)
             .text_color(foreground)
-            .child(self.render_sidebar(title_bar, cx))
+            .child(
+                // The sidebar keeps its width and slides out to the left as this narrows.
+                div()
+                    .flex_none()
+                    .h_full()
+                    .w(px(sidebar_width))
+                    .overflow_hidden()
+                    .child(
+                        self.render_sidebar(title_bar, cx)
+                            .ml(px(sidebar_width - SIDEBAR_WIDTH)),
+                    ),
+            )
             .child(chat)
+            .child(toggle)
     }
 }
 
@@ -758,7 +882,8 @@ fn main() {
                         Theme::sync_system_appearance(Some(window), cx)
                     })
                     .detach();
-                cx.new(|cx| ChatView::new(agent, cwd, lights.row_height, window, cx))
+                let lights_end = lights.end(window);
+                cx.new(|cx| ChatView::new(agent, cwd, lights.row_height, lights_end, window, cx))
             })
             .expect("failed to open the window");
             cx.activate(true);
