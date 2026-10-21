@@ -9,3 +9,16 @@ acp-core.workspace = true
 # Pins a gpui-pre snapshot of Zed's gpui and re-exports it with gpui-component.
 # (crates.io `gpui` itself stopped at 0.2.2 in 2025-10.)
 gpui-kit = "0.8"
+
+# Reads the traffic lights' size from AppKit. gpui's macOS layer already builds both
+# crates at these versions, with these features.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3.2", default-features = false, features = [
+    "NSButton",
+    "NSControl",
+    "NSResponder",
+    "NSView",
+    "NSWindow",
+    "objc2-core-foundation",
+] }

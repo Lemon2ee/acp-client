@@ -168,12 +168,20 @@ struct ChatView {
     input: Entity<TextareaState>,
     commands: Sender<Command>,
     status: SharedString,
+    /// The sidebar's top row, which holds the traffic lights on macOS.
+    title_bar_height: Pixels,
     _events: Task<()>,
     _input_events: Subscription,
 }
 
 impl ChatView {
-    fn new(agent: AcpAgent, cwd: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    fn new(
+        agent: AcpAgent,
+        cwd: PathBuf,
+        title_bar_height: Pixels,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let input = cx.new(|cx| {
             TextareaState::new(window, cx)
                 .placeholder("Message the agent (Enter to send, Shift+Enter for a new line)")
@@ -207,6 +215,7 @@ impl ChatView {
             input,
             commands: agent.commands,
             status: "starting the agent...".into(),
+            title_bar_height,
             _events: events_task,
             _input_events: input_events,
         };
@@ -423,16 +432,47 @@ const HEADER_HEIGHT: f32 = 26.;
 /// the traffic lights in its top row, and the chat card keeps its 8px margin all round.
 /// Elsewhere the system title bar stays.
 const OWN_TITLE_BAR: bool = cfg!(target_os = "macos");
-/// The traffic lights' diameter on macOS 27.
-const TRAFFIC_LIGHT_SIZE: f32 = 14.;
-/// Space between the traffic lights and the window's top and left edges, set so the
-/// lights are centered on the header's text (below the chat card's 8px margin and border).
-const TRAFFIC_LIGHT_INSET: f32 = 9. + (HEADER_HEIGHT - 1.) / 2. - TRAFFIC_LIGHT_SIZE / 2.;
-/// Where the first traffic light starts.
-const TRAFFIC_LIGHTS: Point<Pixels> = point(px(TRAFFIC_LIGHT_INSET), px(TRAFFIC_LIGHT_INSET));
-/// The sidebar's top row, which holds the traffic lights with as much space below
-/// them as above.
-const TITLE_BAR_HEIGHT: f32 = 2. * TRAFFIC_LIGHT_INSET + TRAFFIC_LIGHT_SIZE;
+
+/// Where the traffic lights go, and the sidebar's top row that holds them. The lights
+/// are centered on the header's text, with as much space to their left and below them
+/// as above.
+#[derive(Clone, Copy)]
+struct TrafficLights {
+    /// The close button's top-left corner.
+    origin: Point<Pixels>,
+    row_height: Pixels,
+}
+
+impl TrafficLights {
+    fn new(size: f32) -> Self {
+        // The header's text is centered below the chat card's 8px margin and 1px border.
+        let inset = 9. + (HEADER_HEIGHT - 1.) / 2. - size / 2.;
+        Self {
+            origin: point(px(inset), px(inset)),
+            row_height: px(2. * inset + size),
+        }
+    }
+}
+
+/// The traffic lights' size as AppKit lays them out: 14pt on macOS 27, which is also
+/// the fallback.
+fn traffic_light_size() -> f32 {
+    #[cfg(target_os = "macos")]
+    {
+        use objc2_app_kit::{NSWindow, NSWindowButton, NSWindowStyleMask};
+        let style = NSWindowStyleMask::Titled
+            | NSWindowStyleMask::Closable
+            | NSWindowStyleMask::Miniaturizable
+            | NSWindowStyleMask::Resizable;
+        if let Some(mtm) = objc2::MainThreadMarker::new()
+            && let Some(button) =
+                NSWindow::standardWindowButton_forStyleMask(NSWindowButton::CloseButton, style, mtm)
+        {
+            return button.frame().size.height as f32;
+        }
+    }
+    14.
+}
 
 /// Makes `strip` stand in for the title bar the window doesn't have: dragging it moves
 /// the window, and a double-click does what the system setting for title bars says.
@@ -500,7 +540,7 @@ impl ChatView {
             .text_color(foreground)
             .when(title_bar, |sidebar| {
                 // Nothing goes here: the traffic lights are drawn over this row.
-                sidebar.child(as_title_bar(div().flex_none().h(px(TITLE_BAR_HEIGHT))))
+                sidebar.child(as_title_bar(div().flex_none().h(self.title_bar_height)))
             })
             .child(
                 div()
@@ -655,6 +695,7 @@ fn main() {
         .with_assets(gpui_kit::assets::Assets)
         .run(move |cx: &mut App| {
             gpui_kit::init(cx);
+            let lights = TrafficLights::new(traffic_light_size());
             let options = WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
                     None,
@@ -664,7 +705,7 @@ fn main() {
                 titlebar: Some(TitlebarOptions {
                     title: Some(format!("ACP client: {name}").into()),
                     appears_transparent: OWN_TITLE_BAR,
-                    traffic_light_position: OWN_TITLE_BAR.then_some(TRAFFIC_LIGHTS),
+                    traffic_light_position: OWN_TITLE_BAR.then_some(lights.origin),
                 }),
                 // The app moves the window itself (see `as_title_bar`). Otherwise AppKit
                 // does it from the strip around the traffic lights, and on macOS 27 it
@@ -673,7 +714,7 @@ fn main() {
                 ..Default::default()
             };
             gpui_kit::open_window(options, cx, |window, cx| {
-                cx.new(|cx| ChatView::new(agent, cwd, window, cx))
+                cx.new(|cx| ChatView::new(agent, cwd, lights.row_height, window, cx))
             })
             .expect("failed to open the window");
             cx.activate(true);
