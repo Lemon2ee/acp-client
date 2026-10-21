@@ -7,7 +7,10 @@ use acp_core::{
     AcpAgent, Command, Event as AgentEvent, PermissionRequest, Sender, SessionEvent, SessionKey,
 };
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::input::{InputEvent, Textarea, TextareaState};
+use gpui_kit::component::input::{
+    InputEvent, InputGroup, InputGroupAddon, InputGroupAddonAlignment, InputGroupButton, Textarea,
+    TextareaState,
+};
 use gpui_kit::component::message_scroller::{MessageScroller, MessageScrollerState};
 use gpui_kit::component::{ActiveTheme as _, Icon, IconName, Sizable as _};
 use gpui_kit::prelude::FluentBuilder as _;
@@ -517,13 +520,14 @@ impl Render for ChatView {
         );
         let session = &self.sessions[self.active];
         let action = if session.busy {
-            Button::new("stop")
-                .label("Stop")
+            InputGroupButton::new("stop")
+                .icon(IconName::Square)
+                .accessibility_label("Stop")
                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.stop(cx)))
         } else {
-            Button::new("send")
-                .primary()
-                .label("Send")
+            InputGroupButton::new("send")
+                .icon(IconName::ArrowUp)
+                .accessibility_label("Send")
                 .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.send(window, cx)))
         };
 
@@ -561,15 +565,20 @@ impl Render for ChatView {
                 .min_h(px(0.)),
             )
             .child(
-                div()
-                    .flex()
-                    .items_end()
-                    .gap_2()
-                    .p_3()
-                    .border_t_1()
-                    .border_color(border)
-                    .child(div().flex_1().child(Textarea::new(&self.input)))
-                    .child(action),
+                // The send/stop button sits inside the input box, beside the text.
+                div().p_3().child(
+                    InputGroup::new("prompt")
+                        .rounded_xl()
+                        // One row tall until the text wraps, instead of the group's 4rem minimum.
+                        .input(Textarea::new(&self.input).min_h(px(0.)))
+                        .addon(
+                            InputGroupAddon::new("prompt-actions")
+                                .align(InputGroupAddonAlignment::InlineEnd)
+                                // Keep the button by the last line as the text grows.
+                                .self_end()
+                                .child(action.primary().small().rounded_full()),
+                        ),
+                ),
             );
 
         div()
