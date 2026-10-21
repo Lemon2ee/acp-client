@@ -86,11 +86,12 @@ pub struct PermissionRequest {
 
 impl PermissionRequest {
     /// Answers with an option id, or `None` to reject; only the first answer counts.
-    /// Dropping an unanswered request also rejects.
-    pub fn answer(&mut self, choice: Option<String>) {
-        if let Some(respond) = self.respond.take() {
-            let _ = respond.send(choice);
-        }
+    /// Dropping an unanswered request also rejects. Returns false when the answer is
+    /// not taken: it is not the first, or the turn was already stopped or over.
+    pub fn answer(&mut self, choice: Option<String>) -> bool {
+        self.respond
+            .take()
+            .is_some_and(|respond| respond.send(choice).is_ok())
     }
 }
 
