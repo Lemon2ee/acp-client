@@ -12,7 +12,7 @@ use gpui_kit::component::input::{
     TextareaState,
 };
 use gpui_kit::component::message_scroller::{MessageScroller, MessageScrollerState};
-use gpui_kit::component::{ActiveTheme as _, Icon, IconName, Sizable as _};
+use gpui_kit::component::{ActiveTheme as _, Icon, IconName, Sizable as _, Theme};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
@@ -358,7 +358,12 @@ impl ChatView {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let theme = cx.theme();
-        let (muted, border, bubble) = (theme.muted_foreground, theme.border, theme.secondary);
+        let (muted, border, bubble, danger) = (
+            theme.muted_foreground,
+            theme.border,
+            theme.secondary,
+            theme.danger,
+        );
         let session = &self.sessions[self.active];
         let key = session.key;
         let row = div().w_full().px_4().py_1p5();
@@ -436,7 +441,7 @@ impl ChatView {
                 .into_any_element(),
             Row::Error(text) => row
                 .text_sm()
-                .text_color(red())
+                .text_color(danger)
                 .child(SharedString::from(text.clone()))
                 .into_any_element(),
         }
@@ -647,6 +652,13 @@ fn main() {
                 ..Default::default()
             };
             gpui_kit::open_window(options, cx, |window, cx| {
+                // Light or dark as the system is set, and again whenever that setting changes.
+                Theme::sync_system_appearance(Some(window), cx);
+                window
+                    .observe_window_appearance(|window, cx| {
+                        Theme::sync_system_appearance(Some(window), cx)
+                    })
+                    .detach();
                 cx.new(|cx| ChatView::new(agent, cwd, window, cx))
             })
             .expect("failed to open the window");
