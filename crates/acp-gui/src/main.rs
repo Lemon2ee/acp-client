@@ -13,7 +13,9 @@ use gpui_kit::component::input::{
     TextareaState,
 };
 use gpui_kit::component::message_scroller::{MessageScroller, MessageScrollerState};
-use gpui_kit::component::{ActiveTheme as _, Icon, IconName, Sizable as _, Theme, ThemeConfig};
+use gpui_kit::component::{
+    ActiveTheme as _, FocusableExt as _, Icon, IconName, Sizable as _, Theme, ThemeConfig,
+};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
@@ -621,11 +623,12 @@ impl Render for ChatView {
         // slides down over the window, so the window keeps none of its own.
         let title_bar = OWN_TITLE_BAR && !window.is_fullscreen();
         let theme = cx.theme();
-        let (background, foreground, divider, sidebar) = (
+        let (background, foreground, divider, sidebar, input_border) = (
             theme.background,
             theme.foreground,
             theme.sidebar_border,
             theme.sidebar,
+            theme.input,
         );
         let session = &self.sessions[self.active];
         let action = if session.busy {
@@ -661,16 +664,26 @@ impl Render for ChatView {
                 .min_h(px(0.)),
             )
             .child(
-                // The send/stop button sits inside the input box, beside the text.
+                // The send/stop button sits inside the input box.
                 div().p_3().child(
                     InputGroup::new("prompt")
                         .rounded_xl()
-                        // One row tall until the text wraps, instead of the group's 4rem minimum.
-                        .input(Textarea::new(&self.input).min_h(px(0.)))
+                        // The group brightens its border and rings itself while it has
+                        // focus. An inset shadow draws its resting border instead, so the
+                        // box looks the same focused or not.
+                        .border_0()
+                        .shadow(vec![
+                            BoxShadow::new(px(0.), px(0.), input_border)
+                                .spread_radius(px(1.))
+                                .inset(),
+                        ])
+                        .focus_ring(false)
+                        // 129px tall until the text needs more room, with the text at the top.
+                        .input(Textarea::new(&self.input).min_h(px(129.)))
                         .addon(
                             InputGroupAddon::new("prompt-actions")
                                 .align(InputGroupAddonAlignment::InlineEnd)
-                                // Keep the button by the last line as the text grows.
+                                // Keep the button in the bottom corner as the box grows.
                                 .self_end()
                                 .child(action.primary().small().rounded_full()),
                         ),
