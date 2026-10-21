@@ -240,8 +240,14 @@ impl ChatView {
             self.sessions[self.active].draft = self.input.read(cx).value();
             self.active = ix;
             let draft = std::mem::take(&mut self.sessions[ix].draft);
-            self.input
-                .update(cx, |input, cx| input.set_value(draft, window, cx));
+            self.input.update(cx, |input, cx| {
+                input.set_value(draft, window, cx);
+                // `set_value` leaves a multi-line input's caret at the start. Collapsing a
+                // select-all puts it at the end, and the next layout scrolls it into view;
+                // `set_selected_range` would scroll using the replaced text's layout.
+                input.select_all(window, cx);
+                input.unselect(window, cx);
+            });
         }
         self.input.update(cx, |input, cx| input.focus(window, cx));
         cx.notify();
