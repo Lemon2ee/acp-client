@@ -191,12 +191,20 @@ struct ChatView {
     input: Entity<TextareaState>,
     commands: Sender<Command>,
     status: SharedString,
+    /// The sidebar's top row, which holds the traffic lights on macOS.
+    title_bar_height: Pixels,
     _events: Task<()>,
     _input_events: Subscription,
 }
 
 impl ChatView {
-    fn new(agent: AcpAgent, cwd: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    fn new(
+        agent: AcpAgent,
+        cwd: PathBuf,
+        title_bar_height: Pixels,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let input = cx.new(|cx| {
             TextareaState::new(window, cx)
                 .placeholder("Message the agent (Enter to send, Shift+Enter for a new line)")
@@ -230,6 +238,7 @@ impl ChatView {
             input,
             commands: agent.commands,
             status: "starting the agent...".into(),
+            title_bar_height,
             _events: events_task,
             _input_events: input_events,
         };
@@ -449,9 +458,73 @@ impl ChatView {
 }
 
 const SIDEBAR_WIDTH: f32 = 240.;
+/// The chat's status header, including the line under it.
+const HEADER_HEIGHT: f32 = 26.;
+
+/// On macOS the window has no title bar row: the sidebar starts at the top edge with
+/// the traffic lights in its top row, and the chat card keeps its 8px margin all round.
+/// Elsewhere the system title bar stays.
+const OWN_TITLE_BAR: bool = cfg!(target_os = "macos");
+
+/// Where the traffic lights go, and the sidebar's top row that holds them. The lights
+/// are centered on the header's text, with as much space to their left and below them
+/// as above.
+#[derive(Clone, Copy)]
+struct TrafficLights {
+    /// The close button's top-left corner.
+    origin: Point<Pixels>,
+    row_height: Pixels,
+}
+
+impl TrafficLights {
+    fn new(size: f32) -> Self {
+        // The header's text is centered below the chat card's 8px margin and 1px border.
+        let inset = 9. + (HEADER_HEIGHT - 1.) / 2. - size / 2.;
+        Self {
+            origin: point(px(inset), px(inset)),
+            row_height: px(2. * inset + size),
+        }
+    }
+}
+
+/// The traffic lights' size as AppKit lays them out: 14pt on macOS 27, which is also
+/// the fallback.
+fn traffic_light_size() -> f32 {
+    #[cfg(target_os = "macos")]
+    {
+        use objc2_app_kit::{NSWindow, NSWindowButton, NSWindowStyleMask};
+        let style = NSWindowStyleMask::Titled
+            | NSWindowStyleMask::Closable
+            | NSWindowStyleMask::Miniaturizable
+            | NSWindowStyleMask::Resizable;
+        if let Some(mtm) = objc2::MainThreadMarker::new()
+            && let Some(button) =
+                NSWindow::standardWindowButton_forStyleMask(NSWindowButton::CloseButton, style, mtm)
+        {
+            return button.frame().size.height as f32;
+        }
+    }
+    14.
+}
+
+/// Makes `strip` stand in for the title bar the window doesn't have: dragging it moves
+/// the window, and a double-click does what the system setting for title bars says.
+/// The strip must not hold anything clickable.
+fn as_title_bar(strip: Div) -> Div {
+    strip.on_mouse_down(MouseButton::Left, |event, window, _| {
+        if event.click_count == 2 {
+            window.titlebar_double_click();
+        } else {
+            // AppKit moves the window with the mouse from this press until the button
+            // comes up, and keeps that mouse-up to itself. A press that doesn't move
+            // leaves the window where it is.
+            window.start_window_move();
+        }
+    })
+}
 
 impl ChatView {
-    fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_sidebar(&self, title_bar: bool, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let (foreground, border, background, hover) = (
             theme.sidebar_foreground,
@@ -497,52 +570,65 @@ impl ChatView {
             .h_full()
             .flex()
             .flex_col()
-            .gap_1()
-            .p_2()
             .text_color(foreground)
-            .child(
-                // A plain div: the component Button always centers its label.
-                div()
-                    .id("new-session")
-                    .role(Role::Button)
-                    .aria_label("New session")
-                    .h(px(32.))
-                    .px_3()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(border)
-                    .bg(background)
-                    .text_sm()
-                    .cursor_pointer()
-                    .hover(|style| style.bg(hover))
-                    .child(Icon::new(IconName::Plus).small())
-                    .child("New session")
-                    .on_click(
-                        cx.listener(|this, _: &ClickEvent, window, cx| {
-                            this.new_session(window, cx)
-                        }),
-                    ),
-            )
+            .when(title_bar, |sidebar| {
+                // Nothing goes here: the traffic lights are drawn over this row.
+                sidebar.child(as_title_bar(div().flex_none().h(self.title_bar_height)))
+            })
             .child(
                 div()
-                    .id("sessions")
                     .flex_1()
                     .min_h(px(0.))
-                    .mt_2()
                     .flex()
                     .flex_col()
-                    .gap_0p5()
-                    .overflow_y_scroll()
-                    .children(cards),
+                    .gap_1()
+                    .p_2()
+                    .when(title_bar, |content| content.pt_0())
+                    .child(
+                        // A plain div: the component Button always centers its label.
+                        div()
+                            .id("new-session")
+                            .role(Role::Button)
+                            .aria_label("New session")
+                            .h(px(32.))
+                            .px_3()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(border)
+                            .bg(background)
+                            .text_sm()
+                            .cursor_pointer()
+                            .hover(|style| style.bg(hover))
+                            .child(Icon::new(IconName::Plus).small())
+                            .child("New session")
+                            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                this.new_session(window, cx)
+                            })),
+                    )
+                    .child(
+                        div()
+                            .id("sessions")
+                            .flex_1()
+                            .min_h(px(0.))
+                            .mt_2()
+                            .flex()
+                            .flex_col()
+                            .gap_0p5()
+                            .overflow_y_scroll()
+                            .children(cards),
+                    ),
             )
     }
 }
 
 impl Render for ChatView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // In full screen the traffic lights go back to the system's title bar, which
+        // slides down over the window, so the window keeps none of its own.
+        let title_bar = OWN_TITLE_BAR && !window.is_fullscreen();
         let theme = cx.theme();
         let (background, foreground, muted, border, sidebar) = (
             theme.background,
@@ -579,13 +665,16 @@ impl Render for ChatView {
             .bg(background)
             .child(
                 div()
+                    .h(px(HEADER_HEIGHT))
                     .px_4()
-                    .py_2()
+                    .flex()
+                    .items_center()
                     .border_b_1()
                     .border_color(border)
                     .text_sm()
                     .text_color(muted)
-                    .child(self.status.clone()),
+                    .child(self.status.clone())
+                    .when(title_bar, as_title_bar),
             )
             .child(
                 MessageScroller::new(
@@ -619,7 +708,7 @@ impl Render for ChatView {
             .flex()
             .bg(sidebar)
             .text_color(foreground)
-            .child(self.render_sidebar(cx))
+            .child(self.render_sidebar(title_bar, cx))
             .child(chat)
     }
 }
@@ -639,6 +728,7 @@ fn main() {
         .with_assets(gpui_kit::assets::Assets)
         .run(move |cx: &mut App| {
             gpui_kit::init(cx);
+            let lights = TrafficLights::new(traffic_light_size());
             let options = WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
                     None,
@@ -647,8 +737,13 @@ fn main() {
                 ))),
                 titlebar: Some(TitlebarOptions {
                     title: Some(format!("ACP client: {name}").into()),
-                    ..Default::default()
+                    appears_transparent: OWN_TITLE_BAR,
+                    traffic_light_position: OWN_TITLE_BAR.then_some(lights.origin),
                 }),
+                // The app moves the window itself (see `as_title_bar`). Otherwise AppKit
+                // does it from the strip around the traffic lights, and on macOS 27 it
+                // holds back every click there while it waits for a double-click.
+                app_owns_titlebar_drag: OWN_TITLE_BAR,
                 ..Default::default()
             };
             gpui_kit::open_window(options, cx, |window, cx| {
@@ -659,7 +754,7 @@ fn main() {
                         Theme::sync_system_appearance(Some(window), cx)
                     })
                     .detach();
-                cx.new(|cx| ChatView::new(agent, cwd, window, cx))
+                cx.new(|cx| ChatView::new(agent, cwd, lights.row_height, window, cx))
             })
             .expect("failed to open the window");
             cx.activate(true);
