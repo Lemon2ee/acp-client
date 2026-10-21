@@ -1,0 +1,21 @@
+// Zed settings for this project. Zed already formats Rust on save by default.
+{
+  "inlay_hints": {
+    "enabled": true
+  },
+  "lsp": {
+    "rust-analyzer": {
+      "initialization_options": {
+        // Lint with clippy on save instead of plain `cargo check`.
+        "check": {
+          "command": "clippy"
+        },
+        // Check into target.nosync/rust-analyzer so rust-analyzer never holds
+        // the build lock that `cargo run` needs; costs extra disk.
+        "cargo": {
+          "targetDir": true
+        }
+      }
+    }
+  }
+}

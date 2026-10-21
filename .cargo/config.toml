@@ -1,0 +1,4 @@
+# ~/Documents syncs to iCloud, which skips names ending in `.nosync`,
+# so the multi-GB build output stays on this machine.
+[build]
+target-dir = "target.nosync"

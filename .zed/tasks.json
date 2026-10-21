@@ -1,0 +1,32 @@
+[
+  {
+    "label": "acp-gui: claude",
+    "command": "cargo",
+    "args": ["run", "-p", "acp-gui", "--", "claude"]
+  },
+  {
+    "label": "acp-gui: codex",
+    "command": "cargo",
+    "args": ["run", "-p", "acp-gui", "--", "codex"]
+  },
+  {
+    "label": "acp-cli: claude",
+    "command": "cargo",
+    "args": ["run", "-p", "acp-cli", "--", "claude"]
+  },
+  {
+    "label": "acp-cli: codex",
+    "command": "cargo",
+    "args": ["run", "-p", "acp-cli", "--", "codex"]
+  },
+  {
+    "label": "clippy: workspace",
+    "command": "cargo",
+    "args": ["clippy", "--workspace", "--all-targets"]
+  },
+  {
+    "label": "fmt: workspace",
+    "command": "cargo",
+    "args": ["fmt", "--all"]
+  }
+]
