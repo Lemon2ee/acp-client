@@ -190,7 +190,6 @@ struct ChatView {
     next_key: u64,
     input: Entity<TextareaState>,
     commands: Sender<Command>,
-    status: SharedString,
     /// The sidebar's top row, which holds the traffic lights on macOS.
     title_bar_height: Pixels,
     _events: Task<()>,
@@ -237,7 +236,6 @@ impl ChatView {
             next_key: 0,
             input,
             commands: agent.commands,
-            status: "starting the agent...".into(),
             title_bar_height,
             _events: events_task,
             _input_events: input_events,
@@ -315,7 +313,7 @@ impl ChatView {
 
     fn apply(&mut self, event: AgentEvent, cx: &mut Context<Self>) {
         match event {
-            AgentEvent::Connected { agent } => self.status = format!("connected: {agent}").into(),
+            AgentEvent::Connected { .. } => {}
             AgentEvent::SessionReady(key) => {
                 if let Some(session) = self.session_mut(key) {
                     session.busy = false;
@@ -336,7 +334,6 @@ impl ChatView {
             // Connection-wide failures show in the session on screen.
             AgentEvent::Error(message) => self.sessions[self.active].push(Row::Error(message), cx),
             AgentEvent::Closed => {
-                self.status = "agent disconnected".into();
                 for session in &mut self.sessions {
                     session.busy = true;
                     // A turn cut off with the connection may never report its end.
@@ -458,17 +455,14 @@ impl ChatView {
 }
 
 const SIDEBAR_WIDTH: f32 = 240.;
-/// The chat's status header, including the line under it.
-const HEADER_HEIGHT: f32 = 26.;
 
 /// On macOS the window has no title bar row: the sidebar starts at the top edge with
 /// the traffic lights in its top row, and the chat card keeps its 8px margin all round.
 /// Elsewhere the system title bar stays.
 const OWN_TITLE_BAR: bool = cfg!(target_os = "macos");
 
-/// Where the traffic lights go, and the sidebar's top row that holds them. The lights
-/// are centered on the header's text, with as much space to their left and below them
-/// as above.
+/// Where the traffic lights go, and the sidebar's top row that holds them, with as much
+/// space to the lights' left and below them as above.
 #[derive(Clone, Copy)]
 struct TrafficLights {
     /// The close button's top-left corner.
@@ -478,8 +472,8 @@ struct TrafficLights {
 
 impl TrafficLights {
     fn new(size: f32) -> Self {
-        // The header's text is centered below the chat card's 8px margin and 1px border.
-        let inset = 9. + (HEADER_HEIGHT - 1.) / 2. - size / 2.;
+        // The close button's center sits 21.5pt from the window's top and left edges.
+        let inset = 21.5 - size / 2.;
         Self {
             origin: point(px(inset), px(inset)),
             row_height: px(2. * inset + size),
@@ -624,10 +618,9 @@ impl Render for ChatView {
         // slides down over the window, so the window keeps none of its own.
         let title_bar = OWN_TITLE_BAR && !window.is_fullscreen();
         let theme = cx.theme();
-        let (background, foreground, muted, border, sidebar) = (
+        let (background, foreground, border, sidebar) = (
             theme.background,
             theme.foreground,
-            theme.muted_foreground,
             theme.border,
             theme.sidebar,
         );
@@ -657,19 +650,6 @@ impl Render for ChatView {
             .border_1()
             .border_color(border)
             .bg(background)
-            .child(
-                div()
-                    .h(px(HEADER_HEIGHT))
-                    .px_4()
-                    .flex()
-                    .items_center()
-                    .border_b_1()
-                    .border_color(border)
-                    .text_sm()
-                    .text_color(muted)
-                    .child(self.status.clone())
-                    .when(title_bar, as_title_bar),
-            )
             .child(
                 MessageScroller::new(
                     // Keyed per session, so a switch never reuses another session's list state.
