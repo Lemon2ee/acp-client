@@ -6,10 +6,10 @@ use std::path::PathBuf;
 use acp_core::{
     AcpAgent, Command, Event as AgentEvent, PermissionRequest, Sender, SessionEvent, SessionKey,
 };
-use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{InputEvent, Textarea, TextareaState};
 use gpui_kit::component::message_scroller::{MessageScroller, MessageScrollerState};
+use gpui_kit::component::{ActiveTheme as _, Icon, IconName, Sizable as _};
 use gpui_kit::*;
 
 enum Row {
@@ -28,9 +28,6 @@ enum Row {
     Notice(String),
     Error(String),
 }
-
-/// The window drives one session until the sidebar can start more.
-const SESSION: SessionKey = SessionKey(0);
 
 /// One conversation with the agent: its transcript and whether it takes a prompt.
 struct Session {
@@ -156,6 +153,7 @@ struct ChatView {
     sessions: Vec<Session>,
     /// Index into `sessions` of the one on screen.
     active: usize,
+    next_key: u64,
     input: Entity<TextareaState>,
     commands: Sender<Command>,
     status: SharedString,
@@ -171,7 +169,6 @@ impl ChatView {
                 .auto_grow(1, 8)
                 .submit_on_enter(true)
         });
-        input.update(cx, |input, cx| input.focus(window, cx));
         let input_events = cx.subscribe_in(&input, window, |this, _, event, window, cx| {
             if let InputEvent::PressEnter { shift: false, .. } = event {
                 this.send(window, cx);
@@ -183,7 +180,6 @@ impl ChatView {
         });
 
         let agent = acp_core::spawn(agent, cwd);
-        let _ = agent.commands.try_send(Command::NewSession(SESSION));
         let events = agent.events;
         let events_task = cx.spawn(async move |this, cx| {
             while let Ok(event) = events.recv().await {
@@ -193,15 +189,32 @@ impl ChatView {
             }
         });
 
-        Self {
-            sessions: vec![Session::new(SESSION, cx)],
+        let mut view = Self {
+            sessions: Vec::new(),
             active: 0,
+            next_key: 0,
             input,
             commands: agent.commands,
             status: "starting the agent...".into(),
             _events: events_task,
             _input_events: input_events,
+        };
+        view.new_session(window, cx);
+        view
+    }
+
+    /// Adds a session, shows it, and asks the agent to create it.
+    fn new_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.commands.is_closed() {
+            return;
         }
+        let key = SessionKey(self.next_key);
+        self.next_key += 1;
+        self.sessions.push(Session::new(key, cx));
+        self.active = self.sessions.len() - 1;
+        let _ = self.commands.try_send(Command::NewSession(key));
+        self.input.update(cx, |input, cx| input.focus(window, cx));
+        cx.notify();
     }
 
     fn session_mut(&mut self, key: SessionKey) -> Option<&mut Session> {
@@ -371,6 +384,13 @@ const SIDEBAR_WIDTH: f32 = 240.;
 
 impl ChatView {
     fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let (foreground, border, background, hover) = (
+            theme.sidebar_foreground,
+            theme.border,
+            theme.background,
+            theme.secondary,
+        );
         div()
             .w(px(SIDEBAR_WIDTH))
             .flex_none()
@@ -379,7 +399,33 @@ impl ChatView {
             .flex_col()
             .gap_1()
             .p_2()
-            .text_color(cx.theme().sidebar_foreground)
+            .text_color(foreground)
+            .child(
+                // A plain div: the component Button always centers its label.
+                div()
+                    .id("new-session")
+                    .role(Role::Button)
+                    .aria_label("New session")
+                    .h(px(32.))
+                    .px_3()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(border)
+                    .bg(background)
+                    .text_sm()
+                    .cursor_pointer()
+                    .hover(|style| style.bg(hover))
+                    .child(Icon::new(IconName::Plus).small())
+                    .child("New session")
+                    .on_click(
+                        cx.listener(|this, _: &ClickEvent, window, cx| {
+                            this.new_session(window, cx)
+                        }),
+                    ),
+            )
     }
 }
 
