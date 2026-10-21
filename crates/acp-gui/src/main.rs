@@ -27,6 +27,8 @@ enum Row {
     },
     Permission {
         request: PermissionRequest,
+        /// Replaces the option buttons once the request is closed: how it was answered,
+        /// or that it was cancelled.
         decided: Option<String>,
     },
     Notice(String),
@@ -103,13 +105,30 @@ impl Session {
             ),
             SessionEvent::TurnEnded { stop_reason } => {
                 self.busy = false;
+                self.cancel_open_permissions(cx);
                 if stop_reason != "EndTurn" {
                     self.push(Row::Notice(format!("turn ended: {stop_reason}")), cx);
                 }
             }
             SessionEvent::TurnFailed(message) => {
                 self.busy = false;
+                self.cancel_open_permissions(cx);
                 self.push(Row::Error(message), cx);
+            }
+        }
+    }
+
+    /// acp-core stops taking answers to a turn's permission requests once the turn is
+    /// stopped or over, so the cards still open show as cancelled instead of offering options.
+    fn cancel_open_permissions(&mut self, cx: &mut App) {
+        for ix in 0..self.rows.len() {
+            if let Row::Permission {
+                decided: decided @ None,
+                ..
+            } = &mut self.rows[ix]
+            {
+                *decided = Some("cancelled".into());
+                self.remeasure(ix, cx);
             }
         }
     }
@@ -120,8 +139,12 @@ impl Session {
                 .as_ref()
                 .and_then(|id| request.options.iter().find(|option| option.id == *id))
                 .map_or_else(|| "rejected".to_string(), |option| option.name.clone());
-            request.answer(choice);
-            *decided = Some(label);
+            // The turn may have been stopped or ended since the card was drawn.
+            *decided = Some(if request.answer(choice) {
+                format!("answered: {label}")
+            } else {
+                "cancelled".into()
+            });
             self.remeasure(ix, cx);
         }
     }
@@ -240,8 +263,14 @@ impl ChatView {
             self.sessions[self.active].draft = self.input.read(cx).value();
             self.active = ix;
             let draft = std::mem::take(&mut self.sessions[ix].draft);
-            self.input
-                .update(cx, |input, cx| input.set_value(draft, window, cx));
+            self.input.update(cx, |input, cx| {
+                input.set_value(draft, window, cx);
+                // `set_value` leaves a multi-line input's caret at the start. Collapsing a
+                // select-all puts it at the end, and the next layout scrolls it into view;
+                // `set_selected_range` would scroll using the replaced text's layout.
+                input.select_all(window, cx);
+                input.unselect(window, cx);
+            });
         }
         self.input.update(cx, |input, cx| input.focus(window, cx));
         cx.notify();
@@ -268,8 +297,10 @@ impl ChatView {
     }
 
     fn stop(&mut self, cx: &mut Context<Self>) {
-        let key = self.sessions[self.active].key;
-        let _ = self.commands.try_send(Command::Cancel(key));
+        let session = &mut self.sessions[self.active];
+        let _ = self.commands.try_send(Command::Cancel(session.key));
+        // Stopping makes acp-core answer the turn's open permission requests as cancelled.
+        session.cancel_open_permissions(cx);
         cx.notify();
     }
 
@@ -299,6 +330,8 @@ impl ChatView {
                 self.status = "agent disconnected".into();
                 for session in &mut self.sessions {
                     session.busy = true;
+                    // A turn cut off with the connection may never report its end.
+                    session.cancel_open_permissions(cx);
                 }
             }
         }
@@ -370,12 +403,7 @@ impl ChatView {
                     .border_color(border)
                     .child(format!("Permission requested: {}", request.title));
                 let card = match decided {
-                    Some(label) => card.child(
-                        div()
-                            .text_sm()
-                            .text_color(muted)
-                            .child(format!("answered: {label}")),
-                    ),
+                    Some(note) => card.child(div().text_sm().text_color(muted).child(note.clone())),
                     None => card.child(
                         div()
                             .flex()
