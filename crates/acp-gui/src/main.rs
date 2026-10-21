@@ -168,6 +168,8 @@ struct ChatView {
     input: Entity<TextareaState>,
     commands: Sender<Command>,
     status: SharedString,
+    /// A press on a title bar strip, waiting for a drag to move the window.
+    window_move_pending: bool,
     _events: Task<()>,
     _input_events: Subscription,
 }
@@ -207,6 +209,7 @@ impl ChatView {
             input,
             commands: agent.commands,
             status: "starting the agent...".into(),
+            window_move_pending: false,
             _events: events_task,
             _input_events: input_events,
         };
@@ -430,6 +433,37 @@ const TITLE_BAR_HEIGHT: f32 = 8. + HEADER_HEIGHT;
 const TRAFFIC_LIGHTS: Point<Pixels> = point(px(21.), px(21.));
 
 impl ChatView {
+    /// Makes `strip` stand in for the title bar the window doesn't have: dragging it
+    /// moves the window, and a double-click does what the system setting for title
+    /// bars says. The strip must not hold anything clickable.
+    fn as_title_bar(strip: Stateful<Div>, cx: &Context<Self>) -> Stateful<Div> {
+        strip
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseDownEvent, _, _| this.window_move_pending = true),
+            )
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, _| {
+                if this.window_move_pending && event.dragging() {
+                    // The move swallows the mouse-up, so forget the press first.
+                    this.window_move_pending = false;
+                    window.start_window_move();
+                }
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseUpEvent, _, _| this.window_move_pending = false),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseUpEvent, _, _| this.window_move_pending = false),
+            )
+            .on_click(|event, window, _| {
+                if event.click_count() == 2 {
+                    window.titlebar_double_click();
+                }
+            })
+    }
+
     fn render_sidebar(&self, title_bar: bool, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let (foreground, border, background, hover) = (
@@ -479,7 +513,13 @@ impl ChatView {
             .text_color(foreground)
             .when(title_bar, |sidebar| {
                 // Nothing goes here: the traffic lights are drawn over this row.
-                sidebar.child(div().flex_none().h(px(TITLE_BAR_HEIGHT)))
+                sidebar.child(Self::as_title_bar(
+                    div()
+                        .id("sidebar-title-bar")
+                        .flex_none()
+                        .h(px(TITLE_BAR_HEIGHT)),
+                    cx,
+                ))
             })
             .child(
                 div()
@@ -568,6 +608,7 @@ impl Render for ChatView {
             .bg(background)
             .child(
                 div()
+                    .id("chat-header")
                     .h(px(HEADER_HEIGHT))
                     .px_4()
                     .flex()
@@ -576,7 +617,8 @@ impl Render for ChatView {
                     .border_color(border)
                     .text_sm()
                     .text_color(muted)
-                    .child(self.status.clone()),
+                    .child(self.status.clone())
+                    .when(OWN_TITLE_BAR, |header| Self::as_title_bar(header, cx)),
             )
             .child(
                 MessageScroller::new(
@@ -641,6 +683,10 @@ fn main() {
                     appears_transparent: OWN_TITLE_BAR,
                     traffic_light_position: OWN_TITLE_BAR.then_some(TRAFFIC_LIGHTS),
                 }),
+                // The app moves the window itself (see `as_title_bar`). Otherwise AppKit
+                // does it from the strip around the traffic lights, and on macOS 27 it
+                // holds back every click there while it waits for a double-click.
+                app_owns_titlebar_drag: OWN_TITLE_BAR,
                 ..Default::default()
             };
             gpui_kit::open_window(options, cx, |window, cx| {
