@@ -32,94 +32,26 @@ enum Row {
 /// The window drives one session until the sidebar can start more.
 const SESSION: SessionKey = SessionKey(0);
 
-struct ChatView {
+/// One conversation with the agent: its transcript and whether it takes a prompt.
+struct Session {
+    key: SessionKey,
     rows: Vec<Row>,
     scroller: Entity<MessageScrollerState>,
-    input: Entity<TextareaState>,
-    commands: Sender<Command>,
-    status: SharedString,
-    /// Not ready for a prompt: still connecting, a turn is running, or the agent is gone.
+    /// Not ready for a prompt: still starting, a turn is running, or the agent is gone.
     busy: bool,
-    _events: Task<()>,
-    _input_events: Subscription,
 }
 
-impl ChatView {
-    fn new(agent: AcpAgent, cwd: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let input = cx.new(|cx| {
-            TextareaState::new(window, cx)
-                .placeholder("Message the agent (Enter to send, Shift+Enter for a new line)")
-                .auto_grow(1, 8)
-                .submit_on_enter(true)
-        });
-        input.update(cx, |input, cx| input.focus(window, cx));
-        let input_events = cx.subscribe_in(&input, window, |this, _, event, window, cx| {
-            if let InputEvent::PressEnter { shift: false, .. } = event {
-                this.send(window, cx);
-            }
-        });
-        window.on_window_should_close(cx, |_, cx| {
-            cx.quit();
-            true
-        });
-
-        let agent = acp_core::spawn(agent, cwd);
-        let _ = agent.commands.try_send(Command::NewSession(SESSION));
-        let events = agent.events;
-        let events_task = cx.spawn(async move |this, cx| {
-            while let Ok(event) = events.recv().await {
-                if this.update(cx, |this, cx| this.apply(event, cx)).is_err() {
-                    break;
-                }
-            }
-        });
-
+impl Session {
+    fn new(key: SessionKey, cx: &mut App) -> Self {
         Self {
+            key,
             rows: Vec::new(),
             scroller: cx.new(|cx| MessageScrollerState::new(0, cx)),
-            input,
-            commands: agent.commands,
-            status: "starting the agent...".into(),
             busy: true,
-            _events: events_task,
-            _input_events: input_events,
         }
     }
 
-    fn send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let text = self.input.read(cx).value().trim().to_string();
-        if self.busy || text.is_empty() {
-            return;
-        }
-        self.input.update(cx, |input, cx| input.clean(window, cx));
-        self.busy = true;
-        self.push(Row::User(text.clone()), cx);
-        let _ = self.commands.try_send(Command::Prompt(SESSION, text));
-        cx.notify();
-    }
-
-    fn stop(&mut self, cx: &mut Context<Self>) {
-        let _ = self.commands.try_send(Command::Cancel(SESSION));
-        cx.notify();
-    }
-
-    fn apply(&mut self, event: AgentEvent, cx: &mut Context<Self>) {
-        match event {
-            AgentEvent::Connected { agent } => self.status = format!("connected: {agent}").into(),
-            AgentEvent::SessionReady(_) => self.busy = false,
-            AgentEvent::SessionFailed(_, message) | AgentEvent::Error(message) => {
-                self.push(Row::Error(message), cx)
-            }
-            AgentEvent::Session(_, event) => self.apply_session(event, cx),
-            AgentEvent::Closed => {
-                self.status = "agent disconnected".into();
-                self.busy = true;
-            }
-        }
-        cx.notify();
-    }
-
-    fn apply_session(&mut self, event: SessionEvent, cx: &mut Context<Self>) {
+    fn apply(&mut self, event: SessionEvent, cx: &mut App) {
         match event {
             SessionEvent::AgentText(text) => self.append_text(false, &text, cx),
             SessionEvent::AgentThought(text) => self.append_text(true, &text, cx),
@@ -175,7 +107,7 @@ impl ChatView {
         }
     }
 
-    fn answer(&mut self, ix: usize, choice: Option<String>, cx: &mut Context<Self>) {
+    fn answer(&mut self, ix: usize, choice: Option<String>, cx: &mut App) {
         if let Some(Row::Permission { request, decided }) = self.rows.get_mut(ix) {
             let label = choice
                 .as_ref()
@@ -184,12 +116,11 @@ impl ChatView {
             request.answer(choice);
             *decided = Some(label);
             self.remeasure(ix, cx);
-            cx.notify();
         }
     }
 
     /// Streams arrive as small chunks; grow the last row instead of adding one per chunk.
-    fn append_text(&mut self, thought: bool, text: &str, cx: &mut Context<Self>) {
+    fn append_text(&mut self, thought: bool, text: &str, cx: &mut App) {
         match self.rows.last_mut() {
             Some(Row::Agent(existing)) if !thought => existing.push_str(text),
             Some(Row::Thought(existing)) if thought => existing.push_str(text),
@@ -207,17 +138,136 @@ impl ChatView {
         self.remeasure(self.rows.len() - 1, cx);
     }
 
-    fn push(&mut self, row: Row, cx: &mut Context<Self>) {
+    fn push(&mut self, row: Row, cx: &mut App) {
         self.rows.push(row);
         self.scroller.update(cx, |scroller, cx| {
             scroller.append(1, cx);
         });
     }
 
-    fn remeasure(&mut self, ix: usize, cx: &mut Context<Self>) {
+    fn remeasure(&mut self, ix: usize, cx: &mut App) {
         self.scroller.update(cx, |scroller, cx| {
             scroller.remeasure_items(ix..ix + 1, cx);
         });
+    }
+}
+
+struct ChatView {
+    sessions: Vec<Session>,
+    /// Index into `sessions` of the one on screen.
+    active: usize,
+    input: Entity<TextareaState>,
+    commands: Sender<Command>,
+    status: SharedString,
+    _events: Task<()>,
+    _input_events: Subscription,
+}
+
+impl ChatView {
+    fn new(agent: AcpAgent, cwd: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let input = cx.new(|cx| {
+            TextareaState::new(window, cx)
+                .placeholder("Message the agent (Enter to send, Shift+Enter for a new line)")
+                .auto_grow(1, 8)
+                .submit_on_enter(true)
+        });
+        input.update(cx, |input, cx| input.focus(window, cx));
+        let input_events = cx.subscribe_in(&input, window, |this, _, event, window, cx| {
+            if let InputEvent::PressEnter { shift: false, .. } = event {
+                this.send(window, cx);
+            }
+        });
+        window.on_window_should_close(cx, |_, cx| {
+            cx.quit();
+            true
+        });
+
+        let agent = acp_core::spawn(agent, cwd);
+        let _ = agent.commands.try_send(Command::NewSession(SESSION));
+        let events = agent.events;
+        let events_task = cx.spawn(async move |this, cx| {
+            while let Ok(event) = events.recv().await {
+                if this.update(cx, |this, cx| this.apply(event, cx)).is_err() {
+                    break;
+                }
+            }
+        });
+
+        Self {
+            sessions: vec![Session::new(SESSION, cx)],
+            active: 0,
+            input,
+            commands: agent.commands,
+            status: "starting the agent...".into(),
+            _events: events_task,
+            _input_events: input_events,
+        }
+    }
+
+    fn session_mut(&mut self, key: SessionKey) -> Option<&mut Session> {
+        self.sessions.iter_mut().find(|session| session.key == key)
+    }
+
+    fn send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let text = self.input.read(cx).value().trim().to_string();
+        let session = &mut self.sessions[self.active];
+        if session.busy || text.is_empty() {
+            return;
+        }
+        self.input.update(cx, |input, cx| input.clean(window, cx));
+        session.busy = true;
+        session.push(Row::User(text.clone()), cx);
+        let _ = self.commands.try_send(Command::Prompt(session.key, text));
+        cx.notify();
+    }
+
+    fn stop(&mut self, cx: &mut Context<Self>) {
+        let key = self.sessions[self.active].key;
+        let _ = self.commands.try_send(Command::Cancel(key));
+        cx.notify();
+    }
+
+    fn apply(&mut self, event: AgentEvent, cx: &mut Context<Self>) {
+        match event {
+            AgentEvent::Connected { agent } => self.status = format!("connected: {agent}").into(),
+            AgentEvent::SessionReady(key) => {
+                if let Some(session) = self.session_mut(key) {
+                    session.busy = false;
+                }
+            }
+            AgentEvent::SessionFailed(key, message) => {
+                if let Some(session) = self.session_mut(key) {
+                    session.push(Row::Error(message), cx);
+                }
+            }
+            AgentEvent::Session(key, event) => {
+                if let Some(session) = self.session_mut(key) {
+                    session.apply(event, cx);
+                }
+            }
+            // Connection-wide failures show in the session on screen.
+            AgentEvent::Error(message) => self.sessions[self.active].push(Row::Error(message), cx),
+            AgentEvent::Closed => {
+                self.status = "agent disconnected".into();
+                for session in &mut self.sessions {
+                    session.busy = true;
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    fn answer(
+        &mut self,
+        key: SessionKey,
+        ix: usize,
+        choice: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(session) = self.session_mut(key) {
+            session.answer(ix, choice, cx);
+        }
+        cx.notify();
     }
 
     fn render_row(
@@ -228,8 +278,10 @@ impl ChatView {
     ) -> AnyElement {
         let theme = cx.theme();
         let (muted, border, bubble) = (theme.muted_foreground, theme.border, theme.secondary);
+        let session = &self.sessions[self.active];
+        let key = session.key;
         let row = div().w_full().px_4().py_1p5();
-        match &self.rows[ix] {
+        match &session.rows[ix] {
             Row::User(text) => row
                 .flex()
                 .justify_end()
@@ -288,7 +340,7 @@ impl ChatView {
                                     ))
                                     .label(option.name.clone())
                                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                                        this.answer(ix, Some(id.clone()), cx)
+                                        this.answer(key, ix, Some(id.clone()), cx)
                                     }));
                                     if option.allow {
                                         button.primary()
@@ -341,7 +393,8 @@ impl Render for ChatView {
             theme.border,
             theme.sidebar,
         );
-        let action = if self.busy {
+        let session = &self.sessions[self.active];
+        let action = if session.busy {
             Button::new("stop")
                 .label("Stop")
                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.stop(cx)))
@@ -378,7 +431,7 @@ impl Render for ChatView {
             .child(
                 MessageScroller::new(
                     "messages",
-                    self.scroller.clone(),
+                    session.scroller.clone(),
                     cx.processor(|this, ix: usize, window, cx| this.render_row(ix, window, cx)),
                 )
                 .flex_1()
