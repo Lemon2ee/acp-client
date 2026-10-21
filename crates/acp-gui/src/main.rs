@@ -168,11 +168,8 @@ struct ChatView {
     input: Entity<TextareaState>,
     commands: Sender<Command>,
     status: SharedString,
-    /// A press on a title bar strip, waiting for a drag to move the window.
-    window_move_pending: bool,
     _events: Task<()>,
     _input_events: Subscription,
-    _window_activation: Subscription,
 }
 
 impl ChatView {
@@ -192,13 +189,6 @@ impl ChatView {
             cx.quit();
             true
         });
-        // The system can take a press away without a mouse-up, e.g. when another app
-        // comes to the front; a file dragged in later must not move the window.
-        let window_activation = cx.observe_window_activation(window, |this, window, _| {
-            if !window.is_window_active() {
-                this.window_move_pending = false;
-            }
-        });
 
         let agent = acp_core::spawn(agent, cwd);
         let events = agent.events;
@@ -217,10 +207,8 @@ impl ChatView {
             input,
             commands: agent.commands,
             status: "starting the agent...".into(),
-            window_move_pending: false,
             _events: events_task,
             _input_events: input_events,
-            _window_activation: window_activation,
         };
         view.new_session(window, cx);
         view
@@ -446,43 +434,23 @@ const TRAFFIC_LIGHTS: Point<Pixels> = point(px(TRAFFIC_LIGHT_INSET), px(TRAFFIC_
 /// them as above.
 const TITLE_BAR_HEIGHT: f32 = 2. * TRAFFIC_LIGHT_INSET + TRAFFIC_LIGHT_SIZE;
 
-impl ChatView {
-    /// Makes `strip` stand in for the title bar the window doesn't have: dragging it
-    /// moves the window, and a double-click does what the system setting for title
-    /// bars says. The strip must not hold anything clickable.
-    fn as_title_bar(strip: Stateful<Div>, cx: &Context<Self>) -> Stateful<Div> {
-        strip
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _: &MouseDownEvent, _, _| this.window_move_pending = true),
-            )
-            // Any other press starts a new gesture, which ends an earlier press that never
-            // got its mouse-up. This runs before the other strip's mouse-down sets the flag.
-            .on_mouse_down_out(
-                cx.listener(|this, _: &MouseDownEvent, _, _| this.window_move_pending = false),
-            )
-            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, _| {
-                if this.window_move_pending && event.dragging() {
-                    // The move swallows the mouse-up, so forget the press first.
-                    this.window_move_pending = false;
-                    window.start_window_move();
-                }
-            }))
-            .on_mouse_up(
-                MouseButton::Left,
-                cx.listener(|this, _: &MouseUpEvent, _, _| this.window_move_pending = false),
-            )
-            .on_mouse_up_out(
-                MouseButton::Left,
-                cx.listener(|this, _: &MouseUpEvent, _, _| this.window_move_pending = false),
-            )
-            .on_click(|event, window, _| {
-                if event.click_count() == 2 {
-                    window.titlebar_double_click();
-                }
-            })
-    }
+/// Makes `strip` stand in for the title bar the window doesn't have: dragging it moves
+/// the window, and a double-click does what the system setting for title bars says.
+/// The strip must not hold anything clickable.
+fn as_title_bar(strip: Div) -> Div {
+    strip.on_mouse_down(MouseButton::Left, |event, window, _| {
+        if event.click_count == 2 {
+            window.titlebar_double_click();
+        } else {
+            // AppKit moves the window with the mouse from this press until the button
+            // comes up, and keeps that mouse-up to itself. A press that doesn't move
+            // leaves the window where it is.
+            window.start_window_move();
+        }
+    })
+}
 
+impl ChatView {
     fn render_sidebar(&self, title_bar: bool, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let (foreground, border, background, hover) = (
@@ -532,13 +500,7 @@ impl ChatView {
             .text_color(foreground)
             .when(title_bar, |sidebar| {
                 // Nothing goes here: the traffic lights are drawn over this row.
-                sidebar.child(Self::as_title_bar(
-                    div()
-                        .id("sidebar-title-bar")
-                        .flex_none()
-                        .h(px(TITLE_BAR_HEIGHT)),
-                    cx,
-                ))
+                sidebar.child(as_title_bar(div().flex_none().h(px(TITLE_BAR_HEIGHT))))
             })
             .child(
                 div()
@@ -630,7 +592,6 @@ impl Render for ChatView {
             .bg(background)
             .child(
                 div()
-                    .id("chat-header")
                     .h(px(HEADER_HEIGHT))
                     .px_4()
                     .flex()
@@ -640,7 +601,7 @@ impl Render for ChatView {
                     .text_sm()
                     .text_color(muted)
                     .child(self.status.clone())
-                    .when(title_bar, |header| Self::as_title_bar(header, cx)),
+                    .when(title_bar, as_title_bar),
             )
             .child(
                 MessageScroller::new(
