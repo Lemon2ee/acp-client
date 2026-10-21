@@ -1,4 +1,4 @@
-//! Minimal gpui front end: a message list and an input box, driving one ACP agent.
+//! Minimal gpui front end: a sidebar of sessions beside a chat, driving one ACP agent.
 //! Usage: `acp-gui [claude | codex | "<agent command>"]`.
 
 use std::path::PathBuf;
@@ -10,6 +10,7 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{InputEvent, Textarea, TextareaState};
 use gpui_kit::component::message_scroller::{MessageScroller, MessageScrollerState};
 use gpui_kit::component::{ActiveTheme as _, Icon, IconName, Sizable as _};
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 enum Row {
@@ -32,6 +33,8 @@ enum Row {
 /// One conversation with the agent: its transcript and whether it takes a prompt.
 struct Session {
     key: SessionKey,
+    /// The first line of the first prompt, shown on the session's card.
+    title: Option<String>,
     rows: Vec<Row>,
     scroller: Entity<MessageScrollerState>,
     /// Not ready for a prompt: still starting, a turn is running, or the agent is gone.
@@ -42,6 +45,7 @@ impl Session {
     fn new(key: SessionKey, cx: &mut App) -> Self {
         Self {
             key,
+            title: None,
             rows: Vec::new(),
             scroller: cx.new(|cx| MessageScrollerState::new(0, cx)),
             busy: true,
@@ -217,6 +221,15 @@ impl ChatView {
         cx.notify();
     }
 
+    /// Shows the session in the chat.
+    fn select(&mut self, key: SessionKey, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(ix) = self.sessions.iter().position(|session| session.key == key) {
+            self.active = ix;
+            self.input.update(cx, |input, cx| input.focus(window, cx));
+            cx.notify();
+        }
+    }
+
     fn session_mut(&mut self, key: SessionKey) -> Option<&mut Session> {
         self.sessions.iter_mut().find(|session| session.key == key)
     }
@@ -228,6 +241,9 @@ impl ChatView {
             return;
         }
         self.input.update(cx, |input, cx| input.clean(window, cx));
+        session
+            .title
+            .get_or_insert_with(|| text.lines().next().unwrap_or_default().to_string());
         session.busy = true;
         session.push(Row::User(text.clone()), cx);
         let _ = self.commands.try_send(Command::Prompt(session.key, text));
@@ -391,6 +407,38 @@ impl ChatView {
             theme.background,
             theme.secondary,
         );
+        let (accent, accent_foreground) = (theme.sidebar_accent, theme.sidebar_accent_foreground);
+        // Newest first; the session on screen gets a filled card.
+        let cards =
+            self.sessions.iter().enumerate().rev().map(|(ix, session)| {
+                let key = session.key;
+                let title =
+                    SharedString::from(session.title.clone().unwrap_or_else(|| "Untitled".into()));
+                div()
+                    .id(ElementId::Name(format!("session-{}", key.0).into()))
+                    .role(Role::Button)
+                    .aria_label(title.clone())
+                    .h(px(32.))
+                    .px_3()
+                    .flex()
+                    .items_center()
+                    .rounded_md()
+                    .text_sm()
+                    .cursor_pointer()
+                    .map(|card| {
+                        if ix == self.active {
+                            card.bg(accent)
+                                .text_color(accent_foreground)
+                                .font_weight(FontWeight::MEDIUM)
+                        } else {
+                            card.hover(|style| style.bg(accent.opacity(0.5)))
+                        }
+                    })
+                    .child(div().flex_1().min_w(px(0.)).truncate().child(title))
+                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                        this.select(key, window, cx)
+                    }))
+            });
         div()
             .w(px(SIDEBAR_WIDTH))
             .flex_none()
@@ -425,6 +473,18 @@ impl ChatView {
                             this.new_session(window, cx)
                         }),
                     ),
+            )
+            .child(
+                div()
+                    .id("sessions")
+                    .flex_1()
+                    .min_h(px(0.))
+                    .mt_2()
+                    .flex()
+                    .flex_col()
+                    .gap_0p5()
+                    .overflow_y_scroll()
+                    .children(cards),
             )
     }
 }
@@ -476,7 +536,8 @@ impl Render for ChatView {
             )
             .child(
                 MessageScroller::new(
-                    "messages",
+                    // Keyed per session, so a switch never reuses another session's list state.
+                    ElementId::Name(format!("messages-{}", session.key.0).into()),
                     session.scroller.clone(),
                     cx.processor(|this, ix: usize, window, cx| this.render_row(ix, window, cx)),
                 )
