@@ -39,6 +39,8 @@ struct Session {
     scroller: Entity<MessageScrollerState>,
     /// Not ready for a prompt: still starting, a turn is running, or the agent is gone.
     busy: bool,
+    /// Text typed here but not sent, kept while another session is on screen.
+    draft: SharedString,
 }
 
 impl Session {
@@ -49,6 +51,7 @@ impl Session {
             rows: Vec::new(),
             scroller: cx.new(|cx| MessageScrollerState::new(0, cx)),
             busy: true,
+            draft: SharedString::default(),
         }
     }
 
@@ -154,6 +157,7 @@ impl Session {
 }
 
 struct ChatView {
+    /// Never empty: the window starts with one session and none are removed.
     sessions: Vec<Session>,
     /// Index into `sessions` of the one on screen.
     active: usize,
@@ -207,27 +211,37 @@ impl ChatView {
         view
     }
 
-    /// Adds a session, shows it, and asks the agent to create it.
+    /// Adds a session, shows it, and asks the agent to create it. The window's first
+    /// session is added even if the agent is already gone, so there is always one to show.
     fn new_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.commands.is_closed() {
+        if self.commands.is_closed() && !self.sessions.is_empty() {
             return;
         }
         let key = SessionKey(self.next_key);
         self.next_key += 1;
         self.sessions.push(Session::new(key, cx));
-        self.active = self.sessions.len() - 1;
         let _ = self.commands.try_send(Command::NewSession(key));
-        self.input.update(cx, |input, cx| input.focus(window, cx));
-        cx.notify();
+        self.show(self.sessions.len() - 1, window, cx);
     }
 
     /// Shows the session in the chat.
     fn select(&mut self, key: SessionKey, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(ix) = self.sessions.iter().position(|session| session.key == key) {
-            self.active = ix;
-            self.input.update(cx, |input, cx| input.focus(window, cx));
-            cx.notify();
+            self.show(ix, window, cx);
         }
+    }
+
+    /// Puts the session at `ix` on screen; unsent text stays with the session it was typed in.
+    fn show(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if ix != self.active {
+            self.sessions[self.active].draft = self.input.read(cx).value();
+            self.active = ix;
+            let draft = std::mem::take(&mut self.sessions[ix].draft);
+            self.input
+                .update(cx, |input, cx| input.set_value(draft, window, cx));
+        }
+        self.input.update(cx, |input, cx| input.focus(window, cx));
+        cx.notify();
     }
 
     fn session_mut(&mut self, key: SessionKey) -> Option<&mut Session> {
@@ -266,6 +280,8 @@ impl ChatView {
             }
             AgentEvent::SessionFailed(key, message) => {
                 if let Some(session) = self.session_mut(key) {
+                    // Open for a prompt, which asks the agent to create the session again.
+                    session.busy = false;
                     session.push(Row::Error(message), cx);
                 }
             }
