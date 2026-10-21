@@ -1,34 +1,55 @@
-//! Runs one ACP agent session on its own thread and exposes it as two channels,
+//! Runs one ACP agent connection on its own thread and exposes it as two channels,
 //! so a front end (CLI, gpui window) never touches the ACP runtime directly.
+//! The connection can hold several sessions, each running as its own task.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::thread;
 
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
     AuthMethod, CancelNotification, ContentBlock, ErrorCode, Implementation, InitializeRequest,
-    PermissionOptionKind, RequestPermissionOutcome, RequestPermissionRequest,
-    RequestPermissionResponse, SelectedPermissionOutcome, SessionNotification, SessionUpdate,
+    PermissionOptionKind, PromptRequest, PromptResponse, RequestPermissionOutcome,
+    RequestPermissionRequest, RequestPermissionResponse, SelectedPermissionOutcome, SessionId,
+    SessionNotification, SessionUpdate, StopReason,
 };
-use agent_client_protocol::util::MatchDispatch;
+use agent_client_protocol::util::{MatchDispatch, internal_error};
 pub use agent_client_protocol::{AcpAgent, Error};
 use agent_client_protocol::{ActiveSession, Agent, Client, ConnectionTo, Dispatch, SessionMessage};
 use futures::channel::oneshot;
 pub use smol::channel::{Receiver, Sender};
 
+/// Names a session on the connection. The front end picks it, so it can show the
+/// session before the agent has created it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct SessionKey(pub u64);
+
 /// What the front end asks the agent to do.
 pub enum Command {
-    Prompt(String),
-    /// Stop the turn in flight; ignored when idle.
-    Cancel,
+    /// Answered with `SessionReady` or `SessionFailed`.
+    NewSession(SessionKey),
+    Prompt(SessionKey, String),
+    /// Stop the session's turn in flight; ignored when idle.
+    Cancel(SessionKey),
 }
 
 /// What the agent reports, flattened for display.
 pub enum Event {
-    /// Initialized and a session exists.
-    Ready {
+    /// Initialized; sessions can be created.
+    Connected {
         agent: String,
     },
+    SessionReady(SessionKey),
+    SessionFailed(SessionKey, String),
+    Session(SessionKey, SessionEvent),
+    /// The connection failed (missing login, agent crashed, ...); every session is gone.
+    Error(String),
+    /// No more events will follow.
+    Closed,
+}
+
+/// Something that happened inside one session.
+pub enum SessionEvent {
     AgentText(String),
     AgentThought(String),
     ToolCall {
@@ -46,10 +67,8 @@ pub enum Event {
     TurnEnded {
         stop_reason: String,
     },
-    /// The connection failed (missing login, agent crashed, ...).
-    Error(String),
-    /// No more events will follow.
-    Closed,
+    /// The prompt failed; the session stays usable.
+    TurnFailed(String),
 }
 
 pub struct PermissionRequest {
@@ -94,7 +113,7 @@ pub fn agent_for(name: &str) -> Result<AcpAgent, Error> {
     .parse()
 }
 
-/// Starts the agent process and its session on a background thread.
+/// Starts the agent process on a background thread; create sessions with `Command::NewSession`.
 pub fn spawn(agent: AcpAgent, cwd: PathBuf) -> AgentHandle {
     let (command_tx, command_rx) = smol::channel::unbounded();
     let (event_tx, event_rx) = smol::channel::unbounded();
@@ -119,7 +138,7 @@ async fn run(
     commands: &Receiver<Command>,
     events: &Sender<Event>,
 ) -> Result<(), String> {
-    let mut auth_methods = Vec::new();
+    let mut login_options = Vec::new();
     Client
         .builder()
         .name("acp-gui")
@@ -128,80 +147,163 @@ async fn run(
                 .send_request(InitializeRequest::new(ProtocolVersion::V1))
                 .block_task()
                 .await?;
-            auth_methods = init.auth_methods;
-            let mut session = cx.build_session(cwd).block_task().start_session().await?;
+            login_options = init.auth_methods.iter().map(login_option).collect();
             emit(
                 events,
-                Event::Ready {
+                Event::Connected {
                     agent: describe(init.agent_info.as_ref()),
                 },
             );
 
-            while let Ok(command) = commands.recv().await {
-                if let Command::Prompt(text) = command {
-                    session.send_prompt(text)?;
-                    if !run_turn(&mut session, commands, events).await? {
-                        break;
+            // Sessions run as tasks on this thread, so turns in different sessions overlap.
+            let tasks = smol::LocalExecutor::new();
+            let mut sessions: HashMap<SessionKey, (SessionId, Sender<String>)> = HashMap::new();
+            tasks
+                .run(async {
+                    while let Some(command) = next_command(commands, &cx).await? {
+                        match command {
+                            Command::NewSession(key) => {
+                                match cx.build_session(cwd).block_task().start_session().await {
+                                    Ok(session) => {
+                                        let (prompt_tx, prompt_rx) = smol::channel::unbounded();
+                                        sessions
+                                            .insert(key, (session.session_id().clone(), prompt_tx));
+                                        tasks
+                                            .spawn(run_session(
+                                                key,
+                                                session,
+                                                prompt_rx,
+                                                events.clone(),
+                                                login_options.clone(),
+                                            ))
+                                            .detach();
+                                        emit(events, Event::SessionReady(key));
+                                    }
+                                    Err(err) => emit(
+                                        events,
+                                        Event::SessionFailed(
+                                            key,
+                                            describe_error(err, &login_options),
+                                        ),
+                                    ),
+                                }
+                            }
+                            Command::Prompt(key, text) => {
+                                if let Some((_, prompts)) = sessions.get(&key) {
+                                    let _ = prompts.try_send(text);
+                                }
+                            }
+                            Command::Cancel(key) => {
+                                if let Some((id, _)) = sessions.get(&key) {
+                                    cx.send_notification(CancelNotification::new(id.clone()))?;
+                                }
+                            }
+                        }
                     }
-                }
-            }
-            Ok(())
+                    Ok(())
+                })
+                .await
         })
         .await
-        .map_err(|err| describe_error(err, &auth_methods))
+        .map_err(|err| describe_error(err, &login_options))
 }
 
-/// Pumps one prompt turn. Returns `false` when the front end has gone away.
-async fn run_turn(
-    session: &mut ActiveSession<'static, Agent>,
+/// The next command, `None` once the front end has gone away, or an error once the agent has.
+async fn next_command(
     commands: &Receiver<Command>,
+    cx: &ConnectionTo<Agent>,
+) -> Result<Option<Command>, Error> {
+    enum Next {
+        Command(Option<Command>),
+        AgentGone,
+    }
+    let next = smol::future::or(async { Next::Command(commands.recv().await.ok()) }, async {
+        cx.incoming_closed().await;
+        Next::AgentGone
+    })
+    .await;
+    match next {
+        Next::Command(command) => Ok(command),
+        Next::AgentGone => Err(internal_error("the agent process exited")),
+    }
+}
+
+/// Runs the session's prompts one at a time, as they arrive.
+async fn run_session(
+    key: SessionKey,
+    mut session: ActiveSession<'static, Agent>,
+    prompts: Receiver<String>,
+    events: Sender<Event>,
+    login_options: Vec<String>,
+) {
+    while let Ok(text) = prompts.recv().await {
+        let outcome = match run_turn(key, &mut session, text, &events).await {
+            Ok(reason) => SessionEvent::TurnEnded {
+                stop_reason: format!("{reason:?}"),
+            },
+            Err(err) => SessionEvent::TurnFailed(describe_error(err, &login_options)),
+        };
+        emit(&events, Event::Session(key, outcome));
+    }
+}
+
+/// Sends one prompt and forwards the session's updates until the agent answers it.
+/// The prompt is sent by hand instead of with `ActiveSession::send_prompt`, whose
+/// failure would end the whole connection along with every other session.
+async fn run_turn(
+    key: SessionKey,
+    session: &mut ActiveSession<'static, Agent>,
+    text: String,
     events: &Sender<Event>,
-) -> Result<bool, Error> {
+) -> Result<StopReason, Error> {
     enum Next {
         Update(Result<SessionMessage, Error>),
-        Command(Option<Command>),
+        Answered(Result<Result<PromptResponse, Error>, oneshot::Canceled>),
     }
+    let (answer_tx, mut answer) = oneshot::channel();
+    session
+        .connection()
+        .prepare_request(PromptRequest::new(
+            session.session_id().clone(),
+            vec![text.into()],
+        ))
+        .on_receiving_result(async move |result| {
+            let _ = answer_tx.send(result);
+            Ok(())
+        })?;
     loop {
-        // Both arms are cancel-safe: a dropped `recv`/`read_update` loses no message.
+        // `or` polls the session first, and updates sent before the answer are already
+        // queued when it arrives, so none are left behind.
         let next = smol::future::or(async { Next::Update(session.read_update().await) }, async {
-            Next::Command(commands.recv().await.ok())
+            Next::Answered((&mut answer).await)
         })
         .await;
         match next {
-            Next::Update(update) => match update? {
-                SessionMessage::StopReason(reason) => {
-                    emit(
-                        events,
-                        Event::TurnEnded {
-                            stop_reason: format!("{reason:?}"),
-                        },
-                    );
-                    return Ok(true);
+            Next::Update(update) => {
+                if let SessionMessage::SessionMessage(dispatch) = update? {
+                    handle(dispatch, key, events).await?;
                 }
-                SessionMessage::SessionMessage(dispatch) => handle(dispatch, events).await?,
-                _ => {}
-            },
-            Next::Command(Some(Command::Cancel)) => session
-                .connection()
-                .send_notification(CancelNotification::new(session.session_id().clone()))?,
-            // Front ends keep the input disabled during a turn; a stray prompt is dropped.
-            Next::Command(Some(Command::Prompt(_))) => {}
-            Next::Command(None) => return Ok(false),
+            }
+            Next::Answered(answer) => {
+                return answer
+                    .map_err(|_| internal_error("the prompt was dropped"))?
+                    .map(|response| response.stop_reason);
+            }
         }
     }
 }
 
-async fn handle(dispatch: Dispatch, events: &Sender<Event>) -> Result<(), Error> {
+async fn handle(dispatch: Dispatch, key: SessionKey, events: &Sender<Event>) -> Result<(), Error> {
     MatchDispatch::new(dispatch)
         .if_notification(async |notification: SessionNotification| {
             if let Some(event) = flatten(notification.update) {
-                emit(events, event);
+                emit(events, Event::Session(key, event));
             }
             Ok(())
         })
         .await
         .if_request(async |request: RequestPermissionRequest, responder| {
-            let outcome = ask_permission(request, events).await;
+            let outcome = ask_permission(request, key, events).await;
             responder.respond(RequestPermissionResponse::new(outcome))
         })
         .await
@@ -217,6 +319,7 @@ async fn handle(dispatch: Dispatch, events: &Sender<Event>) -> Result<(), Error>
 
 async fn ask_permission(
     request: RequestPermissionRequest,
+    key: SessionKey,
     events: &Sender<Event>,
 ) -> RequestPermissionOutcome {
     let (respond, choice) = oneshot::channel();
@@ -240,11 +343,14 @@ async fn ask_permission(
         .unwrap_or_else(|| "tool call".into());
     emit(
         events,
-        Event::Permission(PermissionRequest {
-            title,
-            options,
-            respond: Some(respond),
-        }),
+        Event::Session(
+            key,
+            SessionEvent::Permission(PermissionRequest {
+                title,
+                options,
+                respond: Some(respond),
+            }),
+        ),
     );
 
     let chosen = choice.await.ok().flatten();
@@ -260,21 +366,23 @@ async fn ask_permission(
     }
 }
 
-fn flatten(update: SessionUpdate) -> Option<Event> {
+fn flatten(update: SessionUpdate) -> Option<SessionEvent> {
     Some(match update {
-        SessionUpdate::AgentMessageChunk(chunk) => Event::AgentText(text_of(&chunk.content)),
-        SessionUpdate::AgentThoughtChunk(chunk) => Event::AgentThought(text_of(&chunk.content)),
-        SessionUpdate::ToolCall(call) => Event::ToolCall {
+        SessionUpdate::AgentMessageChunk(chunk) => SessionEvent::AgentText(text_of(&chunk.content)),
+        SessionUpdate::AgentThoughtChunk(chunk) => {
+            SessionEvent::AgentThought(text_of(&chunk.content))
+        }
+        SessionUpdate::ToolCall(call) => SessionEvent::ToolCall {
             id: call.tool_call_id.0.to_string(),
             title: call.title,
             status: format!("{:?}", call.status),
         },
-        SessionUpdate::ToolCallUpdate(update) => Event::ToolCallUpdate {
+        SessionUpdate::ToolCallUpdate(update) => SessionEvent::ToolCallUpdate {
             id: update.tool_call_id.0.to_string(),
             title: update.fields.title,
             status: update.fields.status.map(|status| format!("{status:?}")),
         },
-        SessionUpdate::Plan(plan) => Event::Plan(
+        SessionUpdate::Plan(plan) => SessionEvent::Plan(
             plan.entries
                 .into_iter()
                 .map(|entry| format!("[{:?}] {}", entry.status, entry.content))
@@ -304,24 +412,24 @@ fn describe(info: Option<&Implementation>) -> String {
     }
 }
 
+fn login_option(method: &AuthMethod) -> String {
+    match method {
+        AuthMethod::Agent(agent) => agent.name.clone(),
+        AuthMethod::Terminal(terminal) => terminal.name.clone(),
+        _ => "unknown".into(),
+    }
+}
+
 /// A missing or expired login surfaces as `auth_required` (on `session/new` or a prompt).
 /// We never handle credentials ourselves, so point at the agent's own login instead.
-fn describe_error(err: Error, auth_methods: &[AuthMethod]) -> String {
+fn describe_error(err: Error, login_options: &[String]) -> String {
     if err.code != ErrorCode::AuthRequired {
         return err.to_string();
     }
-    let names: Vec<&str> = auth_methods
-        .iter()
-        .map(|method| match method {
-            AuthMethod::Agent(agent) => agent.name.as_str(),
-            AuthMethod::Terminal(terminal) => terminal.name.as_str(),
-            _ => "unknown",
-        })
-        .collect();
     format!(
         "not logged in, or the login expired. Log in with the agent's own CLI \
-         (`claude` then /login, or `codex login`), then restart. Agent offers: {}",
-        names.join(", ")
+         (`claude` then /login, or `codex login`), then try again. Agent offers: {}",
+        login_options.join(", ")
     )
 }
 

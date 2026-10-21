@@ -4,7 +4,10 @@ use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
 use std::process::ExitCode;
 
-use acp_core::{Command, Event, PermissionRequest, Receiver};
+use acp_core::{Command, Event, PermissionRequest, Receiver, SessionEvent, SessionKey};
+
+/// The CLI talks to a single session.
+const SESSION: SessionKey = SessionKey(0);
 
 fn main() -> ExitCode {
     let name = std::env::args().nth(1).unwrap_or_else(|| "claude".into());
@@ -18,6 +21,7 @@ fn main() -> ExitCode {
     let cwd = std::env::current_dir().expect("no current directory");
     eprintln!("starting {name} in {} ...", cwd.display());
     let handle = acp_core::spawn(agent, cwd);
+    let _ = handle.commands.send_blocking(Command::NewSession(SESSION));
     let mut lines = io::stdin().lock().lines();
 
     let mut alive = pump(&handle.events, &mut lines);
@@ -30,7 +34,7 @@ fn main() -> ExitCode {
         }
         if handle
             .commands
-            .send_blocking(Command::Prompt(line))
+            .send_blocking(Command::Prompt(SESSION, line))
             .is_err()
         {
             break;
@@ -63,36 +67,44 @@ fn pump(events: &Receiver<Event>, lines: &mut impl Iterator<Item = io::Result<St
     let mut tool_titles = HashMap::new();
     while let Ok(event) = events.recv_blocking() {
         match event {
-            Event::Ready { agent } => {
-                println!("connected: {agent}");
-                return true;
+            Event::Connected { agent } => println!("connected: {agent}"),
+            Event::SessionReady(_) => return true,
+            Event::SessionFailed(_, message) => {
+                eprintln!("error: {message}");
+                return false;
             }
-            Event::AgentText(text) => print!("{text}"),
-            Event::AgentThought(text) => print!("\x1b[2m{text}\x1b[0m"),
-            Event::ToolCall { id, title, status } => {
-                println!("\n[tool] {title} ({status})");
-                tool_titles.insert(id, title);
-            }
-            Event::ToolCallUpdate { id, title, status } => {
-                if let Some(title) = title {
-                    tool_titles.insert(id.clone(), title);
+            Event::Session(_, update) => match update {
+                SessionEvent::AgentText(text) => print!("{text}"),
+                SessionEvent::AgentThought(text) => print!("\x1b[2m{text}\x1b[0m"),
+                SessionEvent::ToolCall { id, title, status } => {
+                    println!("\n[tool] {title} ({status})");
+                    tool_titles.insert(id, title);
                 }
-                if let Some(status) = status {
-                    let title = tool_titles.get(&id).map_or("tool", String::as_str);
-                    println!("[tool] {title} ({status})");
+                SessionEvent::ToolCallUpdate { id, title, status } => {
+                    if let Some(title) = title {
+                        tool_titles.insert(id.clone(), title);
+                    }
+                    if let Some(status) = status {
+                        let title = tool_titles.get(&id).map_or("tool", String::as_str);
+                        println!("[tool] {title} ({status})");
+                    }
                 }
-            }
-            Event::Plan(entries) => {
-                println!("\n[plan]");
-                for entry in entries {
-                    println!("  {entry}");
+                SessionEvent::Plan(entries) => {
+                    println!("\n[plan]");
+                    for entry in entries {
+                        println!("  {entry}");
+                    }
                 }
-            }
-            Event::Permission(request) => ask(request, lines),
-            Event::TurnEnded { stop_reason } => {
-                println!("\n[turn ended: {stop_reason}]");
-                return true;
-            }
+                SessionEvent::Permission(request) => ask(request, lines),
+                SessionEvent::TurnEnded { stop_reason } => {
+                    println!("\n[turn ended: {stop_reason}]");
+                    return true;
+                }
+                SessionEvent::TurnFailed(message) => {
+                    eprintln!("\nerror: {message}");
+                    return true;
+                }
+            },
             Event::Error(message) => eprintln!("\nerror: {message}"),
             Event::Closed => return false,
         }

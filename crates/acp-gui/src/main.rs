@@ -3,7 +3,9 @@
 
 use std::path::PathBuf;
 
-use acp_core::{AcpAgent, Command, Event as AgentEvent, PermissionRequest, Sender};
+use acp_core::{
+    AcpAgent, Command, Event as AgentEvent, PermissionRequest, Sender, SessionEvent, SessionKey,
+};
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{InputEvent, Textarea, TextareaState};
@@ -26,6 +28,9 @@ enum Row {
     Notice(String),
     Error(String),
 }
+
+/// The window drives one session until the sidebar can start more.
+const SESSION: SessionKey = SessionKey(0);
 
 struct ChatView {
     rows: Vec<Row>,
@@ -59,6 +64,7 @@ impl ChatView {
         });
 
         let agent = acp_core::spawn(agent, cwd);
+        let _ = agent.commands.try_send(Command::NewSession(SESSION));
         let events = agent.events;
         let events_task = cx.spawn(async move |this, cx| {
             while let Ok(event) = events.recv().await {
@@ -88,27 +94,39 @@ impl ChatView {
         self.input.update(cx, |input, cx| input.clean(window, cx));
         self.busy = true;
         self.push(Row::User(text.clone()), cx);
-        let _ = self.commands.try_send(Command::Prompt(text));
+        let _ = self.commands.try_send(Command::Prompt(SESSION, text));
         cx.notify();
     }
 
     fn stop(&mut self, cx: &mut Context<Self>) {
-        let _ = self.commands.try_send(Command::Cancel);
+        let _ = self.commands.try_send(Command::Cancel(SESSION));
         cx.notify();
     }
 
     fn apply(&mut self, event: AgentEvent, cx: &mut Context<Self>) {
         match event {
-            AgentEvent::Ready { agent } => {
-                self.status = format!("connected: {agent}").into();
-                self.busy = false;
+            AgentEvent::Connected { agent } => self.status = format!("connected: {agent}").into(),
+            AgentEvent::SessionReady(_) => self.busy = false,
+            AgentEvent::SessionFailed(_, message) | AgentEvent::Error(message) => {
+                self.push(Row::Error(message), cx)
             }
-            AgentEvent::AgentText(text) => self.append_text(false, &text, cx),
-            AgentEvent::AgentThought(text) => self.append_text(true, &text, cx),
-            AgentEvent::ToolCall { id, title, status } => {
+            AgentEvent::Session(_, event) => self.apply_session(event, cx),
+            AgentEvent::Closed => {
+                self.status = "agent disconnected".into();
+                self.busy = true;
+            }
+        }
+        cx.notify();
+    }
+
+    fn apply_session(&mut self, event: SessionEvent, cx: &mut Context<Self>) {
+        match event {
+            SessionEvent::AgentText(text) => self.append_text(false, &text, cx),
+            SessionEvent::AgentThought(text) => self.append_text(true, &text, cx),
+            SessionEvent::ToolCall { id, title, status } => {
                 self.push(Row::Tool { id, title, status }, cx)
             }
-            AgentEvent::ToolCallUpdate { id, title, status } => {
+            SessionEvent::ToolCallUpdate { id, title, status } => {
                 let found =
                     self.rows
                         .iter_mut()
@@ -134,29 +152,27 @@ impl ChatView {
                     self.remeasure(ix, cx);
                 }
             }
-            AgentEvent::Plan(entries) => {
+            SessionEvent::Plan(entries) => {
                 self.push(Row::Notice(format!("plan\n{}", entries.join("\n"))), cx)
             }
-            AgentEvent::Permission(request) => self.push(
+            SessionEvent::Permission(request) => self.push(
                 Row::Permission {
                     request,
                     decided: None,
                 },
                 cx,
             ),
-            AgentEvent::TurnEnded { stop_reason } => {
+            SessionEvent::TurnEnded { stop_reason } => {
                 self.busy = false;
                 if stop_reason != "EndTurn" {
                     self.push(Row::Notice(format!("turn ended: {stop_reason}")), cx);
                 }
             }
-            AgentEvent::Error(message) => self.push(Row::Error(message), cx),
-            AgentEvent::Closed => {
-                self.status = "agent disconnected".into();
-                self.busy = true;
+            SessionEvent::TurnFailed(message) => {
+                self.busy = false;
+                self.push(Row::Error(message), cx);
             }
         }
-        cx.notify();
     }
 
     fn answer(&mut self, ix: usize, choice: Option<String>, cx: &mut Context<Self>) {
