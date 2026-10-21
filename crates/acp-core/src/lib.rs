@@ -1,34 +1,62 @@
-//! Runs one ACP agent session on its own thread and exposes it as two channels,
+//! Runs one ACP agent connection on its own thread and exposes it as two channels,
 //! so a front end (CLI, gpui window) never touches the ACP runtime directly.
+//! The connection can hold several sessions, each running as its own task.
 
+use std::collections::hash_map::Entry;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::thread;
 
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
     AuthMethod, CancelNotification, ContentBlock, ErrorCode, Implementation, InitializeRequest,
-    PermissionOptionKind, RequestPermissionOutcome, RequestPermissionRequest,
-    RequestPermissionResponse, SelectedPermissionOutcome, SessionNotification, SessionUpdate,
+    PermissionOption, PermissionOptionKind, PromptRequest, PromptResponse,
+    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
+    SelectedPermissionOutcome, SessionNotification, SessionUpdate, StopReason,
 };
-use agent_client_protocol::util::MatchDispatch;
+use agent_client_protocol::util::{MatchDispatch, internal_error};
 pub use agent_client_protocol::{AcpAgent, Error};
-use agent_client_protocol::{ActiveSession, Agent, Client, ConnectionTo, Dispatch, SessionMessage};
+use agent_client_protocol::{
+    ActiveSession, Agent, Client, ConnectionTo, Dispatch, Responder, SessionMessage,
+};
 use futures::channel::oneshot;
 pub use smol::channel::{Receiver, Sender};
 
+/// Names a session on the connection. The front end picks it, so it can show the
+/// session before the agent has created it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct SessionKey(pub u64);
+
 /// What the front end asks the agent to do.
 pub enum Command {
-    Prompt(String),
-    /// Stop the turn in flight; ignored when idle.
-    Cancel,
+    /// Answered with `SessionReady` or `SessionFailed`. A key already in use keeps its
+    /// session, and the repeated command is ignored.
+    NewSession(SessionKey),
+    /// Runs after the session's earlier prompts. If the agent failed to create the
+    /// session, it is created again first.
+    Prompt(SessionKey, String),
+    /// Stop the session's turn in flight; ignored when idle.
+    Cancel(SessionKey),
 }
 
 /// What the agent reports, flattened for display.
 pub enum Event {
-    /// Initialized and a session exists.
-    Ready {
+    /// Initialized; sessions can be created.
+    Connected {
         agent: String,
     },
+    SessionReady(SessionKey),
+    /// The agent could not create the session; its next prompt tries again.
+    SessionFailed(SessionKey, String),
+    Session(SessionKey, SessionEvent),
+    /// The connection failed (missing login, agent crashed, ...); every session is gone.
+    Error(String),
+    /// No more events will follow.
+    Closed,
+}
+
+/// Something that happened inside one session.
+pub enum SessionEvent {
     AgentText(String),
     AgentThought(String),
     ToolCall {
@@ -46,10 +74,8 @@ pub enum Event {
     TurnEnded {
         stop_reason: String,
     },
-    /// The connection failed (missing login, agent crashed, ...).
-    Error(String),
-    /// No more events will follow.
-    Closed,
+    /// The prompt failed; the session stays usable.
+    TurnFailed(String),
 }
 
 pub struct PermissionRequest {
@@ -79,6 +105,13 @@ pub struct AgentHandle {
     pub events: Receiver<Event>,
 }
 
+/// A command for one session. Each session reads these from one queue in order,
+/// so a cancel never overtakes the prompt it is meant to stop.
+enum SessionCommand {
+    Prompt(String),
+    Cancel,
+}
+
 /// Pinned rather than `@latest`, so each adapter runs the CLI it bundles and was tested with
 /// (claude-agent-acp pins Agent SDK 0.3.303 exactly; codex-acp takes @openai/codex 0.160.x).
 const CLAUDE_ADAPTER: &str = "npx -y @agentclientprotocol/claude-agent-acp@0.94.0";
@@ -94,7 +127,7 @@ pub fn agent_for(name: &str) -> Result<AcpAgent, Error> {
     .parse()
 }
 
-/// Starts the agent process and its session on a background thread.
+/// Starts the agent process on a background thread; create sessions with `Command::NewSession`.
 pub fn spawn(agent: AcpAgent, cwd: PathBuf) -> AgentHandle {
     let (command_tx, command_rx) = smol::channel::unbounded();
     let (event_tx, event_rx) = smol::channel::unbounded();
@@ -119,7 +152,7 @@ async fn run(
     commands: &Receiver<Command>,
     events: &Sender<Event>,
 ) -> Result<(), String> {
-    let mut auth_methods = Vec::new();
+    let mut login_options = Vec::new();
     Client
         .builder()
         .name("acp-gui")
@@ -128,81 +161,256 @@ async fn run(
                 .send_request(InitializeRequest::new(ProtocolVersion::V1))
                 .block_task()
                 .await?;
-            auth_methods = init.auth_methods;
-            let mut session = cx.build_session(cwd).block_task().start_session().await?;
+            login_options = init.auth_methods.iter().map(login_option).collect();
             emit(
                 events,
-                Event::Ready {
+                Event::Connected {
                     agent: describe(init.agent_info.as_ref()),
                 },
             );
 
-            while let Ok(command) = commands.recv().await {
-                if let Command::Prompt(text) = command {
-                    session.send_prompt(text)?;
-                    if !run_turn(&mut session, commands, events).await? {
-                        break;
+            // Each session runs as a task on this thread: turns in different sessions
+            // overlap, and a slow `session/new` never holds up other sessions' commands.
+            let tasks = smol::LocalExecutor::new();
+            let mut sessions: HashMap<SessionKey, Sender<SessionCommand>> = HashMap::new();
+            tasks
+                .run(async {
+                    while let Some(command) = next_command(commands, &cx).await? {
+                        let (key, command) = match command {
+                            Command::NewSession(key) => {
+                                if let Entry::Vacant(entry) = sessions.entry(key) {
+                                    let (command_tx, command_rx) = smol::channel::unbounded();
+                                    entry.insert(command_tx);
+                                    tasks
+                                        .spawn(run_session(
+                                            key,
+                                            cx.clone(),
+                                            cwd.to_path_buf(),
+                                            command_rx,
+                                            events.clone(),
+                                            login_options.clone(),
+                                        ))
+                                        .detach();
+                                }
+                                continue;
+                            }
+                            Command::Prompt(key, text) => (key, SessionCommand::Prompt(text)),
+                            Command::Cancel(key) => (key, SessionCommand::Cancel),
+                        };
+                        if let Some(session) = sessions.get(&key) {
+                            let _ = session.try_send(command);
+                        }
                     }
-                }
-            }
-            Ok(())
+                    Ok(())
+                })
+                .await
         })
         .await
-        .map_err(|err| describe_error(err, &auth_methods))
+        .map_err(|err| describe_error(err, &login_options))
 }
 
-/// Pumps one prompt turn. Returns `false` when the front end has gone away.
-async fn run_turn(
-    session: &mut ActiveSession<'static, Agent>,
+/// The next command, `None` once the front end has gone away, or an error once the agent has.
+async fn next_command(
     commands: &Receiver<Command>,
+    cx: &ConnectionTo<Agent>,
+) -> Result<Option<Command>, Error> {
+    enum Next {
+        Command(Option<Command>),
+        AgentGone,
+    }
+    let next = smol::future::or(async { Next::Command(commands.recv().await.ok()) }, async {
+        cx.incoming_closed().await;
+        Next::AgentGone
+    })
+    .await;
+    match next {
+        Next::Command(command) => Ok(command),
+        Next::AgentGone => Err(internal_error("the agent process exited")),
+    }
+}
+
+/// Creates the session, then runs its prompts one at a time, as they arrive.
+/// A session the agent failed to create is created again by its next prompt.
+async fn run_session(
+    key: SessionKey,
+    cx: ConnectionTo<Agent>,
+    cwd: PathBuf,
+    commands: Receiver<SessionCommand>,
+    events: Sender<Event>,
+    login_options: Vec<String>,
+) {
+    // The prompt to run once the session exists, when a prompt is creating it again.
+    let mut retry = None;
+    loop {
+        // `run_until` sends `session/new` from this task, so a refusal comes back here;
+        // `start_session` sends it from a connection task, where an error ends the
+        // whole connection.
+        let created = cx
+            .build_session(&cwd)
+            .block_task()
+            .run_until(async |mut session| {
+                let waiting: VecDeque<String> = retry.take().into_iter().collect();
+                if waiting.is_empty() {
+                    emit(&events, Event::SessionReady(key));
+                }
+                serve(
+                    key,
+                    &mut session,
+                    waiting,
+                    &commands,
+                    &events,
+                    &login_options,
+                )
+                .await;
+                Ok(())
+            })
+            .await;
+        // `serve` returns only once the front end has gone.
+        let Err(err) = created else { return };
+        let message = describe_error(err, &login_options);
+        let failed = match retry {
+            None => Event::SessionFailed(key, message),
+            Some(_) => Event::Session(key, SessionEvent::TurnFailed(message)),
+        };
+        emit(&events, failed);
+        retry = loop {
+            match commands.recv().await {
+                Ok(SessionCommand::Prompt(text)) => break Some(text),
+                // No session, so nothing is running to stop.
+                Ok(SessionCommand::Cancel) => {}
+                Err(_) => return,
+            }
+        };
+    }
+}
+
+/// Runs the session's prompts one at a time, as they arrive, until the front end has gone.
+/// Prompts sent during a turn wait in `waiting` for their own.
+async fn serve(
+    key: SessionKey,
+    session: &mut ActiveSession<'_, Agent>,
+    mut waiting: VecDeque<String>,
+    commands: &Receiver<SessionCommand>,
     events: &Sender<Event>,
-) -> Result<bool, Error> {
+    login_options: &[String],
+) {
+    loop {
+        let text = match waiting.pop_front() {
+            Some(text) => text,
+            None => match commands.recv().await {
+                Ok(SessionCommand::Prompt(text)) => text,
+                // Nothing is running, so there is nothing to stop.
+                Ok(SessionCommand::Cancel) => continue,
+                Err(_) => return,
+            },
+        };
+        let outcome = match run_turn(key, session, text, commands, &mut waiting, events).await {
+            Ok(reason) => SessionEvent::TurnEnded {
+                stop_reason: format!("{reason:?}"),
+            },
+            Err(err) => SessionEvent::TurnFailed(describe_error(err, login_options)),
+        };
+        emit(events, Event::Session(key, outcome));
+    }
+}
+
+/// Sends one prompt and forwards the session's updates until the agent answers it.
+/// The prompt is sent by hand instead of with `ActiveSession::send_prompt`, whose
+/// failure would end the whole connection along with every other session.
+async fn run_turn(
+    key: SessionKey,
+    session: &mut ActiveSession<'_, Agent>,
+    text: String,
+    commands: &Receiver<SessionCommand>,
+    waiting: &mut VecDeque<String>,
+    events: &Sender<Event>,
+) -> Result<StopReason, Error> {
     enum Next {
         Update(Result<SessionMessage, Error>),
-        Command(Option<Command>),
+        Answered(Result<Result<PromptResponse, Error>, oneshot::Canceled>),
+        Chosen(usize, Option<String>),
+        Command(Option<SessionCommand>),
     }
+    let (answer_tx, mut answer) = oneshot::channel();
+    session
+        .connection()
+        .prepare_request(PromptRequest::new(
+            session.session_id().clone(),
+            vec![text.into()],
+        ))
+        .on_receiving_result(async move |result| {
+            let _ = answer_tx.send(result);
+            Ok(())
+        })?;
+    // Permission requests are answered from this loop, so the turn keeps reading
+    // updates and can still be cancelled while the user decides.
+    let mut permissions: Vec<PendingPermission> = Vec::new();
     loop {
-        // Both arms are cancel-safe: a dropped `recv`/`read_update` loses no message.
-        let next = smol::future::or(async { Next::Update(session.read_update().await) }, async {
-            Next::Command(commands.recv().await.ok())
-        })
+        let update = async { Next::Update(session.read_update().await) };
+        let answered = async { Next::Answered((&mut answer).await) };
+        let chosen = async {
+            if permissions.is_empty() {
+                return smol::future::pending().await;
+            }
+            let choices = permissions
+                .iter_mut()
+                .map(|permission| &mut permission.choice);
+            let (choice, ix, _) = futures::future::select_all(choices).await;
+            Next::Chosen(ix, choice.ok().flatten())
+        };
+        let command = async { Next::Command(commands.recv().await.ok()) };
+        // `or` polls its left side first. Updates come before the answer, and updates
+        // sent before the answer are already queued when it arrives, so none are left behind.
+        let next = smol::future::or(
+            update,
+            smol::future::or(answered, smol::future::or(chosen, command)),
+        )
         .await;
         match next {
-            Next::Update(update) => match update? {
-                SessionMessage::StopReason(reason) => {
-                    emit(
-                        events,
-                        Event::TurnEnded {
-                            stop_reason: format!("{reason:?}"),
-                        },
-                    );
-                    return Ok(true);
+            Next::Update(update) => {
+                if let SessionMessage::SessionMessage(dispatch) = update? {
+                    handle(dispatch, key, events, &mut permissions).await?;
                 }
-                SessionMessage::SessionMessage(dispatch) => handle(dispatch, events).await?,
-                _ => {}
-            },
-            Next::Command(Some(Command::Cancel)) => session
-                .connection()
-                .send_notification(CancelNotification::new(session.session_id().clone()))?,
-            // Front ends keep the input disabled during a turn; a stray prompt is dropped.
-            Next::Command(Some(Command::Prompt(_))) => {}
-            Next::Command(None) => return Ok(false),
+            }
+            Next::Answered(answer) => {
+                return answer
+                    .map_err(|_| internal_error("the prompt was dropped"))?
+                    .map(|response| response.stop_reason);
+            }
+            Next::Chosen(ix, choice) => permissions.remove(ix).answer(choice)?,
+            Next::Command(Some(SessionCommand::Cancel)) => {
+                let id = session.session_id().clone();
+                session
+                    .connection()
+                    .send_notification(CancelNotification::new(id))?;
+                // ACP has the client answer every open permission request as cancelled.
+                for permission in permissions.drain(..) {
+                    permission.answer(None)?;
+                }
+            }
+            Next::Command(Some(SessionCommand::Prompt(text))) => waiting.push_back(text),
+            Next::Command(None) => return Err(internal_error("the session was closed")),
         }
     }
 }
 
-async fn handle(dispatch: Dispatch, events: &Sender<Event>) -> Result<(), Error> {
+async fn handle(
+    dispatch: Dispatch,
+    key: SessionKey,
+    events: &Sender<Event>,
+    permissions: &mut Vec<PendingPermission>,
+) -> Result<(), Error> {
     MatchDispatch::new(dispatch)
         .if_notification(async |notification: SessionNotification| {
             if let Some(event) = flatten(notification.update) {
-                emit(events, event);
+                emit(events, Event::Session(key, event));
             }
             Ok(())
         })
         .await
         .if_request(async |request: RequestPermissionRequest, responder| {
-            let outcome = ask_permission(request, events).await;
-            responder.respond(RequestPermissionResponse::new(outcome))
+            permissions.push(ask_permission(request, responder, key, events));
+            Ok(())
         })
         .await
         .otherwise(async |message| match message {
@@ -215,10 +423,38 @@ async fn handle(dispatch: Dispatch, events: &Sender<Event>) -> Result<(), Error>
         .await
 }
 
-async fn ask_permission(
+/// A permission request the user has not answered yet.
+struct PendingPermission {
+    options: Vec<PermissionOption>,
+    responder: Responder<RequestPermissionResponse>,
+    choice: oneshot::Receiver<Option<String>>,
+}
+
+impl PendingPermission {
+    /// Answers the agent with the chosen option; `None`, or an id it did not offer, cancels.
+    fn answer(self, chosen: Option<String>) -> Result<(), Error> {
+        let outcome = match self
+            .options
+            .into_iter()
+            .find(|option| Some(option.option_id.0.as_ref()) == chosen.as_deref())
+        {
+            Some(option) => {
+                RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(option.option_id))
+            }
+            None => RequestPermissionOutcome::Cancelled,
+        };
+        self.responder
+            .respond(RequestPermissionResponse::new(outcome))
+    }
+}
+
+/// Shows the request to the front end; the turn answers the agent once the user chooses.
+fn ask_permission(
     request: RequestPermissionRequest,
+    responder: Responder<RequestPermissionResponse>,
+    key: SessionKey,
     events: &Sender<Event>,
-) -> RequestPermissionOutcome {
+) -> PendingPermission {
     let (respond, choice) = oneshot::channel();
     let options = request
         .options
@@ -240,41 +476,39 @@ async fn ask_permission(
         .unwrap_or_else(|| "tool call".into());
     emit(
         events,
-        Event::Permission(PermissionRequest {
-            title,
-            options,
-            respond: Some(respond),
-        }),
+        Event::Session(
+            key,
+            SessionEvent::Permission(PermissionRequest {
+                title,
+                options,
+                respond: Some(respond),
+            }),
+        ),
     );
-
-    let chosen = choice.await.ok().flatten();
-    match request
-        .options
-        .into_iter()
-        .find(|option| Some(option.option_id.0.as_ref()) == chosen.as_deref())
-    {
-        Some(option) => {
-            RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(option.option_id))
-        }
-        None => RequestPermissionOutcome::Cancelled,
+    PendingPermission {
+        options: request.options,
+        responder,
+        choice,
     }
 }
 
-fn flatten(update: SessionUpdate) -> Option<Event> {
+fn flatten(update: SessionUpdate) -> Option<SessionEvent> {
     Some(match update {
-        SessionUpdate::AgentMessageChunk(chunk) => Event::AgentText(text_of(&chunk.content)),
-        SessionUpdate::AgentThoughtChunk(chunk) => Event::AgentThought(text_of(&chunk.content)),
-        SessionUpdate::ToolCall(call) => Event::ToolCall {
+        SessionUpdate::AgentMessageChunk(chunk) => SessionEvent::AgentText(text_of(&chunk.content)),
+        SessionUpdate::AgentThoughtChunk(chunk) => {
+            SessionEvent::AgentThought(text_of(&chunk.content))
+        }
+        SessionUpdate::ToolCall(call) => SessionEvent::ToolCall {
             id: call.tool_call_id.0.to_string(),
             title: call.title,
             status: format!("{:?}", call.status),
         },
-        SessionUpdate::ToolCallUpdate(update) => Event::ToolCallUpdate {
+        SessionUpdate::ToolCallUpdate(update) => SessionEvent::ToolCallUpdate {
             id: update.tool_call_id.0.to_string(),
             title: update.fields.title,
             status: update.fields.status.map(|status| format!("{status:?}")),
         },
-        SessionUpdate::Plan(plan) => Event::Plan(
+        SessionUpdate::Plan(plan) => SessionEvent::Plan(
             plan.entries
                 .into_iter()
                 .map(|entry| format!("[{:?}] {}", entry.status, entry.content))
@@ -304,24 +538,24 @@ fn describe(info: Option<&Implementation>) -> String {
     }
 }
 
+fn login_option(method: &AuthMethod) -> String {
+    match method {
+        AuthMethod::Agent(agent) => agent.name.clone(),
+        AuthMethod::Terminal(terminal) => terminal.name.clone(),
+        _ => "unknown".into(),
+    }
+}
+
 /// A missing or expired login surfaces as `auth_required` (on `session/new` or a prompt).
 /// We never handle credentials ourselves, so point at the agent's own login instead.
-fn describe_error(err: Error, auth_methods: &[AuthMethod]) -> String {
+fn describe_error(err: Error, login_options: &[String]) -> String {
     if err.code != ErrorCode::AuthRequired {
         return err.to_string();
     }
-    let names: Vec<&str> = auth_methods
-        .iter()
-        .map(|method| match method {
-            AuthMethod::Agent(agent) => agent.name.as_str(),
-            AuthMethod::Terminal(terminal) => terminal.name.as_str(),
-            _ => "unknown",
-        })
-        .collect();
     format!(
         "not logged in, or the login expired. Log in with the agent's own CLI \
-         (`claude` then /login, or `codex login`), then restart. Agent offers: {}",
-        names.join(", ")
+         (`claude` then /login, or `codex login`), then try again. Agent offers: {}",
+        login_options.join(", ")
     )
 }
 
