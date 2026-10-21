@@ -2,3 +2,9 @@
 # so the multi-GB build output stays on this machine.
 [build]
 target-dir = "target.nosync"
+
+# block 0.1.6, pulled in by gpui's macOS layer via cocoa and metal, triggers this
+# notice on every build and only gpui upstream can fix it.
+# `cargo report future-incompatibilities` still lists the reports.
+[future-incompat-report]
+frequency = "never"
