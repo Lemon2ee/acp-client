@@ -416,9 +416,21 @@ impl ChatView {
 }
 
 const SIDEBAR_WIDTH: f32 = 240.;
+/// The chat's status header.
+const HEADER_HEIGHT: f32 = 40.;
+
+/// On macOS the window has no title bar row: the content reaches the top edge and
+/// the traffic lights sit at the top of the sidebar. Elsewhere the system title bar stays.
+const OWN_TITLE_BAR: bool = cfg!(target_os = "macos");
+/// The sidebar's top row, which holds the traffic lights. It ends at the line under
+/// the chat's header, which starts below the chat card's 8px top margin.
+const TITLE_BAR_HEIGHT: f32 = 8. + HEADER_HEIGHT;
+/// The close button's top-left corner. With macOS 27's 16pt buttons this centers the
+/// traffic lights on the header's text, and the close button over the New session icon.
+const TRAFFIC_LIGHTS: Point<Pixels> = point(px(21.), px(21.));
 
 impl ChatView {
-    fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_sidebar(&self, title_bar: bool, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let (foreground, border, background, hover) = (
             theme.sidebar_foreground,
@@ -464,46 +476,56 @@ impl ChatView {
             .h_full()
             .flex()
             .flex_col()
-            .gap_1()
-            .p_2()
             .text_color(foreground)
-            .child(
-                // A plain div: the component Button always centers its label.
-                div()
-                    .id("new-session")
-                    .role(Role::Button)
-                    .aria_label("New session")
-                    .h(px(32.))
-                    .px_3()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(border)
-                    .bg(background)
-                    .text_sm()
-                    .cursor_pointer()
-                    .hover(|style| style.bg(hover))
-                    .child(Icon::new(IconName::Plus).small())
-                    .child("New session")
-                    .on_click(
-                        cx.listener(|this, _: &ClickEvent, window, cx| {
-                            this.new_session(window, cx)
-                        }),
-                    ),
-            )
+            .when(title_bar, |sidebar| {
+                // Nothing goes here: the traffic lights are drawn over this row.
+                sidebar.child(div().flex_none().h(px(TITLE_BAR_HEIGHT)))
+            })
             .child(
                 div()
-                    .id("sessions")
                     .flex_1()
                     .min_h(px(0.))
-                    .mt_2()
                     .flex()
                     .flex_col()
-                    .gap_0p5()
-                    .overflow_y_scroll()
-                    .children(cards),
+                    .gap_1()
+                    .p_2()
+                    .when(title_bar, |content| content.pt_0())
+                    .child(
+                        // A plain div: the component Button always centers its label.
+                        div()
+                            .id("new-session")
+                            .role(Role::Button)
+                            .aria_label("New session")
+                            .h(px(32.))
+                            .px_3()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(border)
+                            .bg(background)
+                            .text_sm()
+                            .cursor_pointer()
+                            .hover(|style| style.bg(hover))
+                            .child(Icon::new(IconName::Plus).small())
+                            .child("New session")
+                            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                this.new_session(window, cx)
+                            })),
+                    )
+                    .child(
+                        div()
+                            .id("sessions")
+                            .flex_1()
+                            .min_h(px(0.))
+                            .mt_2()
+                            .flex()
+                            .flex_col()
+                            .gap_0p5()
+                            .overflow_y_scroll()
+                            .children(cards),
+                    ),
             )
     }
 }
@@ -546,8 +568,10 @@ impl Render for ChatView {
             .bg(background)
             .child(
                 div()
+                    .h(px(HEADER_HEIGHT))
                     .px_4()
-                    .py_2()
+                    .flex()
+                    .items_center()
                     .border_b_1()
                     .border_color(border)
                     .text_sm()
@@ -586,7 +610,7 @@ impl Render for ChatView {
             .flex()
             .bg(sidebar)
             .text_color(foreground)
-            .child(self.render_sidebar(cx))
+            .child(self.render_sidebar(OWN_TITLE_BAR, cx))
             .child(chat)
     }
 }
@@ -614,7 +638,8 @@ fn main() {
                 ))),
                 titlebar: Some(TitlebarOptions {
                     title: Some(format!("ACP client: {name}").into()),
-                    ..Default::default()
+                    appears_transparent: OWN_TITLE_BAR,
+                    traffic_light_position: OWN_TITLE_BAR.then_some(TRAFFIC_LIGHTS),
                 }),
                 ..Default::default()
             };
