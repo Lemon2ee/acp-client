@@ -139,8 +139,12 @@ impl Session {
                 .as_ref()
                 .and_then(|id| request.options.iter().find(|option| option.id == *id))
                 .map_or_else(|| "rejected".to_string(), |option| option.name.clone());
-            request.answer(choice);
-            *decided = Some(format!("answered: {label}"));
+            // The turn may have been stopped or ended since the card was drawn.
+            *decided = Some(if request.answer(choice) {
+                format!("answered: {label}")
+            } else {
+                "cancelled".into()
+            });
             self.remeasure(ix, cx);
         }
     }
