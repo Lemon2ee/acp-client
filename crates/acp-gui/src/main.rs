@@ -19,18 +19,21 @@ use gpui_kit::component::input::{
     Input, InputEvent, InputGroup, InputGroupAddon, InputGroupAddonAlignment, InputGroupButton,
     InputState, Textarea, TextareaState,
 };
+use gpui_kit::component::kbd::Kbd;
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::message_scroller::{MessageScroller, MessageScrollerState};
 use gpui_kit::component::popover::{Popover, PopoverState};
 use gpui_kit::component::switch::Switch;
+use gpui_kit::component::tab::{Tab, TabBar};
 use gpui_kit::component::text::{TextView, TextViewState};
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{
-    ActiveTheme as _, FocusableExt as _, Icon, IconName, Sizable as _, Theme, ThemeConfig, h_flex,
-    resize_handle, v_flex,
+    ActiveTheme as _, FocusableExt as _, Icon, IconName, Sizable as _, Theme, ThemeConfig,
+    ThemeMode, h_flex, resize_handle, v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
+use serde::{Deserialize, Serialize};
 
 enum Row {
     User(String),
@@ -77,6 +80,20 @@ struct Session {
     /// switches, and every setting of a session the agent hasn't created yet, as no
     /// answer comes until it has.
     asked: HashMap<String, Asked>,
+    /// The agent's id for it, once the agent has it, which keeps it for later runs.
+    id: Option<String>,
+    origin: Origin,
+}
+
+/// Which run a session's agent session comes from.
+enum Origin {
+    /// This one: the agent creates it on its first prompt, or as a spare.
+    New,
+    /// An earlier one, and the agent hasn't been asked to load it yet: the folder it
+    /// was created in, which loading it needs. It loads as it first shows.
+    Saved(PathBuf),
+    /// An earlier one, and the agent has been asked to load it.
+    Loaded,
 }
 
 /// A setting changed here, until the agent has answered every change it was asked for.
@@ -100,6 +117,8 @@ impl Session {
             settings: Vec::new(),
             created: false,
             asked: HashMap::new(),
+            id: None,
+            origin: Origin::New,
         }
     }
 
@@ -139,6 +158,8 @@ impl Session {
 
     fn apply(&mut self, event: SessionEvent, cx: &mut App) {
         match event {
+            SessionEvent::Created(id) => self.id = Some(id),
+            SessionEvent::UserText(text) => self.append_user_text(&text, cx),
             SessionEvent::AgentText(text) => self.append_text(false, &text, cx),
             SessionEvent::AgentThought(text) => self.append_text(true, &text, cx),
             SessionEvent::ToolCall { id, title, status } => {
@@ -269,6 +290,16 @@ impl Session {
         self.remeasure(self.rows.len() - 1, cx);
     }
 
+    /// The user's own messages come back in parts as the agent replays a session it
+    /// loads, each part of a message after the one before.
+    fn append_user_text(&mut self, text: &str, cx: &mut App) {
+        match self.rows.last_mut() {
+            Some(Row::User(message)) => message.push_str(text),
+            _ => return self.push(Row::User(text.to_string()), cx),
+        }
+        self.remeasure(self.rows.len() - 1, cx);
+    }
+
     fn push(&mut self, row: Row, cx: &mut App) {
         self.rows.push(row);
         self.scroller.update(cx, |scroller, cx| {
@@ -288,6 +319,10 @@ struct AgentSlot {
     /// What the agent is called in the window: its harness's name, or the command it
     /// was started with.
     name: String,
+    /// The command line that started it, for the settings' list of agents.
+    command: String,
+    /// The agent has said it is ready, so sessions can be created on it.
+    connected: bool,
     commands: Sender<Command>,
     /// A session created ahead of its use, so the model menu can list the models of an
     /// agent that has no session on show and no settings kept from before. Taken by
@@ -305,9 +340,10 @@ struct AgentSlot {
 }
 
 struct ChatView {
-    /// Never empty: the window starts with one session, which its first prompt has the
-    /// agent create. At most one has no prompt yet; the sidebar leaves it out, and a new
-    /// one on another agent takes its place.
+    /// Never empty: the window starts with the sessions kept from earlier runs, oldest
+    /// first, and one new session, which its first prompt has the agent create. At most
+    /// one has no prompt yet; the sidebar leaves it out, and a new one on another agent
+    /// takes its place.
     sessions: Vec<Session>,
     /// Index into `sessions` of the one on screen.
     active: usize,
@@ -316,6 +352,8 @@ struct ChatView {
     /// Never empty. New sessions go on the agent of the session on screen, until the
     /// user picks another agent's model.
     agents: Vec<AgentSlot>,
+    /// The folder the agents create new sessions in.
+    cwd: PathBuf,
     /// The window's top row, across the sidebar and the chat. It holds the traffic lights
     /// on macOS, the sidebar button, and the name of the session on screen.
     title_bar_height: Pixels,
@@ -328,16 +366,34 @@ struct ChatView {
     /// The models the user starred, which the model panel's favorites tab lists.
     /// Kept on disk.
     favorites: Vec<Favorite>,
+    /// The blur is on: the desktop shows through the window, blurred, behind the sidebar
+    /// and the chat, except in full screen.
+    window_blur: bool,
+    /// The window is blurred now, and its sidebar and chat translucent.
+    blurred: bool,
+    /// The settings take the whole window while open, in place of the sidebar and the
+    /// chat, which come back as they were.
+    settings_open: bool,
+    /// The settings' page on show, kept while they are closed.
+    settings_page: SettingsPage,
+    /// Holds keyboard focus while the settings are open, so Esc and Cmd+, reach them:
+    /// the prompt box, which has it otherwise, isn't drawn then.
+    settings_focus: FocusHandle,
     _input_events: Subscription,
     _search_events: Subscription,
+    _bounds_events: Subscription,
+    _settings_events: Subscription,
 }
 
 impl ChatView {
-    /// Starts every agent in `agents`, each by name, and shows a session on the first
-    /// that no agent creates until its first prompt.
+    /// Starts every agent in `agents`, each by name, lists the sessions kept from
+    /// earlier runs on them, and shows a session on the first that no agent creates
+    /// until its first prompt. `blur` is whether the window opened blurred (see
+    /// `window_background`).
     fn new(
         agents: Vec<(String, AcpAgent)>,
         cwd: PathBuf,
+        blur: bool,
         title_bar_height: Pixels,
         traffic_lights_end: Pixels,
         window: &mut Window,
@@ -360,9 +416,29 @@ impl ChatView {
                 cx.notify();
             }
         });
+        // Going into full screen or out of it resizes the window.
+        let bounds_events = cx.observe_window_bounds(window, |this, window, cx| {
+            this.update_window_background(window, cx)
+        });
         window.on_window_should_close(cx, |_, cx| {
             cx.quit();
             true
+        });
+        let settings_events = cx.observe_global_in::<AppSettings>(window, |this, window, cx| {
+            this.apply_settings(window, cx)
+        });
+        // The app menu's Settings… and Cmd+, come here from wherever the focus is, or from
+        // nowhere, as nothing in the window handles them. That is inside the window's own
+        // update, where the window can't be reached, so the settings open just after.
+        let (handle, view) = (window.window_handle(), cx.entity().downgrade());
+        // `App`'s own `on_action`, as `Context` has one for a window's.
+        App::on_action(cx, move |_: &OpenSettings, cx| {
+            let view = view.clone();
+            cx.defer(move |cx| {
+                let _ = handle.update(cx, |_, window, cx| {
+                    view.update(cx, |this, cx| this.open_settings(window, cx))
+                });
+            });
         });
 
         let mut last_settings = load_last_settings();
@@ -370,6 +446,11 @@ impl ChatView {
             .into_iter()
             .enumerate()
             .map(|(ix, (name, agent))| {
+                let config = agent.config();
+                let command = std::iter::once(config.command().display().to_string())
+                    .chain(config.arguments().iter().cloned())
+                    .collect::<Vec<_>>()
+                    .join(" ");
                 let handle = acp_core::spawn(agent, cwd.clone());
                 let events = handle.events;
                 let events_task = cx.spawn(async move |this, cx| {
@@ -387,6 +468,8 @@ impl ChatView {
                         .and_then(|kept| last_settings.remove(kept))
                         .unwrap_or_default(),
                     name,
+                    command,
+                    connected: false,
                     commands: handle.commands,
                     spare: None,
                     spare_failed: false,
@@ -401,6 +484,7 @@ impl ChatView {
             next_key: 0,
             input,
             agents,
+            cwd,
             title_bar_height,
             traffic_lights_end,
             sidebar_open: true,
@@ -410,11 +494,135 @@ impl ChatView {
                 search,
             },
             favorites: load_favorites(),
+            window_blur: blur,
+            blurred: blur,
+            settings_open: false,
+            settings_page: SettingsPage::General,
+            settings_focus: cx.focus_handle(),
             _input_events: input_events,
             _search_events: search_events,
+            _bounds_events: bounds_events,
+            _settings_events: settings_events,
         };
-        view.new_session(window, cx);
+        view.restore_sessions(cx);
+        // On the first agent, whatever agent the oldest kept session is on, and even if
+        // that agent is already gone, so there is always a session to show.
+        let ix = view.untitled_on(0, cx);
+        view.show(ix, window, cx);
         view
+    }
+
+    /// Lists the sessions kept from earlier runs on the window's agents. None is loaded
+    /// until it shows, as Claude's adapter starts a Claude Code process for each.
+    fn restore_sessions(&mut self, cx: &mut App) {
+        for saved in load_saved_sessions() {
+            let agent = self
+                .agents
+                .iter()
+                .position(|slot| kept_name(&slot.name) == Some(saved.agent.as_str()));
+            let Some(agent) = agent else {
+                continue;
+            };
+            let key = SessionKey(self.next_key);
+            self.next_key += 1;
+            let mut session = Session::new(key, agent, cx);
+            session.title = Some(saved.title);
+            session.id = Some(saved.id);
+            session.origin = Origin::Saved(saved.cwd);
+            self.sessions.push(session);
+        }
+    }
+
+    /// Has the agent load a session kept from an earlier run, as it first shows. Its
+    /// transcript comes in as the agent replays it, and it takes prompts once loaded.
+    fn load(&mut self, ix: usize, cx: &mut App) {
+        let session = &mut self.sessions[ix];
+        let (Origin::Saved(cwd), Some(id)) = (&session.origin, &session.id) else {
+            return;
+        };
+        let load = Command::LoadSession(session.key, id.clone(), cwd.clone());
+        session.origin = Origin::Loaded;
+        session.busy = true;
+        let slot = &self.agents[session.agent];
+        if slot.commands.try_send(load).is_err() {
+            let message = format!("{} has gone; restart to use it", slot.name);
+            session.push(Row::Error(message), cx);
+        }
+    }
+
+    /// Keeps the session for later runs once it has both the agent's id and a title.
+    /// Only Claude's and Codex's are kept: any other agent is named only by its
+    /// command, which may carry a secret. One from an earlier run is kept already.
+    fn save_session(&self, key: SessionKey) {
+        let Some(session) = self.session(key) else {
+            return;
+        };
+        let (Some(id), Some(title)) = (&session.id, &session.title) else {
+            return;
+        };
+        let Some(agent) = kept_name(&self.agents[session.agent].name) else {
+            return;
+        };
+        if !matches!(session.origin, Origin::New) {
+            return;
+        }
+        let saved = SavedSession {
+            agent: agent.to_string(),
+            id: id.clone(),
+            title: title.clone(),
+            cwd: self.cwd.clone(),
+        };
+        let changed = config_folder()
+            .ok_or_else(|| std::io::Error::other("there is no config folder"))
+            .and_then(|folder| change_saved_sessions(&folder, |sessions| sessions.push(saved)));
+        if let Err(err) = changed {
+            eprintln!("couldn't keep the session for later runs: {err}");
+        }
+    }
+
+    /// Takes up a change to the app's settings. The theme is the app's, so a new
+    /// appearance repaints every window.
+    fn apply_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        apply_appearance(window, cx);
+        let blur = cx.global::<AppSettings>().window_blur;
+        self.set_window_blur(blur, window, cx);
+        cx.notify();
+    }
+
+    /// Shows the settings in place of the sidebar and the chat, on the page they were
+    /// last left on.
+    fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.settings_open = true;
+        window.focus(&self.settings_focus, cx);
+        cx.notify();
+    }
+
+    /// Brings back the sidebar and the chat as they were, the prompt box focused.
+    fn close_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.settings_open = false;
+        self.input.update(cx, |input, cx| input.focus(window, cx));
+        cx.notify();
+    }
+
+    /// Has the desktop show through the window, blurred, behind the sidebar and the chat,
+    /// or stop. Where gpui can't blur (see `WINDOW_BLUR`) the window stays opaque.
+    fn set_window_blur(&mut self, on: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.window_blur = on && WINDOW_BLUR;
+        self.update_window_background(window, cx);
+    }
+
+    /// Blurs the window while the blur is on and the window isn't in full screen, and
+    /// makes it opaque otherwise. In full screen the window fills a space of its own,
+    /// and being opaque there spares the window server blending it with what's behind.
+    fn update_window_background(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let blurred = self.window_blur && !window.is_fullscreen();
+        // Called on every resize, so only a change reaches the platform.
+        if blurred == self.blurred {
+            return;
+        }
+        self.blurred = blurred;
+        window.set_background_appearance(window_background(blurred));
+        cx.notify();
     }
 
     /// A session on the agent that the agent hasn't created yet: acp-core has it created
@@ -434,11 +642,14 @@ impl ChatView {
     }
 
     /// Makes a spare session for each agent whose models the model menu could list no
-    /// other way: it has no spare, no session on show, and no settings kept from before.
-    /// None is made before the window's first prompt, so starting the window has no
-    /// agent create a session.
+    /// other way: it has no spare, no session on show that it will create or load, and
+    /// no settings kept from before. None is made before the window's first prompt or
+    /// load, so starting the window has no agent create a session.
     fn make_spares(&mut self, cx: &mut App) {
-        if self.sessions.iter().all(|session| session.title.is_none()) {
+        let asked = |session: &Session| {
+            session.title.is_some() && !matches!(session.origin, Origin::Saved(_))
+        };
+        if !self.sessions.iter().any(asked) {
             return;
         }
         for agent in 0..self.agents.len() {
@@ -446,7 +657,9 @@ impl ChatView {
             if slot.spare.is_some()
                 || !slot.last_settings.is_empty()
                 || slot.commands.is_closed()
-                || self.sessions.iter().any(|session| session.agent == agent)
+                || self.sessions.iter().any(|session| {
+                    session.agent == agent && !matches!(session.origin, Origin::Saved(_))
+                })
             {
                 continue;
             }
@@ -515,15 +728,10 @@ impl ChatView {
         }
     }
 
-    /// Shows a session with no prompt yet on the agent of the one on screen. The
-    /// window's first session is added even if the agent is already gone, so there is
-    /// always one to show.
+    /// Shows a session with no prompt yet on the agent of the one on screen.
     fn new_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let agent = self
-            .sessions
-            .get(self.active)
-            .map_or(0, |session| session.agent);
-        if self.agents[agent].commands.is_closed() && !self.sessions.is_empty() {
+        let agent = self.sessions[self.active].agent;
+        if self.agents[agent].commands.is_closed() {
             return;
         }
         let ix = self.untitled_on(agent, cx);
@@ -565,8 +773,10 @@ impl ChatView {
         }
     }
 
-    /// Puts the session at `ix` on screen; unsent text stays with the session it was typed in.
+    /// Puts the session at `ix` on screen; unsent text stays with the session it was typed
+    /// in. One kept from an earlier run loads now.
     fn show(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.load(ix, cx);
         if ix != self.active {
             self.sessions[self.active].draft = self.input.read(cx).value();
             self.active = ix;
@@ -628,14 +838,21 @@ impl ChatView {
             return;
         }
         self.input.update(cx, |input, cx| input.clean(window, cx));
+        let first = session.title.is_none();
         session
             .title
             .get_or_insert_with(|| text.lines().next().unwrap_or_default().to_string());
         session.busy = true;
         session.push(Row::User(text.clone()), cx);
+        let key = session.key;
         // Has the agent create the session first, if it hasn't yet.
-        let prompt = Command::Prompt(session.key, text);
+        let prompt = Command::Prompt(key, text);
         let _ = self.agents[session.agent].commands.try_send(prompt);
+        // A spare the agent created has its id already; any other session is kept
+        // once the agent gives it one.
+        if first {
+            self.save_session(key);
+        }
         // The window's first prompt lets the agents that need one make a spare.
         self.make_spares(cx);
         cx.notify();
@@ -735,12 +952,12 @@ impl ChatView {
     }
 
     /// Keeps the settings the agent created the session with as its last, here and on
-    /// disk, unless they are the ones kept already. Only a session's first settings are
-    /// those: later ones carry the changes made to it.
+    /// disk, unless they are the ones kept already. Only a new session's first settings
+    /// are those: later ones carry the changes made to it, as a loaded session's may.
     fn remember_settings(&mut self, agent: usize, key: SessionKey, settings: &[Setting]) {
         let first = self
             .session_mut(key)
-            .is_some_and(|session| !session.created);
+            .is_some_and(|session| !session.created && matches!(session.origin, Origin::New));
         let slot = &mut self.agents[agent];
         if !first || slot.last_settings == settings {
             return;
@@ -760,7 +977,7 @@ impl ChatView {
     /// Takes an event from the agent at `agent`.
     fn apply(&mut self, agent: usize, event: AgentEvent, cx: &mut Context<Self>) {
         match event {
-            AgentEvent::Connected { .. } => {}
+            AgentEvent::Connected { .. } => self.agents[agent].connected = true,
             AgentEvent::SessionReady(key) => {
                 if let Some(session) = self.session_mut(key) {
                     session.busy = false;
@@ -798,8 +1015,12 @@ impl ChatView {
                     // failing after this is news.
                     self.agents[agent].spare_failed = false;
                 }
+                let created = matches!(event, SessionEvent::Created(_));
                 if let Some(session) = self.session_mut(key) {
                     session.apply(event, cx);
+                }
+                if created {
+                    self.save_session(key);
                 }
             }
             // Connection-wide failures show in the session on screen when it is the
@@ -1006,6 +1227,25 @@ const SIDEBAR_BUTTON_SIZE: Pixels = px(28.);
 /// top edge, with the traffic lights in the window's top row. Elsewhere the system
 /// title bar stays.
 const OWN_TITLE_BAR: bool = cfg!(target_os = "macos");
+
+/// Whether the window can blur what is behind it. On macOS gpui puts an
+/// `NSVisualEffectView` under its Metal layer and the window server blurs; elsewhere
+/// the window stays opaque, as gpui's blur there is a guess: Windows uses an undocumented
+/// acrylic attribute, Wayland blurs only under KDE, and X11 just turns see-through.
+const WINDOW_BLUR: bool = cfg!(target_os = "macos");
+/// How much of the blur the sidebar's and the chat's colors cover while the window is
+/// blurred. The sidebar lets more of it through, as macOS sidebars do, and the chat
+/// little enough that its text reads as well as on an opaque window.
+const BLURRED_SIDEBAR_ALPHA: f32 = 0.6;
+const BLURRED_CHAT_ALPHA: f32 = 0.85;
+
+fn window_background(blurred: bool) -> WindowBackgroundAppearance {
+    if blurred {
+        WindowBackgroundAppearance::Blurred
+    } else {
+        WindowBackgroundAppearance::Opaque
+    }
+}
 
 /// Where the traffic lights go, and the top row that holds them, with as much space to
 /// the lights' left and below them as above.
@@ -2327,20 +2567,7 @@ impl ChatView {
             .flex()
             .flex_col()
             .text_color(foreground)
-            .child(
-                // The line between the sidebar and the chat, which goes with the sidebar,
-                // and the band over it that drags the sidebar's width: the root follows
-                // the drag. A double-click puts the width back.
-                resize_handle("sidebar-edge", Axis::Horizontal)
-                    .inside(HandleEdge::Trailing)
-                    .on_drag(ResizeSidebar, |_, _, _, cx| cx.new(|_| ResizeSidebar))
-                    .on_click(cx.listener(|this, event: &ClickEvent, _, cx| {
-                        if event.click_count() == 2 {
-                            this.sidebar_width = SIDEBAR_WIDTH;
-                            cx.notify();
-                        }
-                    })),
-            )
+            .child(self.sidebar_edge(cx))
             .child(
                 // Nothing goes here: the traffic lights and the sidebar button are drawn
                 // over this row.
@@ -2394,8 +2621,68 @@ impl ChatView {
                             .gap_0p5()
                             .overflow_y_scroll()
                             .children(cards),
+                    )
+                    .child(
+                        div()
+                            .id("open-settings")
+                            .role(Role::Button)
+                            .aria_label("Settings")
+                            .h(px(32.))
+                            .flex_none()
+                            // The gear reaches about 1px further out than the plus above
+                            // it, so it starts 1px further in, and 1px closer to its label.
+                            .pl(px(11.5))
+                            .pr_3()
+                            .flex()
+                            .items_center()
+                            .gap(px(7.))
+                            .rounded_md()
+                            .text_sm()
+                            .cursor_pointer()
+                            .hover(|style| style.bg(hover))
+                            .child(Icon::new(IconName::Settings).small())
+                            .child("Settings")
+                            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                this.open_settings(window, cx)
+                            })),
                     ),
             )
+    }
+
+    /// The line between the sidebar, or the settings' list of pages, and what is right of
+    /// it, and the band over it that drags the sidebar's width: the root follows the
+    /// drag. A double-click puts the width back.
+    fn sidebar_edge(&self, cx: &Context<Self>) -> impl IntoElement {
+        resize_handle("sidebar-edge", Axis::Horizontal)
+            .inside(HandleEdge::Trailing)
+            .on_drag(ResizeSidebar, |_, _, _, cx| cx.new(|_| ResizeSidebar))
+            .on_click(cx.listener(|this, event: &ClickEvent, _, cx| {
+                if event.click_count() == 2 {
+                    this.sidebar_width = SIDEBAR_WIDTH;
+                    cx.notify();
+                }
+            }))
+    }
+
+    /// The sidebar's color and the chat's, which let the blur through while the window
+    /// is blurred. The settings' list of pages and their page take the same two.
+    fn panel_colors(&self, cx: &App) -> (Hsla, Hsla) {
+        let theme = cx.theme();
+        if self.blurred {
+            (
+                theme.sidebar.opacity(BLURRED_SIDEBAR_ALPHA),
+                theme.background.opacity(BLURRED_CHAT_ALPHA),
+            )
+        } else {
+            (theme.sidebar, theme.background)
+        }
+    }
+
+    /// Follows a drag of the sidebar's edge: the sidebar ends where the pointer is.
+    fn resize_sidebar(&mut self, event: &DragMoveEvent<ResizeSidebar>, cx: &mut Context<Self>) {
+        let width = event.event.position.x - event.bounds.left();
+        self.sidebar_width = width.clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH);
+        cx.notify();
     }
 }
 
@@ -2404,13 +2691,24 @@ impl Render for ChatView {
         // In full screen the traffic lights go back to the system's title bar, which
         // slides down over the window, so the window keeps none of its own.
         let title_bar = OWN_TITLE_BAR && !window.is_fullscreen();
-        let theme = cx.theme();
-        let (background, foreground, sidebar, input_border) = (
-            theme.background,
-            theme.foreground,
-            theme.sidebar,
-            theme.input,
+        let motion = cx.theme().motion_tokens();
+        let fade = Transition::new(motion.duration_fast).easing(motion.easing_enter.clone());
+        // 1 while the settings are open, 0 while not. The settings fade in on their own,
+        // as each page does; the sidebar and the chat fade back in on this.
+        let settings_shown = transition(
+            "settings-shown",
+            if self.settings_open { 1. } else { 0. },
+            fade,
+            window,
+            cx,
         );
+        if self.settings_open {
+            return self.render_settings(title_bar, cx);
+        }
+        let chat_shown = 1. - settings_shown;
+        let (sidebar, background) = self.panel_colors(cx);
+        let theme = cx.theme();
+        let (foreground, input_border) = (theme.foreground, theme.input);
         let (muted, hover) = (theme.muted_foreground, theme.secondary);
         let motion = theme.motion_tokens();
         let slide = Transition::new(motion.duration_slow).easing(motion.easing_move.clone());
@@ -2470,6 +2768,8 @@ impl Render for ChatView {
             .flex_col()
             .overflow_hidden()
             .bg(background)
+            // The chat's color stays as the settings close, so the window doesn't show
+            // through while what is on it fades back in.
             .child(
                 // The session's name, in the window's top row. While the sidebar is
                 // hidden the traffic lights and the sidebar button sit here too.
@@ -2483,6 +2783,7 @@ impl Render for ChatView {
                     .text_sm()
                     .font_weight(FontWeight::MEDIUM)
                     .children(name.map(|name| div().flex_1().min_w(px(0.)).truncate().child(name)))
+                    .opacity(chat_shown)
                     .when(title_bar, as_title_bar),
             )
             .child(
@@ -2493,12 +2794,13 @@ impl Render for ChatView {
                     cx.processor(|this, ix: usize, window, cx| this.render_row(ix, window, cx)),
                 )
                 .flex_1()
-                .min_h(px(0.)),
+                .min_h(px(0.))
+                .opacity(chat_shown),
             )
             .child(
                 // A row along the input box's bottom: the session's model and mode on the
                 // left, the send/stop button on the right.
-                div().p_3().child(
+                div().p_3().opacity(chat_shown).child(
                     InputGroup::new("prompt")
                         .rounded_xl()
                         // The group brightens its border and rings itself while it has
@@ -2558,6 +2860,7 @@ impl Render for ChatView {
             .rounded_md()
             .cursor_pointer()
             .hover(|style| style.bg(hover))
+            .opacity(chat_shown)
             // Keeps presses from the title bar strip underneath, which would move the
             // window instead.
             .occlude()
@@ -2578,7 +2881,6 @@ impl Render for ChatView {
             .size_full()
             .relative()
             .flex()
-            .bg(sidebar)
             .text_color(foreground)
             // A drag of the sidebar's edge can leave the edge's own band within a pixel,
             // so the whole window follows it: the sidebar ends where the pointer is.
@@ -2590,9 +2892,7 @@ impl Render for ChatView {
                     if hidden > 0. {
                         return;
                     }
-                    let width = event.event.position.x - event.bounds.left();
-                    this.sidebar_width = width.clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH);
-                    cx.notify();
+                    this.resize_sidebar(event, cx);
                 }),
             )
             // The prompt box keeps keyboard focus while text in the chat is selected, and
@@ -2607,18 +2907,640 @@ impl Render for ChatView {
             })
             .child(
                 // The sidebar keeps its width and slides out to the left as this narrows.
+                // Its color stops here, so that while the window is blurred it isn't
+                // also under the chat's.
                 div()
                     .flex_none()
                     .h_full()
                     .w(sidebar_width)
                     .overflow_hidden()
+                    .bg(sidebar)
                     .child(
                         self.render_sidebar(title_bar, cx)
-                            .ml(sidebar_width - self.sidebar_width),
+                            .ml(sidebar_width - self.sidebar_width)
+                            .opacity(chat_shown),
                     ),
             )
             .child(chat)
             .child(toggle)
+            .into_any_element()
+    }
+}
+
+/// The widest the settings' column gets: 560 for the settings, and 32 either side.
+const SETTINGS_COLUMN_WIDTH: Pixels = px(624.);
+/// A settings page's title, and the text of its settings: a setting's name, with what it
+/// does below in smaller type, at the sizes macOS's own settings use.
+const SETTINGS_TITLE_SIZE: Pixels = px(22.);
+const SETTING_TEXT_SIZE: Pixels = px(13.);
+const SETTING_NOTE_SIZE: Pixels = px(12.);
+/// How tall a setting's row is with its two lines, and a shortcut's with one.
+const SETTING_ROW_HEIGHT: Pixels = px(56.);
+const SHORTCUT_ROW_HEIGHT: Pixels = px(44.);
+/// How far in from a group's edges its rows' text starts, and the lines between them.
+const SETTING_ROW_INSET: Pixels = px(16.);
+/// The rounded tile behind an agent's mark in the settings' list of agents.
+const AGENT_TILE_SIZE: Pixels = px(28.);
+
+/// A page of the settings.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SettingsPage {
+    General,
+    Agents,
+    Keyboard,
+}
+
+impl SettingsPage {
+    const ALL: [Self; 3] = [Self::General, Self::Agents, Self::Keyboard];
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::General => "General",
+            Self::Agents => "Agents",
+            Self::Keyboard => "Keyboard",
+        }
+    }
+
+    fn icon(self) -> gpui_kit::assets::IconName {
+        use gpui_kit::assets::IconName;
+        match self {
+            Self::General => IconName::SlidersHorizontal,
+            Self::Agents => IconName::Bot,
+            Self::Keyboard => IconName::Keyboard,
+        }
+    }
+}
+
+/// What the keyboard page lists, each with its keystroke as `main` binds it, or as the
+/// prompt box takes it. None can be changed yet.
+const SHORTCUTS: [(&str, &str); 6] = [
+    ("Send message", "enter"),
+    ("New line", "shift-enter"),
+    ("Copy selected text in the chat", "cmd-c"),
+    ("Open or leave settings", "cmd-,"),
+    ("Leave settings", "escape"),
+    ("Quit", "cmd-q"),
+];
+
+impl ChatView {
+    /// The settings over the whole window: a list of their pages where the sidebar goes,
+    /// and the page on show where the chat goes. The sessions go on as they were.
+    fn render_settings(&mut self, title_bar: bool, cx: &mut Context<Self>) -> AnyElement {
+        let (sidebar, background) = self.panel_colors(cx);
+        let theme = cx.theme();
+        let (foreground, sidebar_foreground, muted, hover) = (
+            theme.foreground,
+            theme.sidebar_foreground,
+            theme.muted_foreground,
+            theme.secondary,
+        );
+        let (accent, accent_foreground) = (theme.sidebar_accent, theme.sidebar_accent_foreground);
+        let motion = theme.motion_tokens();
+        let easing = motion.easing_enter.clone();
+        // Each side comes in on its own, as it is drawn anew; the page again for each
+        // page picked. Reduced motion draws them at once.
+        let fade = Animation::new(motion.duration_fast).with_easing(move |t| easing.sample(t));
+        let page = self.settings_page;
+
+        let page_rows = SettingsPage::ALL.map(|item| {
+            div()
+                .id(("settings-page", item as usize))
+                .role(Role::Button)
+                .aria_label(item.name())
+                .aria_selected(item == page)
+                .h(px(32.))
+                .flex_none()
+                .px_3()
+                .flex()
+                .items_center()
+                .gap_2()
+                .rounded_md()
+                .text_sm()
+                .cursor_pointer()
+                .map(|row| {
+                    if item == page {
+                        row.bg(accent)
+                            .text_color(accent_foreground)
+                            .font_weight(FontWeight::MEDIUM)
+                    } else {
+                        row.hover(|style| style.bg(hover))
+                    }
+                })
+                .child(
+                    Icon::new(item.icon())
+                        .small()
+                        .when(item != page, |icon| icon.text_color(muted)),
+                )
+                .child(item.name())
+                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    this.settings_page = item;
+                    cx.notify();
+                }))
+        });
+        let pages = div()
+            .w(self.sidebar_width)
+            .flex_none()
+            .h_full()
+            .relative()
+            .flex()
+            .flex_col()
+            .bg(sidebar)
+            .text_color(sidebar_foreground)
+            .child(self.sidebar_edge(cx))
+            .child(
+                // Under the traffic lights; the sidebar button has no use here.
+                div()
+                    .flex_none()
+                    .h(self.title_bar_height)
+                    .when(title_bar, as_title_bar),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_h(px(0.))
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .px_2()
+                    .pb_2()
+                    .child(
+                        div()
+                            .id("close-settings")
+                            .role(Role::Button)
+                            .aria_label("Back to app")
+                            .h(px(32.))
+                            .flex_none()
+                            // The arrow starts as far into its icon as the plus of New
+                            // session does, so it lines up the same way.
+                            .pl(px(10.5))
+                            .pr_3()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .rounded_md()
+                            .text_sm()
+                            .text_color(muted)
+                            .cursor_pointer()
+                            .hover(|style| style.bg(hover).text_color(sidebar_foreground))
+                            .child(Icon::new(IconName::ArrowLeft).small())
+                            .child("Back to app")
+                            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                this.close_settings(window, cx)
+                            })),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .mt_2()
+                            .px_3()
+                            .pb_1()
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(muted)
+                            .child("Settings"),
+                    )
+                    .children(page_rows)
+                    .child(div().flex_1())
+                    .child(
+                        div()
+                            .flex_none()
+                            .px_3()
+                            .py_1p5()
+                            .text_xs()
+                            .text_color(muted)
+                            .child(concat!("ACP client ", env!("CARGO_PKG_VERSION"))),
+                    )
+                    .with_animation("settings-pages", fade.clone(), |pages, delta| {
+                        pages.opacity(delta)
+                    }),
+            );
+
+        let content = match page {
+            SettingsPage::General => self.general_page(cx),
+            SettingsPage::Agents => self.agents_page(cx),
+            SettingsPage::Keyboard => keyboard_page(cx),
+        };
+        let shown = div()
+            .flex_1()
+            .min_w(px(0.))
+            .flex()
+            .flex_col()
+            .overflow_hidden()
+            .bg(background)
+            .child(
+                div()
+                    .flex_none()
+                    .h(self.title_bar_height)
+                    .when(title_bar, as_title_bar),
+            )
+            .child(
+                div()
+                    .id("settings-page")
+                    .flex_1()
+                    .min_h(px(0.))
+                    .overflow_y_scroll()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .child(
+                        v_flex()
+                            .w_full()
+                            .max_w(SETTINGS_COLUMN_WIDTH)
+                            .px_8()
+                            .pt_3()
+                            .pb_12()
+                            .child(
+                                div()
+                                    .text_size(SETTINGS_TITLE_SIZE)
+                                    .line_height(px(28.))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child(page.name()),
+                            )
+                            .child(content)
+                            .with_animation(
+                                ElementId::Name(format!("settings-{}", page.name()).into()),
+                                fade,
+                                |column, delta| column.opacity(delta),
+                            ),
+                    ),
+            );
+
+        div()
+            .size_full()
+            .relative()
+            .flex()
+            .text_color(foreground)
+            .track_focus(&self.settings_focus)
+            .key_context("Settings")
+            .on_action(
+                cx.listener(|this, _: &CloseSettings, window, cx| this.close_settings(window, cx)),
+            )
+            .on_drag_move(
+                cx.listener(|this, event: &DragMoveEvent<ResizeSidebar>, _, cx| {
+                    this.resize_sidebar(event, cx)
+                }),
+            )
+            .child(pages)
+            .child(shown)
+            .into_any_element()
+    }
+
+    /// The appearance, and the blur where the window can blur.
+    fn general_page(&self, cx: &mut Context<Self>) -> Div {
+        let theme = cx.theme();
+        let (muted, border) = (theme.muted_foreground, theme.border);
+        let settings = cx.global::<AppSettings>();
+        let selected = Appearance::ALL
+            .iter()
+            .position(|&appearance| appearance == settings.appearance)
+            .unwrap_or_default();
+        let appearance = TabBar::new("appearance")
+            .segmented()
+            .selected_index(selected)
+            .on_click(|ix: &usize, _, cx| {
+                let appearance = Appearance::ALL[*ix];
+                AppSettings::change(cx, |settings| settings.appearance = appearance);
+            })
+            .children(Appearance::ALL.map(|appearance| {
+                Tab::new()
+                    .label(appearance.name())
+                    .icon(Icon::new(appearance.icon()))
+            }));
+        let mut rows = vec![
+            setting_row(
+                "Theme",
+                Some("Light or dark, or as the system is set."),
+                appearance,
+                muted,
+            )
+            .into_any_element(),
+        ];
+        if WINDOW_BLUR {
+            let on = settings.window_blur;
+            // The whole row flips the switch, as the model panel's switch rows do.
+            rows.push(
+                setting_row(
+                    "Translucent window",
+                    Some("Blur the desktop behind the sidebar and the chat."),
+                    Switch::new("window-blur-value").checked(on).tab_stop(false),
+                    muted,
+                )
+                .id("window-blur")
+                .role(Role::Switch)
+                .aria_label("Translucent window")
+                .aria_toggled(on.into())
+                .cursor_pointer()
+                .on_click(move |_, _, cx| {
+                    AppSettings::change(cx, |settings| settings.window_blur = !on)
+                })
+                .into_any_element(),
+            );
+        }
+        let saved_in = config_folder().map(|folder| {
+            div()
+                .mt_2()
+                .mx_0p5()
+                .text_size(SETTING_NOTE_SIZE)
+                .line_height(px(16.))
+                .text_color(muted)
+                .child(format!("Saved in {}", shown_path(&folder.join(SETTINGS))))
+        });
+        v_flex().child(settings_section(Some("Appearance"), rows, border, muted).children(saved_in))
+    }
+
+    /// The agents the window started, each with the command it was started with and
+    /// whether it is running.
+    fn agents_page(&self, cx: &mut Context<Self>) -> Div {
+        let theme = cx.theme();
+        let (muted, border, tile) = (theme.muted_foreground, theme.border, theme.secondary);
+        let (ok, gone) = (theme.success, theme.danger);
+        let rows = self.agents.iter().map(|slot| {
+            let (status, color) = if slot.commands.is_closed() {
+                ("Stopped", gone)
+            } else if slot.connected {
+                ("Connected", ok)
+            } else {
+                ("Starting", muted)
+            };
+            h_flex()
+                .min_h(SETTING_ROW_HEIGHT)
+                .px(SETTING_ROW_INSET)
+                .py_2p5()
+                .gap_4()
+                .child(
+                    div()
+                        .size(AGENT_TILE_SIZE)
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(7.))
+                        .bg(tile)
+                        .child(agent_logo(&slot.name)),
+                )
+                .child(
+                    v_flex()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .gap_0p5()
+                        .child(setting_label(slot.name.clone()))
+                        .child(
+                            setting_note(slot.command.clone(), muted)
+                                .font_family(theme.mono_font_family.clone()),
+                        ),
+                )
+                .child(
+                    h_flex()
+                        .flex_none()
+                        .gap_1p5()
+                        .text_size(SETTING_NOTE_SIZE)
+                        .text_color(muted)
+                        .child(div().size(px(6.)).rounded_full().bg(color))
+                        .child(status),
+                )
+                .into_any_element()
+        });
+        v_flex()
+            .child(page_lede(
+                "The agents this window started, and the command each was started with.",
+                muted,
+            ))
+            .child(
+                settings_section(None, rows.collect(), border, muted).child(
+                    div()
+                        .mt_2()
+                        .mx_0p5()
+                        .text_size(SETTING_NOTE_SIZE)
+                        .line_height(px(16.))
+                        .text_color(muted)
+                        .child("Sign in from each agent's own CLI. The app never handles your credentials."),
+                ),
+            )
+    }
+}
+
+/// The shortcuts, which can't be changed yet.
+fn keyboard_page(cx: &App) -> Div {
+    let theme = cx.theme();
+    let (muted, border) = (theme.muted_foreground, theme.border);
+    let shortcut_row = |(name, keystroke): (&'static str, &str)| {
+        h_flex()
+            .h(SHORTCUT_ROW_HEIGHT)
+            .px(SETTING_ROW_INSET)
+            .gap_4()
+            .child(setting_label(name).flex_1())
+            .children(Keystroke::parse(keystroke).ok().map(Kbd::new))
+            .into_any_element()
+    };
+    #[cfg_attr(not(feature = "profile"), expect(unused_mut))]
+    let mut page = v_flex()
+        .child(page_lede("Shortcuts can't be changed yet.", muted))
+        .child(settings_section(
+            None,
+            SHORTCUTS.into_iter().map(shortcut_row).collect(),
+            border,
+            muted,
+        ));
+    #[cfg(feature = "profile")]
+    {
+        page = page.child(settings_section(
+            Some("Profiling"),
+            vec![shortcut_row(("Cycle the frame-time overlay", "cmd-alt-f"))],
+            border,
+            muted,
+        ));
+    }
+    page
+}
+
+/// A setting's name, on one line.
+fn setting_label(text: impl Into<SharedString>) -> Div {
+    div()
+        .min_w(px(0.))
+        .truncate()
+        .text_size(SETTING_TEXT_SIZE)
+        .line_height(px(16.))
+        .child(text.into())
+}
+
+/// What a setting does, below its name, on one line.
+fn setting_note(text: impl Into<SharedString>, muted: Hsla) -> Div {
+    div()
+        .min_w(px(0.))
+        .truncate()
+        .text_size(SETTING_NOTE_SIZE)
+        .line_height(px(16.))
+        .text_color(muted)
+        .child(text.into())
+}
+
+/// A line under a page's title on what the page is for.
+fn page_lede(text: &'static str, muted: Hsla) -> Div {
+    div()
+        .mt_1p5()
+        .text_size(SETTING_TEXT_SIZE)
+        .line_height(px(18.))
+        .text_color(muted)
+        .child(text)
+}
+
+/// A setting's row in a group: its name with what it does below it, and its control on
+/// the right.
+fn setting_row(
+    name: &'static str,
+    description: Option<&'static str>,
+    control: impl IntoElement,
+    muted: Hsla,
+) -> Div {
+    h_flex()
+        .min_h(SETTING_ROW_HEIGHT)
+        .px(SETTING_ROW_INSET)
+        .py_2p5()
+        .gap_4()
+        .child(
+            v_flex()
+                .flex_1()
+                .min_w(px(0.))
+                .gap_0p5()
+                .child(setting_label(name))
+                .children(description.map(|description| setting_note(description, muted))),
+        )
+        .child(div().flex_none().child(control))
+}
+
+/// A group of rows under an optional heading: an outline around them, with a line
+/// between each two that starts where their text does.
+fn settings_section(
+    heading: Option<&'static str>,
+    rows: Vec<AnyElement>,
+    border: Hsla,
+    muted: Hsla,
+) -> Div {
+    let rows = rows.into_iter().enumerate().map(|(ix, row)| {
+        div().relative().child(row).when(ix > 0, |row| {
+            row.child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left(SETTING_ROW_INSET)
+                    .right_0()
+                    .h(px(1.))
+                    .bg(border),
+            )
+        })
+    });
+    v_flex()
+        .mt_6()
+        .children(heading.map(|heading| {
+            div()
+                .mb_2()
+                .mx_0p5()
+                .text_xs()
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(muted)
+                .child(heading)
+        }))
+        .child(
+            v_flex()
+                .rounded(px(10.))
+                .border_1()
+                .border_color(border)
+                .overflow_hidden()
+                .children(rows),
+        )
+}
+
+/// `path` with the home folder written as `~`, as the user would type it.
+fn shown_path(path: &Path) -> String {
+    match dirs::home_dir().and_then(|home| path.strip_prefix(home).ok().map(Path::to_owned)) {
+        Some(rest) => format!("~/{}", rest.display()),
+        None => path.display().to_string(),
+    }
+}
+
+/// What the settings page sets, kept on disk as `SETTINGS`. A global, so the window hears
+/// of each change wherever it is made.
+#[derive(Clone, Serialize, Deserialize)]
+// A setting the file doesn't name, such as one added since it was written, takes its
+// default.
+#[serde(default)]
+struct AppSettings {
+    /// Light or dark, or as the system is set.
+    appearance: Appearance,
+    /// Whether the window blurs what is behind it, where `WINDOW_BLUR` says it can.
+    window_blur: bool,
+}
+
+impl Global for AppSettings {}
+
+impl Default for AppSettings {
+    fn default() -> Self {
+        Self {
+            appearance: Appearance::System,
+            // The translucent window is the app's own look; the switch turns it off.
+            window_blur: true,
+        }
+    }
+}
+
+impl AppSettings {
+    /// Makes `change` to the settings and saves them. Another run of the app may have
+    /// changed the file since this one read it, so the change is made to the settings
+    /// on disk, and this run takes those up.
+    fn change(cx: &mut App, change: impl Fn(&mut AppSettings)) {
+        let changed = config_folder()
+            .ok_or_else(|| std::io::Error::other("there is no config folder"))
+            .and_then(|folder| change_settings(&folder, &change));
+        let settings = changed.unwrap_or_else(|err| {
+            eprintln!("couldn't save the settings: {err}");
+            // The change still holds for this run.
+            let mut settings = cx.global::<AppSettings>().clone();
+            change(&mut settings);
+            settings
+        });
+        cx.set_global(settings);
+    }
+}
+
+/// Whether the app is light or dark.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum Appearance {
+    /// As the system is set, and again whenever that setting changes.
+    #[default]
+    System,
+    Light,
+    Dark,
+}
+
+impl Appearance {
+    const ALL: [Self; 3] = [Self::System, Self::Light, Self::Dark];
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::System => "System",
+            Self::Light => "Light",
+            Self::Dark => "Dark",
+        }
+    }
+
+    fn icon(self) -> gpui_kit::assets::IconName {
+        use gpui_kit::assets::IconName;
+        match self {
+            Self::System => IconName::Monitor,
+            Self::Light => IconName::Sun,
+            Self::Dark => IconName::Moon,
+        }
+    }
+}
+
+/// Puts the theme in the mode the settings ask for. The theme is the app's, so this
+/// repaints every window.
+fn apply_appearance(window: &mut Window, cx: &mut App) {
+    match cx.global::<AppSettings>().appearance {
+        Appearance::System => Theme::sync_system_appearance(Some(window), cx),
+        Appearance::Light => Theme::change(ThemeMode::Light, Some(window), cx),
+        Appearance::Dark => Theme::change(ThemeMode::Dark, Some(window), cx),
     }
 }
 
@@ -2743,9 +3665,105 @@ fn save_last_settings(folder: &Path, agent: &str, settings: &[Setting]) -> std::
     std::fs::rename(&written, &path)
 }
 
-// The icons `mode_icon` uses beyond those in the component library's own bundle.
+/// Holds the sessions kept for later runs, oldest first, as JSON.
+const SESSIONS: &str = "sessions";
+
+/// A session kept for later runs, which the agent loads by its id.
+#[derive(Serialize, Deserialize)]
+struct SavedSession {
+    /// Its agent's `kept_name`.
+    agent: String,
+    /// The agent's id for it.
+    id: String,
+    title: String,
+    /// The folder the agent created it in, which loading it needs.
+    cwd: PathBuf,
+}
+
+/// A file that is missing or can't be read gives none.
+fn load_saved_sessions() -> Vec<SavedSession> {
+    config_folder()
+        .and_then(|folder| read_saved_sessions(&folder.join(SESSIONS)).ok())
+        .unwrap_or_default()
+}
+
+/// An error other than a missing file is passed on, so sessions that couldn't be read
+/// aren't written over.
+fn read_saved_sessions(path: &Path) -> std::io::Result<Vec<SavedSession>> {
+    match std::fs::read(path) {
+        Ok(json) => Ok(serde_json::from_slice(&json)?),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(err) => Err(err),
+    }
+}
+
+/// Makes `change` to the sessions kept in `folder`. Windows changing them at once take
+/// turns under a lock, and the new file replaces the old one whole.
+fn change_saved_sessions(
+    folder: &Path,
+    change: impl FnOnce(&mut Vec<SavedSession>),
+) -> std::io::Result<()> {
+    std::fs::create_dir_all(folder)?;
+    // Held until the new file is in place.
+    let lock = std::fs::File::create(folder.join(format!("{SESSIONS}.lock")))?;
+    lock.lock()?;
+    let path = folder.join(SESSIONS);
+    let mut sessions = read_saved_sessions(&path)?;
+    change(&mut sessions);
+    let written = folder.join(format!("{SESSIONS}.new"));
+    std::fs::write(&written, serde_json::to_vec(&sessions)?)?;
+    std::fs::rename(&written, &path)
+}
+
+/// Holds what the settings page sets, as JSON.
+const SETTINGS: &str = "settings.json";
+
+/// A missing file gives the defaults. So does one that can't be read, which is said.
+fn load_settings() -> AppSettings {
+    let Some(folder) = config_folder() else {
+        return AppSettings::default();
+    };
+    read_settings(&folder.join(SETTINGS)).unwrap_or_else(|err| {
+        eprintln!("couldn't read the settings: {err}");
+        AppSettings::default()
+    })
+}
+
+/// An error other than a missing file is passed on, so a file that couldn't be read,
+/// such as one edited by hand into bad JSON, isn't written over.
+fn read_settings(path: &Path) -> std::io::Result<AppSettings> {
+    match std::fs::read(path) {
+        Ok(json) => Ok(serde_json::from_slice(&json)?),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(AppSettings::default()),
+        Err(err) => Err(err),
+    }
+}
+
+/// Makes `change` to the settings kept in `folder`, and returns them as they then stand.
+/// Runs of the app changing them at once take turns under a lock, and the new file
+/// replaces the old one whole.
+fn change_settings(
+    folder: &Path,
+    change: impl Fn(&mut AppSettings),
+) -> std::io::Result<AppSettings> {
+    std::fs::create_dir_all(folder)?;
+    // Held until the new file is in place.
+    let lock = std::fs::File::create(folder.join(format!("{SETTINGS}.lock")))?;
+    lock.lock()?;
+    let path = folder.join(SETTINGS);
+    let mut settings = read_settings(&path)?;
+    change(&mut settings);
+    let written = folder.join(format!("{SETTINGS}.new"));
+    // Laid out for reading, as it is a file a person may edit.
+    std::fs::write(&written, serde_json::to_vec_pretty(&settings)?)?;
+    std::fs::rename(&written, &path)?;
+    Ok(settings)
+}
+
+// The icons `mode_icon` and the settings use beyond those in the component library's
+// own bundle.
 gpui_kit::assets::icon_assets!(
-    ModeIcons,
+    ExtraIcons,
     [
         Hand,
         FilePen,
@@ -2753,16 +3771,19 @@ gpui_kit::assets::icon_assets!(
         FolderPen,
         ShieldCheck,
         ShieldOff,
-        Shield
+        Shield,
+        SlidersHorizontal,
+        Keyboard,
+        Monitor
     ]
 );
 
-/// The component library's icons, and the mode icons.
+/// The component library's icons, and the extra ones.
 struct AppAssets;
 
 impl AssetSource for AppAssets {
     fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
-        match ModeIcons.load(path)? {
+        match ExtraIcons.load(path)? {
             Some(icon) => Ok(Some(icon)),
             None => gpui_kit::assets::Assets.load(path),
         }
@@ -2770,12 +3791,12 @@ impl AssetSource for AppAssets {
 
     fn list(&self, path: &str) -> Result<Vec<SharedString>> {
         let mut paths = gpui_kit::assets::Assets.list(path)?;
-        paths.extend(ModeIcons.list(path)?);
+        paths.extend(ExtraIcons.list(path)?);
         Ok(paths)
     }
 }
 
-actions!(acp_gui, [Quit]);
+actions!(acp_gui, [Quit, OpenSettings, CloseSettings]);
 
 #[cfg(feature = "profile")]
 actions!(acp_gui, [CycleFrameOverlay]);
@@ -2849,19 +3870,32 @@ fn main() {
             // Nothing quits on Cmd+Q unless the app says so: gpui-kit leaves the shortcut
             // to the app, and with no menus set AppKit has no Quit item to match it to.
             cx.on_action(|_: &Quit, cx| cx.quit());
-            cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
+            // Cmd+, opens the settings anywhere (see `ChatView::new`), and leaves them
+            // while they are open, as does Esc.
+            cx.bind_keys([
+                KeyBinding::new("cmd-q", Quit, None),
+                KeyBinding::new("cmd-,", OpenSettings, None),
+                KeyBinding::new("cmd-,", CloseSettings, Some("Settings")),
+                KeyBinding::new("escape", CloseSettings, Some("Settings")),
+            ]);
             #[cfg(feature = "profile")]
             bind_frame_overlay(cx);
             cx.set_menus([Menu::new("ACP client").items([
+                MenuItem::action("Settings…", OpenSettings),
+                MenuItem::separator(),
                 #[cfg(feature = "profile")]
                 MenuItem::action("Cycle frame-time overlay", CycleFrameOverlay),
                 MenuItem::action("Quit ACP client", Quit),
             ])]);
+            cx.set_global(load_settings());
             Theme::update(cx, |theme| {
                 theme.light_theme = with_panel_colors(&theme.light_theme, "#f7f7f7", "#fcfcfc");
                 theme.dark_theme = with_panel_colors(&theme.dark_theme, "#111111", "#151515");
             });
             let lights = TrafficLights::new(traffic_light_size());
+            // Blurred from the start, where the platform can blur and the settings say so.
+            // The window opens that way, so its first frame already is.
+            let blur = WINDOW_BLUR && cx.global::<AppSettings>().window_blur;
             let options = WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
                     None,
@@ -2877,18 +3911,22 @@ fn main() {
                 // does it from the strip around the traffic lights, and on macOS 27 it
                 // holds back every click there while it waits for a double-click.
                 app_owns_titlebar_drag: OWN_TITLE_BAR,
+                window_background: window_background(blur),
                 ..Default::default()
             };
-            gpui_kit::open_window(options, cx, |window, cx| {
-                // Light or dark as the system is set, and again whenever that setting changes.
-                Theme::sync_system_appearance(Some(window), cx);
-                window
-                    .observe_window_appearance(|window, cx| {
-                        Theme::sync_system_appearance(Some(window), cx)
-                    })
-                    .detach();
+            // What `gpui_kit::open_window` does, but the root paints no background of its
+            // own: the chat view paints every surface, and the root's opaque one under
+            // them would hide the blur.
+            cx.open_window(options, |window, cx| {
+                // Light or dark as the settings say, and for System again whenever the
+                // system's setting changes.
+                apply_appearance(window, cx);
+                window.observe_window_appearance(apply_appearance).detach();
                 let lights_end = lights.end(window);
-                cx.new(|cx| ChatView::new(agents, cwd, lights.row_height, lights_end, window, cx))
+                let view = cx.new(|cx| {
+                    ChatView::new(agents, cwd, blur, lights.row_height, lights_end, window, cx)
+                });
+                cx.new(|cx| gpui_kit::base::Root::new(view, window, cx).bg(transparent_black()))
             })
             .expect("failed to open the window");
             cx.activate(true);
