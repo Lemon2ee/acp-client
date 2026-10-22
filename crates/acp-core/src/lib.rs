@@ -421,6 +421,9 @@ async fn run_session(
             .run_until(async |mut session| {
                 tracing::info!(session = key.0, took_ms = millis(asked), "session/new");
                 let settings = settings_of(session.config_options().unwrap_or_default());
+                // A level the front end picked before the session existed goes out below.
+                let reported = reported_thought_level(&settings)
+                    .filter(|(id, _)| !changes_waiting.iter().any(|(setting, _)| setting == id));
                 emit(
                     &events,
                     Event::Session(key, SessionEvent::Settings(settings)),
@@ -429,11 +432,20 @@ async fn run_session(
                 if waiting.is_empty() {
                     emit(&events, Event::SessionReady(key));
                 }
+                // Only a closed connection fails these, which ends the session anyway.
+                let mut changes = Changes::default();
+                if let Some((setting, value)) = reported {
+                    let by = AskedBy::Core;
+                    let _ = queue_change(key, &session, setting, value, by, &events, &mut changes);
+                }
+                for (setting, value) in std::mem::take(&mut changes_waiting) {
+                    let _ = change_setting(key, &session, setting, value, &events, &mut changes);
+                }
                 serve(
                     key,
                     &mut session,
                     waiting,
-                    std::mem::take(&mut changes_waiting),
+                    changes,
                     &commands,
                     &events,
                     &login_options,
@@ -482,21 +494,17 @@ async fn creating_prompt(
 
 /// Runs the session's prompts one at a time, as they arrive, until the front end has gone.
 /// Prompts sent during a turn wait in `waiting` for their own, and every prompt waits
-/// for the agent to answer the setting changes sent before it, `first` included.
+/// for the agent to answer the setting changes sent before it, those already in
+/// `changes` included.
 async fn serve(
     key: SessionKey,
     session: &mut ActiveSession<'_, Agent>,
     mut waiting: VecDeque<String>,
-    first: Vec<(String, SettingValue)>,
+    mut changes: Changes,
     commands: &Receiver<SessionCommand>,
     events: &Sender<Event>,
     login_options: &[String],
 ) {
-    let mut changes = Changes::default();
-    for (setting, value) in first {
-        // Only a closed connection fails this, which ends the session anyway.
-        let _ = change_setting(key, session, setting, value, events, &mut changes);
-    }
     loop {
         let text = match waiting.pop_front() {
             Some(text) => text,
@@ -690,10 +698,22 @@ struct Change {
     id: u64,
     setting: String,
     value: SettingValue,
+    asked_by: AskedBy,
     /// Set by whoever sends it, so it goes out once.
     sent: bool,
     /// Told when the agent answers.
     answered: oneshot::Sender<()>,
+}
+
+/// Who asked for a setting change. The front end counts the answers to its own changes
+/// to know when a setting shows the agent's value again, so acp-core's changes must not
+/// answer as one of its.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AskedBy {
+    FrontEnd,
+    /// acp-core, setting a value back to what the agent reported; see
+    /// `reported_thought_level`.
+    Core,
 }
 
 impl ChangeQueue {
@@ -748,6 +768,11 @@ async fn wait_for_changes(
                 // leaves the queue alone, so the next change goes at once.
                 let given_up: Vec<Change> = changes.queue.lock().changes.drain(..).collect();
                 for change in given_up {
+                    if change.asked_by == AskedBy::Core {
+                        // Nothing the user did failed; the setting shows as reported.
+                        tracing::warn!(session = key.0, setting = %change.setting, "the agent didn't answer the reported value set back");
+                        continue;
+                    }
                     let message = format!(
                         "couldn't change {}: the agent didn't answer within {} s",
                         change.setting,
@@ -771,14 +796,29 @@ async fn wait_for_changes(
     Waited::Answered
 }
 
-/// Asks the agent to change one of the session's settings, once it has answered the
-/// changes asked before, for the next prompt to wait on. The answer, the settings as
-/// they then stand, goes to the front end.
+/// Asks the agent to change one of the session's settings for the front end, once it
+/// has answered the changes asked before, for the next prompt to wait on. The answer,
+/// the settings as they then stand, goes to the front end.
 fn change_setting(
     key: SessionKey,
     session: &ActiveSession<'_, Agent>,
     setting: String,
     value: SettingValue,
+    events: &Sender<Event>,
+    changes: &mut Changes,
+) -> Result<(), Error> {
+    let by = AskedBy::FrontEnd;
+    queue_change(key, session, setting, value, by, events, changes)
+}
+
+/// Asks the agent to change one of the session's settings, for whoever `asked_by` says,
+/// once it has answered the changes asked before.
+fn queue_change(
+    key: SessionKey,
+    session: &ActiveSession<'_, Agent>,
+    setting: String,
+    value: SettingValue,
+    asked_by: AskedBy,
     events: &Sender<Event>,
     changes: &mut Changes,
 ) -> Result<(), Error> {
@@ -792,6 +832,7 @@ fn change_setting(
             id,
             setting,
             value,
+            asked_by,
             sent: false,
             answered,
         });
@@ -818,10 +859,11 @@ fn send_change(
     let first = queue.lock().changes.front_mut().and_then(|change| {
         (!change.sent).then(|| {
             change.sent = true;
-            (change.id, change.setting.clone(), change.value.clone())
+            let (setting, value) = (change.setting.clone(), change.value.clone());
+            (change.id, setting, value, change.asked_by)
         })
     });
-    let Some((id, setting, value)) = first else {
+    let Some((id, setting, value, asked_by)) = first else {
         return Ok(());
     };
     let value = match value {
@@ -837,10 +879,12 @@ fn send_change(
             let event = match result {
                 Ok(response) => {
                     tracing::info!(session = key.0, took_ms, %setting, "session/set_config_option");
-                    SessionEvent::SettingChanged {
-                        settings: settings_of(&response.config_options),
-                        setting,
-                    }
+                    let settings = settings_of(&response.config_options);
+                    Some(match asked_by {
+                        AskedBy::FrontEnd => SessionEvent::SettingChanged { setting, settings },
+                        // The front end has no change of its own waiting on this answer.
+                        AskedBy::Core => SessionEvent::Settings(settings),
+                    })
                 }
                 Err(err) => {
                     tracing::warn!(
@@ -850,13 +894,16 @@ fn send_change(
                         error = %err,
                         "session/set_config_option failed"
                     );
-                    SessionEvent::SettingFailed {
+                    // Nothing the user did failed when acp-core's own change does.
+                    (asked_by == AskedBy::FrontEnd).then(|| SessionEvent::SettingFailed {
                         message: format!("couldn't change {setting}: {err}"),
                         setting,
-                    }
+                    })
                 }
             };
-            emit(&events, Event::Session(key, event));
+            if let Some(event) = event {
+                emit(&events, Event::Session(key, event));
+            }
             // A late answer to a change given up on leaves the queue to the changes
             // after it, which went out without waiting.
             let answered = {
@@ -1026,6 +1073,26 @@ fn flatten(update: SessionUpdate) -> Option<SessionEvent> {
         }
         _ => return None,
     })
+}
+
+/// The thought level the agent reports for a session it has just created, for acp-core
+/// to set it to that same value. claude-agent-acp 0.94.0 only shows this value to a
+/// client without JetBrains' `recommendedValue` extension: it reads it from Claude
+/// Code's settings files, down to the old top-level `effortLevel`, which the CLI it
+/// starts no longer reads. So the button said "Xhigh" while turns ran at the model's
+/// default. Only `session/set_config_option` makes the CLI use a level, and the level
+/// then stays when the session moves to another model that has it. "default" leaves
+/// the level to the agent, so there is nothing to set.
+fn reported_thought_level(settings: &[Setting]) -> Option<(String, SettingValue)> {
+    let setting = settings
+        .iter()
+        .find(|setting| setting.kind == SettingKind::ThoughtLevel)?;
+    match &setting.value {
+        SettingValue::Choice(level) if level != "default" => {
+            Some((setting.id.clone(), setting.value.clone()))
+        }
+        _ => None,
+    }
 }
 
 /// The agent's session config options of the kinds we know: a pick of one of several
