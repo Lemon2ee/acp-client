@@ -3,6 +3,7 @@
 
 use std::borrow::Cow;
 use std::cell::Cell;
+use std::cmp::Reverse;
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -223,6 +224,8 @@ struct ChatView {
     traffic_lights_end: Pixels,
     sidebar_open: bool,
     model_menu: ModelMenuState,
+    /// Older Claude models the user added to the model list, by id. Kept on disk.
+    added_models: Vec<String>,
     _events: Task<()>,
     _input_events: Subscription,
 }
@@ -272,6 +275,7 @@ impl ChatView {
             traffic_lights_end,
             sidebar_open: true,
             model_menu: ModelMenuState::default(),
+            added_models: load_added_models(),
             _events: events_task,
             _input_events: input_events,
         };
@@ -354,19 +358,26 @@ impl ChatView {
     }
 
     /// The pointer came, at `position`, to a row of the model menu that wants `list` open
-    /// beside the menu. A change that closes the open list waits while the pointer heads
-    /// for that list, as the way there can cross other rows; any other change is made at
-    /// once.
+    /// beside the menu, and the older models open beside that list or not. A change that
+    /// closes a list waits while the pointer heads for that list, as the way there can
+    /// cross other rows; any other change is made at once.
     fn point_model_menu(
         &mut self,
         list: Option<String>,
+        older: bool,
         position: Point<Pixels>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let menu = &mut self.model_menu;
         // Where the list the change would close was drawn.
-        let closing = (menu.list.is_some() && menu.list != list).then(|| menu.list_bounds.clone());
+        let closing = if menu.list.is_some() && menu.list != list {
+            Some(menu.list_bounds.clone())
+        } else if menu.older && !older {
+            Some(menu.older_bounds.clone())
+        } else {
+            None
+        };
         let heading = closing.filter(|bounds| {
             let from = menu.trail.front().copied();
             from.zip(bounds.get())
@@ -374,8 +385,9 @@ impl ChatView {
         });
         let Some(bounds) = heading else {
             menu.pending = None;
-            if menu.list != list {
+            if menu.list != list || menu.older != older {
                 menu.list = list;
+                menu.older = older;
                 cx.notify();
             }
             return;
@@ -394,6 +406,7 @@ impl ChatView {
                             .is_some_and(|list| heading_for(from, now, list));
                     if !heading {
                         this.model_menu.list = list.clone();
+                        this.model_menu.older = older;
                         cx.notify();
                     }
                     heading.then_some(now)
@@ -404,6 +417,16 @@ impl ChatView {
                 }
             }
         }));
+    }
+
+    /// Adds an older model to the model list, or takes it off again.
+    fn set_model_added(&mut self, id: String, added: bool, cx: &mut Context<Self>) {
+        self.added_models.retain(|model| *model != id);
+        if added {
+            self.added_models.push(id);
+        }
+        save_added_models(&self.added_models);
+        cx.notify();
     }
 
     fn apply(&mut self, event: AgentEvent, cx: &mut Context<Self>) {
@@ -655,18 +678,116 @@ const LIST_ROW_HEIGHT: Pixels = px(32.);
 /// How long a change to the model menu's open lists waits, while the pointer heads for
 /// a list the change would close, before looking again at where the pointer went.
 const MENU_HOVER_DELAY: Duration = Duration::from_millis(300);
+/// Groups each row of a list beside the model menu with its button, which shows while
+/// the row is pointed at.
+const CHOICE_GROUP: &str = "model-menu-choice";
+
+/// Claude's model families. Its models are named "<family> <version>", like "Opus 4.7".
+const CLAUDE_FAMILIES: [&str; 4] = ["Fable", "Opus", "Sonnet", "Haiku"];
+
+/// A Claude model's family and version, read from its name.
+fn claude_model(name: &str) -> Option<(&str, Vec<u32>)> {
+    let mut words = name.split(' ');
+    let family = words
+        .next()
+        .filter(|family| CLAUDE_FAMILIES.contains(family))?;
+    let version = words
+        .next()?
+        .split('.')
+        .map(|part| part.parse().ok())
+        .collect::<Option<_>>()?;
+    Some((family, version))
+}
+
+/// Claude's models as the model list shows them.
+struct ClaudeModels<'a> {
+    /// The newest model of each family and the older ones the user added, with whether
+    /// the user added it.
+    listed: Vec<(&'a SettingChoice, bool)>,
+    /// The other older models, a level down.
+    older: Vec<&'a SettingChoice>,
+}
+
+/// Sorts Claude's models out for the model list, each part by family, newest first.
+/// The adapter's "default" entry is left out: it stands for one of the others. `None`
+/// when the choices aren't Claude's models.
+fn claude_models<'a>(choices: &'a [SettingChoice], added: &[String]) -> Option<ClaudeModels<'a>> {
+    let models: Vec<_> = choices
+        .iter()
+        .map(|choice| (choice, claude_model(&choice.name)))
+        .collect();
+    // Each family in the order the adapter first lists it, with its newest version.
+    let mut families: Vec<(&str, &[u32])> = Vec::new();
+    for (family, version) in models.iter().filter_map(|(_, model)| model.as_ref()) {
+        match families.iter_mut().find(|(name, _)| name == family) {
+            Some((_, newest)) => *newest = (*newest).max(version.as_slice()),
+            None => families.push((family, version)),
+        }
+    }
+    if families.is_empty() {
+        return None;
+    }
+    // Models of no family come last, as the adapter lists them.
+    let order = |model: &Option<(&str, Vec<u32>)>| match model {
+        Some((family, version)) => (
+            families.iter().position(|(name, _)| name == family),
+            Reverse(version.clone()),
+        ),
+        None => (Some(usize::MAX), Reverse(Vec::new())),
+    };
+    let mut listed = Vec::new();
+    let mut older = Vec::new();
+    for (choice, model) in &models {
+        if choice.id == "default" {
+            continue;
+        }
+        let is_older = model.as_ref().is_some_and(|(family, version)| {
+            families
+                .iter()
+                .any(|(name, newest)| name == family && version.as_slice() < *newest)
+        });
+        match (is_older, added.contains(&choice.id)) {
+            (true, false) => older.push((*choice, model)),
+            (is_older, _) => listed.push(((*choice, is_older), model)),
+        }
+    }
+    listed.sort_by_key(|(_, model)| order(model));
+    older.sort_by_key(|(_, model)| order(model));
+    Some(ClaudeModels {
+        listed: listed.into_iter().map(|(entry, _)| entry).collect(),
+        older: older.into_iter().map(|(choice, _)| choice).collect(),
+    })
+}
+
+/// The choice a setting shows as its value. Claude's adapter can set the model to its
+/// "default" entry, which isn't listed; its description names the model it stands for.
+fn shown_choice(setting: &Setting) -> Option<&SettingChoice> {
+    let chosen = setting.chosen()?;
+    if setting.kind != SettingKind::Model || chosen.id != "default" {
+        return Some(chosen);
+    }
+    let stands_for = chosen.description.as_deref();
+    let model = setting
+        .choices
+        .iter()
+        .find(|choice| choice.id != "default" && Some(choice.name.as_str()) == stands_for);
+    Some(model.unwrap_or(chosen))
+}
 
 /// What the model menu keeps from frame to frame while it is open.
 #[derive(Default)]
 struct ModelMenuState {
     /// The row whose choices are open beside the menu, by its setting's id.
     list: Option<String>,
-    /// A change to the open list, waiting while the pointer heads for it.
+    /// Whether the older models are open beside the model list.
+    older: bool,
+    /// A change to the open lists, waiting while the pointer heads for one of them.
     pending: Option<Task<()>>,
     /// The last few places the pointer moved to over the menu, oldest first.
     trail: VecDeque<Point<Pixels>>,
-    /// Where the list beside the menu was last drawn.
+    /// Where the model list and the older models were last drawn.
     list_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+    older_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
 }
 
 /// Whether the pointer, moving from `from` to `to`, is heading for `list`, which is to
@@ -691,6 +812,7 @@ struct ModelMenu<'a> {
     key: SessionKey,
     popover: &'a Entity<PopoverState>,
     list_bounds: &'a Rc<Cell<Option<Bounds<Pixels>>>>,
+    older_bounds: &'a Rc<Cell<Option<Bounds<Pixels>>>>,
     accent: Hsla,
     accent_foreground: Hsla,
     muted: Hsla,
@@ -699,14 +821,19 @@ struct ModelMenu<'a> {
 }
 
 impl ModelMenu<'_> {
-    /// While the row is pointed at, it wants `list` open beside the menu.
-    fn wants(&self, list: Option<String>) -> impl Fn(&bool, &mut Window, &mut App) + 'static {
+    /// While the row is pointed at, it wants `list` open beside the menu, and the older
+    /// models open beside that list or not.
+    fn wants(
+        &self,
+        list: Option<String>,
+        older: bool,
+    ) -> impl Fn(&bool, &mut Window, &mut App) + 'static {
         let view = self.view.clone();
         move |hovered, window, cx| {
             if *hovered {
                 let position = window.mouse_position();
                 let _ = view.update(cx, |this, cx| {
-                    this.point_model_menu(list.clone(), position, window, cx)
+                    this.point_model_menu(list.clone(), older, position, window, cx)
                 });
             }
         }
@@ -739,9 +866,15 @@ impl ModelMenu<'_> {
         }
     }
 
-    /// A row of the list beside the menu, which sets `setting` to its choice and closes
-    /// the menu.
-    fn choice(&self, setting: &Setting, choice: &SettingChoice, current: bool) -> Stateful<Div> {
+    /// A row of a list beside the menu, which sets `setting` to its choice and closes
+    /// the menu. `button`, if any, shows while the row is pointed at.
+    fn choice(
+        &self,
+        setting: &Setting,
+        choice: &SettingChoice,
+        current: bool,
+        button: Option<AnyElement>,
+    ) -> Stateful<Div> {
         let (view, popover, key) = (self.view.clone(), self.popover.clone(), self.key);
         let (id, value) = (setting.id.clone(), choice.id.clone());
         let (accent, accent_foreground) = (self.accent, self.accent_foreground);
@@ -749,6 +882,7 @@ impl ModelMenu<'_> {
             .id(ElementId::Name(
                 format!("model-menu-choice-{}", choice.id).into(),
             ))
+            .group(CHOICE_GROUP)
             .h(LIST_ROW_HEIGHT)
             .flex_none()
             .px_2()
@@ -762,6 +896,7 @@ impl ModelMenu<'_> {
                     .flex_1()
                     .child(SharedString::from(choice.name.clone())),
             )
+            .children(button)
             .when(current, |row| {
                 row.child(Icon::new(IconName::Check).xsmall())
             })
@@ -773,17 +908,51 @@ impl ModelMenu<'_> {
             })
     }
 
-    /// The list beside the menu, its bottom `bottom` above the menu's.
+    /// The button on an older model's row that adds it to the model list, or takes it
+    /// off again. It shows while its row is pointed at.
+    fn add_button(&self, id: &str, add: bool) -> AnyElement {
+        let view = self.view.clone();
+        let id = id.to_string();
+        div()
+            .flex_none()
+            // The button draws its icon 4px in from its edge. This puts the icon against
+            // the row's padding, where a row's check goes.
+            .mr(px(-4.))
+            .opacity(0.)
+            .group_hover(CHOICE_GROUP, |style| style.opacity(1.))
+            .child(
+                Button::new(ElementId::Name(format!("model-menu-add-{id}").into()))
+                    .ghost()
+                    .xsmall()
+                    .icon(if add { IconName::Plus } else { IconName::Minus })
+                    .tooltip(if add {
+                        "Add to the list"
+                    } else {
+                        "Remove from the list"
+                    })
+                    .on_click(move |_, _, cx| {
+                        // Doesn't pick the model, as a press elsewhere on its row does.
+                        cx.stop_propagation();
+                        let _ =
+                            view.update(cx, |this, cx| this.set_model_added(id.clone(), add, cx));
+                    }),
+            )
+            .into_any_element()
+    }
+
+    /// A list beside the menu or beside another list, its bottom `bottom` above the
+    /// bottom of what it is beside. Where it is drawn goes in `bounds`.
     fn list(
         &self,
+        id: &'static str,
         rows: Vec<AnyElement>,
         bottom: Pixels,
+        bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
         window: &Window,
         cx: &App,
     ) -> Stateful<Div> {
-        let bounds = self.list_bounds.clone();
         div()
-            .id("model-menu-list")
+            .id(id)
             .absolute()
             .left(relative(1.))
             .ml_1()
@@ -795,7 +964,7 @@ impl ModelMenu<'_> {
             .flex_col()
             .gap(MENU_ROW_GAP)
             // It lies outside the popover, which keeps the pointer from what is under
-            // the menu but not from what is under the list.
+            // the menu but not from what is under its lists.
             .occlude()
             .on_hover(self.holds())
             .on_mouse_move(self.trails())
@@ -815,20 +984,24 @@ impl ModelMenu<'_> {
 }
 
 /// The model menu: a row for each setting, and beside the row whose list is open, a
-/// list of that setting's choices. The list's bottom is level with the row's, so it
-/// opens upward like the menu.
+/// list of that setting's choices. Claude's older models are a level further down.
+/// Each list's bottom is level with the row it opens from, so it opens upward like
+/// the menu.
 fn model_menu(
     menu: &ModelMenu,
     settings: &[Setting],
     open_list: Option<&str>,
+    older_open: bool,
+    added: &[String],
     window: &Window,
     cx: &App,
 ) -> Div {
     let (accent, accent_foreground, muted) = (menu.accent, menu.accent_foreground, menu.muted);
-    // Where the open list is drawn, so a press in it leaves the menu open, and the
-    // pointer's way to it can be told. Set as it is drawn; a closed list has none.
-    let list_bounds = menu.list_bounds.clone();
+    // Where the open lists are drawn, so a press in them leaves the menu open, and the
+    // pointer's way to them can be told. Set as they are drawn; a closed list has none.
+    let (list_bounds, older_bounds) = (menu.list_bounds.clone(), menu.older_bounds.clone());
     list_bounds.set(None);
+    older_bounds.set(None);
 
     let rows = settings.iter().map(|setting| {
         let list = (!setting.choices.is_empty()).then(|| setting.id.clone());
@@ -847,7 +1020,7 @@ fn model_menu(
                     .flex_1()
                     .child(SharedString::from(setting.name.clone())),
             )
-            .on_hover(menu.wants(list));
+            .on_hover(menu.wants(list, false));
         match &setting.value {
             SettingValue::Switch(on) => {
                 let (view, key, id, on) = (menu.view.clone(), menu.key, setting.id.clone(), *on);
@@ -869,7 +1042,7 @@ fn model_menu(
                 .when(open_list == Some(setting.id.as_str()), |row| {
                     row.bg(accent).text_color(accent_foreground)
                 })
-                .children(setting.chosen().map(|choice| {
+                .children(shown_choice(setting).map(|choice| {
                     div()
                         .text_color(muted)
                         .child(SharedString::from(choice.name.clone()))
@@ -883,22 +1056,96 @@ fn model_menu(
         .filter(|&ix| !settings[ix].choices.is_empty())
         .map(|ix| {
             let setting = &settings[ix];
-            let current = setting.chosen().map(|choice| choice.id.as_str());
-            let rows = setting
-                .choices
-                .iter()
-                .map(|choice| {
-                    menu.choice(setting, choice, current == Some(choice.id.as_str()))
+            let current = shown_choice(setting).map(|choice| choice.id.as_str());
+            let claude = (setting.kind == SettingKind::Model)
+                .then(|| claude_models(&setting.choices, added))
+                .flatten();
+            let rows = match &claude {
+                Some(models) => models
+                    .listed
+                    .iter()
+                    .map(|&(choice, added)| {
+                        let button = added.then(|| menu.add_button(&choice.id, false));
+                        menu.choice(setting, choice, current == Some(choice.id.as_str()), button)
+                    })
+                    .collect::<Vec<_>>(),
+                None => setting
+                    .choices
+                    .iter()
+                    .map(|choice| {
+                        menu.choice(setting, choice, current == Some(choice.id.as_str()), None)
+                    })
+                    .collect(),
+            };
+            // Pointing at this list's rows closes the older models beside it.
+            let rows = rows
+                .into_iter()
+                .map(|row| {
+                    row.on_hover(menu.wants(Some(setting.id.clone()), false))
                         .into_any_element()
                 })
                 .collect();
             let rows_below = (settings.len() - 1 - ix) as f32;
-            menu.list(
+            let frame = menu.list(
+                "model-menu-list",
                 rows,
                 (MENU_ROW_HEIGHT + MENU_ROW_GAP) * rows_below,
+                list_bounds.clone(),
                 window,
                 cx,
-            )
+            );
+            let older = claude.filter(|models| !models.older.is_empty());
+            frame.when_some(older, |frame, models| {
+                let older_list = older_open.then(|| {
+                    let rows = models
+                        .older
+                        .iter()
+                        .map(|&choice| {
+                            let button = Some(menu.add_button(&choice.id, true));
+                            menu.choice(
+                                setting,
+                                choice,
+                                current == Some(choice.id.as_str()),
+                                button,
+                            )
+                            .into_any_element()
+                        })
+                        .collect();
+                    // Level with the row that opens it, the last of this list.
+                    menu.list(
+                        "model-menu-older",
+                        rows,
+                        px(0.),
+                        older_bounds.clone(),
+                        window,
+                        cx,
+                    )
+                });
+                frame
+                    .child(
+                        // A line across the list, above the row for the older models.
+                        div().flex_none().h(px(1.)).mx_neg_1().bg(cx.theme().border),
+                    )
+                    .child(
+                        div()
+                            .id("model-menu-older-row")
+                            .h(LIST_ROW_HEIGHT)
+                            .flex_none()
+                            .px_2()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .rounded(menu.radius)
+                            .hover(move |style| style.bg(accent).text_color(accent_foreground))
+                            .when(older_open, |row| {
+                                row.bg(accent).text_color(accent_foreground)
+                            })
+                            .child(div().flex_1().child("Older models"))
+                            .child(Icon::new(IconName::ChevronRight).xsmall().text_color(muted))
+                            .on_hover(menu.wants(Some(setting.id.clone()), true)),
+                    )
+                    .children(older_list)
+            })
         });
 
     let popover = menu.popover.clone();
@@ -917,10 +1164,12 @@ fn model_menu(
         .on_mouse_move(menu.trails())
         .on_mouse_down_out(move |_, window, cx| {
             let position = window.mouse_position();
-            if !list_bounds
-                .get()
-                .is_some_and(|bounds| bounds.contains(&position))
-            {
+            let in_list = [&list_bounds, &older_bounds].iter().any(|bounds| {
+                bounds
+                    .get()
+                    .is_some_and(|bounds| bounds.contains(&position))
+            });
+            if !in_list {
                 popover.update(cx, |state, cx| state.dismiss(window, cx));
             }
         })
@@ -989,11 +1238,12 @@ impl ChatView {
         let names: Vec<&str> = [SettingKind::Model, SettingKind::ThoughtLevel]
             .into_iter()
             .filter_map(|kind| {
-                session
-                    .settings
-                    .iter()
-                    .find(|setting| setting.kind == kind)?
-                    .chosen()
+                shown_choice(
+                    session
+                        .settings
+                        .iter()
+                        .find(|setting| setting.kind == kind)?,
+                )
             })
             .map(|choice| choice.name.as_str())
             .collect();
@@ -1018,7 +1268,10 @@ impl ChatView {
         let view = cx.entity().downgrade();
         let key = session.key;
         let open_list = self.model_menu.list.clone();
+        let older_open = self.model_menu.older;
         let list_bounds = self.model_menu.list_bounds.clone();
+        let older_bounds = self.model_menu.older_bounds.clone();
+        let added = self.added_models.clone();
         let trigger = InputGroupButton::new("model-picker")
             .label(label.clone())
             .accessibility_label(format!("Model: {label}"))
@@ -1049,12 +1302,21 @@ impl ChatView {
                     key,
                     popover: &popover,
                     list_bounds: &list_bounds,
+                    older_bounds: &older_bounds,
                     accent: *theme.tokens.accent,
                     accent_foreground: theme.accent_foreground,
                     muted: theme.muted_foreground,
                     radius: theme.radius.min(px(8.)),
                 };
-                model_menu(&menu, &settings, open_list.as_deref(), window, cx)
+                model_menu(
+                    &menu,
+                    &settings,
+                    open_list.as_deref(),
+                    older_open,
+                    &added,
+                    window,
+                    cx,
+                )
             });
         Some(picker.into_any_element())
     }
@@ -1390,6 +1652,40 @@ fn with_panel_colors(
     config.colors.sidebar = Some(sidebar.into());
     config.colors.background = Some(chat.into());
     Rc::new(config)
+}
+
+/// Where the older models the user added to the model list are kept, an id a line.
+fn added_models_path() -> Option<PathBuf> {
+    Some(dirs::config_dir()?.join("acp-client").join("added-models"))
+}
+
+fn load_added_models() -> Vec<String> {
+    let text = added_models_path().and_then(|path| std::fs::read_to_string(path).ok());
+    text.map(|text| {
+        text.lines()
+            .filter(|line| !line.is_empty())
+            .map(Into::into)
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+/// The list still changes for this run when saving it fails.
+fn save_added_models(models: &[String]) {
+    let Some(path) = added_models_path() else {
+        return;
+    };
+    let text: String = models.iter().map(|id| format!("{id}\n")).collect();
+    let saved = path
+        .parent()
+        .map_or(Ok(()), std::fs::create_dir_all)
+        .and_then(|()| std::fs::write(&path, text));
+    if let Err(err) = saved {
+        eprintln!(
+            "couldn't save the added models to {}: {err}",
+            path.display()
+        );
+    }
 }
 
 // The icons `mode_icon` uses beyond those in the component library's own bundle.
