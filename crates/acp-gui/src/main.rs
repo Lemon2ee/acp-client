@@ -6,6 +6,8 @@ mod chat_view;
 mod chrome;
 mod config;
 mod hotkey;
+#[cfg(target_os = "macos")]
+mod launch;
 mod session;
 
 use std::borrow::Cow;
@@ -102,6 +104,11 @@ fn bind_frame_overlay(cx: &mut App) {
 }
 
 fn main() {
+    // First, while the process has only this thread: it may set PATH.
+    #[cfg(target_os = "macos")]
+    let cwd = launch::session_folder();
+    #[cfg(not(target_os = "macos"))]
+    let cwd = std::env::current_dir().expect("no current directory");
     #[cfg(feature = "profile")]
     start_tracing();
     // One agent by name, or both harnesses to pick between from the model menu.
@@ -123,7 +130,6 @@ fn main() {
         Some(name) => format!("ACP client: {name}"),
         None => "ACP client".to_string(),
     };
-    let cwd = std::env::current_dir().expect("no current directory");
 
     gpui_kit::application()
         .with_assets(AppAssets)
