@@ -13,15 +13,15 @@ use gpui_kit::component::{Icon, IconName, Sizable as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use crate::ChatView;
-use crate::config::{Favorite, change_favorites, config_folder, kept_name};
-use crate::pickers::{
+use crate::chat_view::ChatView;
+use crate::chat_view::pickers::{
     HEADING_ICON_SIZE, LEAD_GAP, LEAD_ICON_SIZE, LIST_HEADER_GAP, LIST_HEADER_HEIGHT,
     MENU_HEADING_SIZE, MENU_OFFSET, MENU_TEXT_SIZE, MODEL_ROW_GROUP, MenuLook, PANEL_HEIGHT,
     PANEL_WIDTH, PICKER_ICON_SIZE, ROW_PAD_LEFT, ROW_RADIUS, SEARCH_ROW_HEIGHT, STAR_BUTTON_SIZE,
     SURFACE_PADDING, SURFACE_RADIUS, SWITCH_ROW_HEIGHT, TAB_COLUMN_WIDTH, TAB_ICON_SIZE, TAB_SIZE,
     agent_logo, check, lead, listed_choices, picker_button, rise_in, shown_choice,
 };
+use crate::config::{Favorite, change_favorites, config_folder, kept_name};
 use crate::session::Session;
 
 /// A model's name as its row shows it: a trailing note in parentheses, such as
@@ -83,7 +83,7 @@ pub(crate) enum ModelTab {
 }
 
 /// One agent's models in the model panel.
-struct ModelGroup {
+pub(crate) struct ModelGroup {
     agent: usize,
     name: String,
     /// The name the agent's favorites go by, from `kept_name`. None for a command,
@@ -96,7 +96,7 @@ struct ModelGroup {
 }
 
 /// What the parts of the model panel share.
-struct ModelPanel<'a> {
+pub(crate) struct ModelPanel<'a> {
     view: &'a WeakEntity<ChatView>,
     key: SessionKey,
     popover: &'a Entity<PopoverState>,

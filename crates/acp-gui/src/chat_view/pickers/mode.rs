@@ -7,8 +7,8 @@ use gpui_kit::component::{ActiveTheme as _, Icon, IconName, Sizable as _, h_flex
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use crate::ChatView;
-use crate::pickers::{PICKER_ICON_SIZE, picker_button};
+use crate::chat_view::ChatView;
+use crate::chat_view::pickers::{PICKER_ICON_SIZE, picker_button};
 
 /// How wide a mode's name and description may run, each on one line. Codex's longest
 /// description is about 500px; anything past this is cut short with an ellipsis.

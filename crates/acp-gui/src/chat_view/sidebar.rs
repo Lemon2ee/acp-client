@@ -12,7 +12,7 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use crate::ChatView;
+use crate::chat_view::ChatView;
 use crate::chrome::as_title_bar;
 
 /// A field on a session's sidebar card for changing its name.

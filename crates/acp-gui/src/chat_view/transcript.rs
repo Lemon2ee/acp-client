@@ -7,7 +7,7 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::text::TextView;
 use gpui_kit::*;
 
-use crate::ChatView;
+use crate::chat_view::ChatView;
 use crate::session::{Row, row_id};
 
 impl ChatView {

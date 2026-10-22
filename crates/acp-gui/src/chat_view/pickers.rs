@@ -218,8 +218,8 @@ fn check() -> Icon {
 }
 
 /// The harnesses' marks, for the panel's tabs.
-const CLAUDE_LOGO: &[u8] = include_bytes!("../assets/claude.svg");
-const OPENAI_LOGO: &[u8] = include_bytes!("../assets/openai.svg");
+const CLAUDE_LOGO: &[u8] = include_bytes!("../../assets/claude.svg");
+const OPENAI_LOGO: &[u8] = include_bytes!("../../assets/openai.svg");
 /// The orange Claude's mark is drawn in, in both light and dark mode.
 const CLAUDE_ORANGE: u32 = 0xD97757;
 

@@ -6,8 +6,8 @@ use gpui_kit::component::popover::{Popover, PopoverState};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use crate::ChatView;
-use crate::pickers::{
+use crate::chat_view::ChatView;
+use crate::chat_view::pickers::{
     EFFORT_MENU_WIDTH, LEAD_GAP, LEAD_WIDTH, MENU_HEADING_HEIGHT, MENU_HEADING_SIZE, MENU_OFFSET,
     METER_BAR_WIDTH, METER_HEIGHT, MenuLook, ROW_PAD_LEFT, SURFACE_PADDING, check, lead,
     listed_choices, picker_button, rise_in, shown_choice,

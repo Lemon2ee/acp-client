@@ -10,11 +10,12 @@ use gpui_kit::component::{ActiveTheme as _, Icon, IconName, Sizable as _, h_flex
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
+use crate::CloseSettings;
+use crate::chat_view::ChatView;
+use crate::chat_view::pickers::agent_logo;
+use crate::chat_view::sidebar::ResizeSidebar;
 use crate::chrome::{WINDOW_BLUR, as_title_bar};
 use crate::config::{AppSettings, Appearance, SETTINGS, config_folder};
-use crate::pickers::agent_logo;
-use crate::sidebar::ResizeSidebar;
-use crate::{ChatView, CloseSettings};
 
 /// The widest the settings' column gets: 560 for the settings, and 32 either side.
 const SETTINGS_COLUMN_WIDTH: Pixels = px(624.);
