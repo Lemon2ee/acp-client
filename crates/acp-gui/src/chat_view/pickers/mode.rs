@@ -118,7 +118,7 @@ fn mode_menu(
         .map(|(row, choice)| mode_row(&menu, choice, row, current == Some(choice.id.as_str())));
     let surface = menu
         .surface("mode-menu", &setting.name, setting.choices.len())
-        // No narrower than the effort menu beside it; `mode_row` caps how wide a row gets.
+        // No narrower than the effort slider beside it; `mode_row` caps how wide a row gets.
         .min_w(EFFORT_MENU_WIDTH)
         .max_w(window.viewport_size().width)
         .child(menu.heading(&setting.name))
@@ -141,7 +141,7 @@ fn mode_button(setting: &Setting, cx: &App) -> InputGroupButton {
 impl ChatView {
     /// The mode's button, with the mode's icon, and a menu of the modes that opens
     /// upward, each with its icon and what the agent says it does. The menu is a popover
-    /// of its own, as the effort menu is, rather than the component library's menu,
+    /// of its own, as the effort slider is, rather than the component library's menu,
     /// whose surface and rows can't take the model panel's look.
     pub(crate) fn render_mode_picker(
         &self,

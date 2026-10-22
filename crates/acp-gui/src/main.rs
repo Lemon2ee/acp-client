@@ -10,11 +10,14 @@ mod hotkey;
 #[cfg(target_os = "macos")]
 mod launch;
 mod session;
+mod sound;
 
 use std::borrow::Cow;
 
 use acp_core::{AcpAgent, Harness};
-use gpui_kit::base::actions::{Cancel, Confirm, SelectDown, SelectUp};
+use gpui_kit::base::actions::{
+    Cancel, Confirm, SelectDown, SelectFirst, SelectLast, SelectLeft, SelectRight, SelectUp,
+};
 use gpui_kit::component::Theme;
 use gpui_kit::*;
 
@@ -156,14 +159,27 @@ fn main() {
                 KeyBinding::new("cmd-,", CloseSettings, Some("Settings")),
                 KeyBinding::new("escape", CloseSettings, Some("Settings")),
             ]);
-            // In the effort and mode menus, Up and Down move the light and Enter or Space
-            // picks the lit row. Esc is the popover's, which closes it. These are the
-            // component library's own actions, as its menus take them.
+            // In the mode menu, Up and Down move the light and Enter or Space picks the
+            // lit row. Esc is the popover's, which closes it. These are the component
+            // library's own actions, as its menus take them.
             cx.bind_keys([
                 KeyBinding::new("up", SelectUp, Some("PickerMenu")),
                 KeyBinding::new("down", SelectDown, Some("PickerMenu")),
                 KeyBinding::new("enter", Confirm { secondary: false }, Some("PickerMenu")),
                 KeyBinding::new("space", Confirm { secondary: false }, Some("PickerMenu")),
+            ]);
+            // On the effort meter's button and its slider, Up or Right raises the level and
+            // Down or Left lowers it, Home and End go to either end, and Enter or Space
+            // opens the slider from the button and closes it again.
+            cx.bind_keys([
+                KeyBinding::new("up", SelectUp, Some("EffortMeter")),
+                KeyBinding::new("right", SelectRight, Some("EffortMeter")),
+                KeyBinding::new("down", SelectDown, Some("EffortMeter")),
+                KeyBinding::new("left", SelectLeft, Some("EffortMeter")),
+                KeyBinding::new("home", SelectFirst, Some("EffortMeter")),
+                KeyBinding::new("end", SelectLast, Some("EffortMeter")),
+                KeyBinding::new("enter", Confirm { secondary: false }, Some("EffortMeter")),
+                KeyBinding::new("space", Confirm { secondary: false }, Some("EffortMeter")),
             ]);
             // On a permission card's option, reached with Tab, Up and Down move between
             // its options, Enter or Space answers with that one, and Esc says no. From

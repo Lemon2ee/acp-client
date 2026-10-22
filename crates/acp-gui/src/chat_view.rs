@@ -29,6 +29,7 @@ use gpui_kit::*;
 
 use crate::OpenSettings;
 use crate::chat_view::pickers::MenuNav;
+use crate::chat_view::pickers::effort::EffortMeter;
 use crate::chat_view::pickers::model_panel::ModelPanelState;
 use crate::chat_view::settings_page::SettingsPageState;
 use crate::chat_view::sidebar::{ResizeSidebar, SidebarState};
@@ -41,10 +42,13 @@ use crate::config::{
     load_saved_sessions, save_last_settings,
 };
 use crate::hotkey::{self, GlobalShortcut};
-use crate::session::{Origin, Row, Session};
+use crate::session::{Held, Origin, Row, Session};
 
 /// How often text held back in a live turn shows its next piece: about once a frame.
 const PACE_TICK: Duration = Duration::from_millis(16);
+/// How long a held setting waits after its last change before it goes to the agent (see
+/// `ChatView::hold_setting`).
+const HOLD_PAUSE: Duration = Duration::from_millis(450);
 
 /// One agent the window drives, and what it keeps ready on it.
 struct AgentSlot {
@@ -100,6 +104,7 @@ pub(crate) struct ChatView {
     model_panel: ModelPanelState,
     /// The light and the focus of the menu below the prompt that is open.
     menu_nav: MenuNav,
+    effort: EffortMeter,
     settings_page: SettingsPageState,
     /// The system-wide shortcut the settings name, as macOS holds it for the app.
     global_shortcut: GlobalShortcut,
@@ -273,6 +278,7 @@ impl ChatView {
             sidebar: SidebarState::default(),
             model_panel: ModelPanelState::new(window, cx),
             menu_nav: MenuNav::new(cx),
+            effort: EffortMeter::new(cx),
             settings_page: SettingsPageState::new(cx),
             global_shortcut: GlobalShortcut::default(),
             pacing: None,
@@ -756,10 +762,14 @@ impl ChatView {
 
     fn send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let text = self.input.read(cx).value().trim().to_string();
-        let session = &mut self.sessions[self.active];
+        let session = &self.sessions[self.active];
         if session.busy || text.is_empty() {
             return;
         }
+        // A level picked just before goes first, so the prompt runs at it.
+        let key = session.key;
+        self.send_held(key, cx);
+        let session = &mut self.sessions[self.active];
         self.input.update(cx, |input, cx| input.clean(window, cx));
         let first = session.title.is_none();
         session
@@ -844,6 +854,59 @@ impl ChatView {
         }
         if let Some(session) = self.session_mut(key) {
             session.ask(setting, value);
+        }
+        cx.notify();
+    }
+
+    /// Shows `value` for the session's setting at once, and asks the agent for it once the
+    /// user has left it for `HOLD_PAUSE`, or sooner if `send_held` is called first. The
+    /// effort meter moves a level for each notch of a wheel, and the agent should get one
+    /// change, not one for each level passed.
+    fn hold_setting(
+        &mut self,
+        key: SessionKey,
+        setting: String,
+        value: SettingValue,
+        cx: &mut Context<Self>,
+    ) {
+        let send = cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(HOLD_PAUSE).await;
+            let _ = this.update(cx, |this, cx| this.send_held(key, cx));
+        });
+        if let Some(session) = self.session_mut(key) {
+            session.held = Some(Held {
+                setting,
+                value,
+                _send: send,
+            });
+        }
+        cx.notify();
+    }
+
+    /// Asks the agent now for the session's held setting, unless it has come back to the
+    /// value it had. Like a switch, it shows the value asked for until the agent answers.
+    fn send_held(&mut self, key: SessionKey, cx: &mut Context<Self>) {
+        let Some(held) = self
+            .session_mut(key)
+            .and_then(|session| session.held.take())
+        else {
+            return;
+        };
+        let Some(session) = self.session(key) else {
+            return;
+        };
+        let agent = session.agent;
+        let unchanged = self
+            .shown_settings(session)
+            .iter()
+            .any(|shown| shown.id == held.setting && shown.value == held.value);
+        let change = Command::ChangeSetting(key, held.setting.clone(), held.value.clone());
+        // With the agent gone, no answer would ever put the setting right.
+        if !unchanged
+            && self.agents[agent].commands.try_send(change).is_ok()
+            && let Some(session) = self.session_mut(key)
+        {
+            session.ask(held.setting, held.value);
         }
         cx.notify();
     }
@@ -965,6 +1028,7 @@ impl ChatView {
                     session.set_live(false, cx);
                     session.cancel_open_permissions(cx);
                     session.asked.clear();
+                    session.held = None;
                 }
             }
         }
@@ -1101,7 +1165,7 @@ impl Render for ChatView {
             shown
                 .iter()
                 .find(|setting| setting.kind == SettingKind::ThoughtLevel)
-                .map(|setting| self.render_effort_picker(session.key, setting, cx)),
+                .map(|setting| self.render_effort_picker(session.key, setting, window, cx)),
             shown
                 .iter()
                 .find(|setting| setting.kind == SettingKind::Mode)
