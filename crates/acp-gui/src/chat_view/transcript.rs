@@ -1,22 +1,70 @@
 //! The rows of the chat's transcript: the user's prompts, the agent's text and thoughts,
 //! its tool calls, permission requests with their answers, notices and errors.
 
-use gpui_kit::base::SelectableText;
+use std::time::Duration;
+
+use gpui_kit::base::{Easing, SelectableText};
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::shimmer::ShimmerText;
 use gpui_kit::component::text::TextView;
 use gpui_kit::*;
 
 use crate::chat_view::ChatView;
-use crate::session::{Row, row_id};
+use crate::session::{Row, Session, row_id};
+
+/// How long a live turn waits on the agent before the waiting line shows, so a reply that
+/// follows at once never flashes it.
+const WAIT_DELAY: Duration = Duration::from_millis(250);
 
 impl ChatView {
+    /// A row of the active session's transcript. In a live turn a new row comes in as
+    /// the menus do, rising the theme's short distance as it fades in, and the last row
+    /// carries the waiting line while the agent has sent nothing new.
     pub(crate) fn render_row(
         &mut self,
         ix: usize,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let row = self.row_content(ix, cx);
+        let motion = cx.theme().motion_tokens();
+        let enter = Enter {
+            duration: motion.duration_normal,
+            easing: motion.easing_enter.clone(),
+            still: cx.reduce_motion(),
+        };
+        let travel = motion.distance_short.to_pixels(window.rem_size());
+        let muted = cx.theme().muted_foreground;
+        let session = &mut self.sessions[self.active];
+        let row = if session.waiting() && ix + 1 == session.rows.len() {
+            div()
+                .flex()
+                .flex_col()
+                .child(row)
+                .child(waiting_line(session, ix, muted, &enter, window))
+                .into_any_element()
+        } else {
+            row
+        };
+        let Some(arrived) = session.entering.get(&ix) else {
+            return row;
+        };
+        let Some(delta) = enter.at(arrived.elapsed(), window) else {
+            session.entering.remove(&ix);
+            return row;
+        };
+        // Moved by its offset, which leaves the list's measure of the row alone.
+        div()
+            .w_full()
+            .relative()
+            .top(travel * (1. - delta))
+            .opacity(delta)
+            .child(row)
+            .into_any_element()
+    }
+
+    fn row_content(&mut self, ix: usize, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme();
         let (muted, border, bubble, danger, selection) = (
             theme.muted_foreground,
@@ -129,5 +177,56 @@ impl ChatView {
                 )
                 .into_any_element(),
         }
+    }
+}
+
+/// "Thinking…" under the last row, with the component library's shimmer, while a live
+/// turn waits on the agent. Its space is there from the start, so the row that takes its
+/// place doesn't move the transcript; it fades in once the rows have kept still for
+/// `WAIT_DELAY`.
+fn waiting_line(
+    session: &Session,
+    ix: usize,
+    muted: Hsla,
+    enter: &Enter,
+    window: &mut Window,
+) -> impl IntoElement {
+    let waited = session.changed.elapsed().checked_sub(WAIT_DELAY);
+    let fade = match waited {
+        Some(waited) => enter.at(waited, window).unwrap_or(1.),
+        // Nothing would draw the line once the delay is over while motion is reduced.
+        None if enter.still => 1.,
+        None => {
+            window.request_animation_frame();
+            0.
+        }
+    };
+    div()
+        .px_4()
+        .py_1p5()
+        .text_sm()
+        .text_color(muted)
+        .opacity(fade)
+        .child(ShimmerText::new("Thinking…").id(row_id("waiting", session.key, ix)))
+}
+
+/// How a row or the waiting line comes in: the theme's normal duration and entering curve,
+/// or at once while macOS's Reduce motion is on.
+struct Enter {
+    duration: Duration,
+    easing: Easing,
+    still: bool,
+}
+
+impl Enter {
+    /// How far in it is `elapsed` after it started, asking for the next frame while it
+    /// moves; `None` once it is in.
+    fn at(&self, elapsed: Duration, window: &mut Window) -> Option<f32> {
+        let progress = elapsed.as_secs_f32() / self.duration.as_secs_f32();
+        if self.still || progress >= 1. {
+            return None;
+        }
+        window.request_animation_frame();
+        Some(self.easing.sample(progress))
     }
 }

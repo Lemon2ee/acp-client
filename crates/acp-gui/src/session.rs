@@ -4,11 +4,18 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use acp_core::{PermissionRequest, SessionEvent, SessionKey, Setting, SettingKind, SettingValue};
+use gpui_kit::base::Easing;
+use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::message_scroller::MessageScrollerState;
-use gpui_kit::component::text::TextViewState;
+use gpui_kit::component::text::{TextViewMotion, TextViewState};
 use gpui_kit::*;
+
+/// How much later each word of a streamed piece starts fading in than the one before,
+/// as in gpui-component's own `TextView::stream_fade`.
+const STREAM_FADE_STAGGER: Duration = Duration::from_millis(10);
 
 pub(crate) enum Row {
     User(String),
@@ -60,6 +67,14 @@ pub(crate) struct Session {
     pub(crate) origin: Origin,
     /// In the sidebar's Archived list, out of the way.
     pub(crate) archived: bool,
+    /// A turn prompted here is running, so the agent's text arrives as it is written: it
+    /// fades in, and new rows come in with motion. A loaded session's replay shows at once.
+    pub(crate) live: bool,
+    /// When each row added in a live turn came in, until its entrance has played. Kept
+    /// here because the list drops a row's element state once it scrolls out of view.
+    pub(crate) entering: HashMap<usize, Instant>,
+    /// When the rows last changed, which the waiting line's delay counts from.
+    pub(crate) changed: Instant,
 }
 
 /// Which run a session's agent session comes from.
@@ -98,7 +113,35 @@ impl Session {
             id: None,
             origin: Origin::New,
             archived: false,
+            live: false,
+            entering: HashMap::new(),
+            changed: Instant::now(),
         }
+    }
+
+    /// Starts or ends a live turn. Only a live turn shows the waiting line under the last
+    /// row, so that row is measured again when it comes or goes.
+    pub(crate) fn set_live(&mut self, live: bool, cx: &mut App) {
+        if self.live == live {
+            return;
+        }
+        let waiting = self.waiting();
+        self.live = live;
+        if self.waiting() != waiting {
+            self.remeasure(self.rows.len() - 1, cx);
+        }
+    }
+
+    /// Waiting on the agent in a live turn: nothing has come since the prompt, or since
+    /// the last tool call finished.
+    pub(crate) fn waiting(&self) -> bool {
+        self.live
+            && match self.rows.last() {
+                Some(Row::User(_)) => true,
+                // acp-core names a tool call's status as ACP's `ToolCallStatus` does.
+                Some(Row::Tool { status, .. }) => status == "Completed" || status == "Failed",
+                _ => false,
+            }
     }
 
     /// A setting as it shows: one changed here shows the value last asked for until the
@@ -180,17 +223,20 @@ impl Session {
                 },
                 cx,
             ),
+            // The turn's last row still comes in as the turn's others did.
             SessionEvent::TurnEnded { stop_reason } => {
                 self.busy = false;
                 self.cancel_open_permissions(cx);
                 if stop_reason != "EndTurn" {
                     self.push(Row::Notice(format!("turn ended: {stop_reason}")), cx);
                 }
+                self.set_live(false, cx);
             }
             SessionEvent::TurnFailed(message) => {
                 self.busy = false;
                 self.cancel_open_permissions(cx);
                 self.push(Row::Error(message), cx);
+                self.set_live(false, cx);
             }
             SessionEvent::Settings(settings) => {
                 self.settings = settings;
@@ -257,7 +303,16 @@ impl Session {
             // Agents often open a block with a bare "\n\n" chunk; don't start a row with it.
             _ if text.trim().is_empty() => return,
             _ => {
-                let view = cx.new(|cx| TextViewState::markdown(text, cx));
+                let live = self.live;
+                let view = cx.new(|cx| {
+                    if !live {
+                        return TextViewState::markdown(text, cx);
+                    }
+                    // Pushed rather than set, so the row's first piece fades in too.
+                    let mut view = TextViewState::markdown("", cx).motion(stream_fade(cx));
+                    view.push_str(text, cx);
+                    view
+                });
                 let row = if thought {
                     Row::Thought(view)
                 } else {
@@ -280,6 +335,11 @@ impl Session {
     }
 
     pub(crate) fn push(&mut self, row: Row, cx: &mut App) {
+        let now = Instant::now();
+        if self.live {
+            self.entering.insert(self.rows.len(), now);
+        }
+        self.changed = now;
         self.rows.push(row);
         self.scroller.update(cx, |scroller, cx| {
             scroller.append(1, cx);
@@ -287,10 +347,22 @@ impl Session {
     }
 
     fn remeasure(&mut self, ix: usize, cx: &mut App) {
+        self.changed = Instant::now();
         self.scroller.update(cx, |scroller, cx| {
             scroller.remeasure_items(ix..ix + 1, cx);
         });
     }
+}
+
+/// The agent's text fading in as it streams: each piece over the theme's slow duration,
+/// its words one after another, as `TextView::stream_fade` does. A piece too large to
+/// light up within one fade, such as one after a stall, fades as a whole. gpui-component
+/// draws it at once while macOS's Reduce motion is on.
+fn stream_fade(cx: &App) -> TextViewMotion {
+    TextViewMotion::default()
+        .with_stream_fade(cx.theme().motion_tokens().duration_slow)
+        .with_stream_fade_stagger(STREAM_FADE_STAGGER)
+        .with_stream_fade_easing(Easing::EaseOut)
 }
 
 /// A selectable row's element id, which carries the session so a row of one session

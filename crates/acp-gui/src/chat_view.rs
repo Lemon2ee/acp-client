@@ -719,6 +719,8 @@ impl ChatView {
             .get_or_insert_with(|| text.lines().next().unwrap_or_default().to_string());
         session.busy = true;
         session.push(Row::User(text.clone()), cx);
+        // Live from after the prompt's own row, which shows at once as it was typed here.
+        session.set_live(true, cx);
         let key = session.key;
         // Has the agent create the session first, if it hasn't yet.
         let prompt = Command::Prompt(key, text);
@@ -850,6 +852,7 @@ impl ChatView {
                     // Open for a prompt, which asks the agent to create the session again.
                     session.busy = false;
                     session.push(Row::Error(message), cx);
+                    session.set_live(false, cx);
                 }
             }
             AgentEvent::Session(key, event) => {
@@ -898,6 +901,7 @@ impl ChatView {
                     session.busy = true;
                     // A turn cut off with the connection may never report its end, nor
                     // a setting change its answer.
+                    session.set_live(false, cx);
                     session.cancel_open_permissions(cx);
                     session.asked.clear();
                 }
