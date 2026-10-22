@@ -307,7 +307,7 @@ impl ChatView {
         let slot = &self.agents[session.agent];
         if slot.commands.try_send(load).is_err() {
             let message = format!("{} has gone; restart to use it", slot.name);
-            session.push(Row::Error(message), cx);
+            session.push_error(message, cx);
         }
     }
 
@@ -384,7 +384,7 @@ impl ChatView {
         if slot.commands.is_closed() {
             session.busy = true;
             let message = format!("{} has gone; restart to use it", slot.name);
-            session.push(Row::Error(message), cx);
+            session.push_error(message, cx);
         }
         session
     }
@@ -855,12 +855,12 @@ impl ChatView {
                     let _ = slot.commands.try_send(Command::CloseSession(key));
                     if !slot.spare_failed {
                         slot.spare_failed = true;
-                        self.sessions[self.active].push(Row::Error(message), cx);
+                        self.sessions[self.active].push_error(message, cx);
                     }
                 } else if let Some(session) = self.session_mut(key) {
                     // Open for a prompt, which asks the agent to create the session again.
                     session.busy = false;
-                    session.push(Row::Error(message), cx);
+                    session.push_error(message, cx);
                     session.set_live(false, cx);
                 }
             }
@@ -902,7 +902,7 @@ impl ChatView {
                 } else {
                     message
                 };
-                self.sessions[ix].push(Row::Error(message), cx)
+                self.sessions[ix].push_error(message, cx)
             }
             AgentEvent::Closed => {
                 let spare = self.agents[agent].spare.as_mut();
@@ -910,10 +910,11 @@ impl ChatView {
                     if session.agent != agent {
                         continue;
                     }
-                    session.busy = true;
                     // A turn cut off with the connection may never report its end, nor
-                    // a setting change its answer.
+                    // a setting change its answer. Flushed first: the turn's end, if it
+                    // came, would open the session to prompts again.
                     session.flush(cx);
+                    session.busy = true;
                     session.set_live(false, cx);
                     session.cancel_open_permissions(cx);
                     session.asked.clear();
@@ -937,14 +938,20 @@ impl ChatView {
                 let dt = now - last;
                 last = now;
                 let holding = this.update(cx, |this, cx| {
-                    let mut holding = false;
-                    for session in &mut this.sessions {
-                        holding |= session.pace(dt, cx);
+                    let (mut holding, mut changed) = (false, false);
+                    for (ix, session) in this.sessions.iter_mut().enumerate() {
+                        let paced = session.pace(dt, cx);
+                        holding |= paced.holds;
+                        // Text shown off screen draws nothing; a landed event may change
+                        // what the window shows of the session anywhere, as its busy state.
+                        changed |= paced.landed || paced.shown && ix == this.active;
                     }
                     if !holding {
                         this.pacing = None;
                     }
-                    cx.notify();
+                    if changed {
+                        cx.notify();
+                    }
                     holding
                 });
                 if !matches!(holding, Ok(true)) {

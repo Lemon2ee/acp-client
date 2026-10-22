@@ -190,7 +190,7 @@ impl Session {
     /// Takes an event from the agent. In a live turn its text is held back to show at an
     /// even pace, and the transcript's other events wait behind it, keeping their order.
     pub(crate) fn apply(&mut self, event: SessionEvent, cx: &mut App) {
-        if !self.live || !in_transcript(&event) {
+        if !self.live || !in_transcript(&event) || self.updates_shown_tool(&event) {
             return self.land(event, cx);
         }
         if self.pacer.after.is_empty() {
@@ -200,24 +200,40 @@ impl Session {
         }
     }
 
+    /// An update to a tool call whose row shows already. It changes a row above any text
+    /// held back, so it can't land out of order; held back, it would make the pacer take
+    /// that text's row as finished while more of it may follow the update.
+    fn updates_shown_tool(&self, event: &SessionEvent) -> bool {
+        let SessionEvent::ToolCallUpdate { id, .. } = event else {
+            return false;
+        };
+        self.rows
+            .iter()
+            .any(|row| matches!(row, Row::Tool { id: shown, .. } if shown == id))
+    }
+
     /// Whether any text or event is held back, for `pace` to show.
     pub(crate) fn pacing(&self) -> bool {
         self.pacer.holds()
     }
 
     /// Shows the next piece of held-back text, `dt` after the last, and once all of it
-    /// shows, lands what came after it. Returns whether anything is still held back.
-    pub(crate) fn pace(&mut self, dt: Duration, cx: &mut App) -> bool {
+    /// shows, lands what came after it.
+    pub(crate) fn pace(&mut self, dt: Duration, cx: &mut App) -> Paced {
+        let mut paced = Paced::default();
         if let Some(piece) = self.pacer.next(dt, Instant::now()) {
             self.show(piece, cx);
+            paced.shown = true;
         }
         while !self.pacer.has_text() {
             let Some(event) = self.pacer.after.pop_front() else {
                 break;
             };
             self.take(event, cx);
+            paced.landed = true;
         }
-        self.pacer.holds()
+        paced.holds = self.pacer.holds();
+        paced
     }
 
     /// Shows all held-back text at once and lands what came after it, as when the user
@@ -368,7 +384,7 @@ impl Session {
             }
             SessionEvent::SettingFailed { setting, message } => {
                 self.answered(&setting);
-                self.push(Row::Error(message), cx)
+                self.push_error(message, cx)
             }
         }
     }
@@ -439,6 +455,14 @@ impl Session {
         self.remeasure(self.rows.len() - 1, cx);
     }
 
+    /// An error from outside the turn's own events, such as the connection's or a setting
+    /// change's. What the turn has sent shows first, all of it, so the error comes after
+    /// it and no held-back text is left for a row that is no longer the last.
+    pub(crate) fn push_error(&mut self, message: String, cx: &mut App) {
+        self.flush(cx);
+        self.push(Row::Error(message), cx);
+    }
+
     pub(crate) fn push(&mut self, row: Row, cx: &mut App) {
         let now = Instant::now();
         if self.live {
@@ -457,6 +481,17 @@ impl Session {
             scroller.remeasure_items(ix..ix + 1, cx);
         });
     }
+}
+
+/// What one `Session::pace` step did.
+#[derive(Default)]
+pub(crate) struct Paced {
+    /// A piece of held-back text showed.
+    pub(crate) shown: bool,
+    /// An event that waited behind the text landed.
+    pub(crate) landed: bool,
+    /// Text or events are still held back.
+    pub(crate) holds: bool,
 }
 
 /// Events that land in the transcript, which keep their order behind held-back text.

@@ -5,8 +5,9 @@
 //! for a moment, then a whole sentence. Held here, it shows a few characters a frame at
 //! about the rate it arrives, faster when it falls behind, so it trails what has arrived
 //! by about `LAG`. Where it stops is chosen so that what shows renders as it will once
-//! the rest comes: half of a `**bold**` run would show its asterisks, and a table's
-//! header row would show as a paragraph until its delimiter row came.
+//! the rest comes: half of a `**bold**` run would show its asterisks, half of a link its
+//! brackets and target, and a table's header row would show as a paragraph until its
+//! delimiter row came.
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -28,10 +29,12 @@ const WAIT_LIMIT: Duration = Duration::from_millis(800);
 
 #[derive(Default)]
 pub(crate) struct Pacer {
-    /// What the last row shows of the text streamed into it, which the stopping rules read.
-    shown: String,
-    /// Text for the last row not shown yet.
-    text: String,
+    /// The text streamed into the last row, shown or not, which the stopping rules read.
+    row: String,
+    /// How much of `row` shows; the rest is held back.
+    shown: usize,
+    /// Which lines of `row` are code, as far as the stopping rules have read it.
+    fences: Fences,
     /// Events that came after the held text, landing once it has all shown.
     pub(crate) after: VecDeque<SessionEvent>,
     /// The held text opens a new row, a thought or not, which comes with its first piece
@@ -57,34 +60,40 @@ impl Pacer {
     }
 
     pub(crate) fn has_text(&self) -> bool {
-        !self.text.is_empty()
+        self.shown < self.row.len()
     }
 
-    /// The text arriving next opens a new row, a thought or not.
+    /// The text arriving next opens a new row, a thought or not. Its pace starts from
+    /// rest, not at the last row's, which may have been catching up.
     pub(crate) fn start_row(&mut self, thought: bool) {
         self.opens = Some(thought);
-        self.shown.clear();
+        self.row.clear();
+        self.shown = 0;
+        self.fences = Fences::default();
+        self.arrivals.clear();
+        self.rate = 0.;
+        self.budget = 0.;
         self.wait = None;
         self.given_up_to = 0;
     }
 
     /// More of the row's text, arrived at `now`.
     pub(crate) fn arrived(&mut self, text: &str, now: Instant) {
-        self.text.push_str(text);
+        self.row.push_str(text);
         self.arrivals.push_back((now, text.chars().count()));
     }
 
     /// All of the held text, to show at once.
     pub(crate) fn take_all(&mut self) -> String {
-        let text = std::mem::take(&mut self.text);
-        self.shown.push_str(&text);
+        let text = self.row[self.shown..].to_string();
+        self.shown = self.row.len();
         self.budget = 0.;
         text
     }
 
     /// The next piece of held text to show, `dt` after the last frame, if one is due.
     pub(crate) fn next(&mut self, dt: Duration, now: Instant) -> Option<String> {
-        if self.text.is_empty() {
+        if !self.has_text() {
             self.budget = 0.;
             return None;
         }
@@ -97,7 +106,8 @@ impl Pacer {
         }
         let arriving = self.arrivals.iter().map(|(_, chars)| *chars).sum::<usize>() as f32
             / ARRIVAL_WINDOW.as_secs_f32();
-        let behind = self.text.chars().count() as f32;
+        let held = &self.row[self.shown..];
+        let behind = held.chars().count() as f32;
         let lag = if self.after.is_empty() { LAG } else { CATCH_UP };
         let want = arriving.max(behind / lag.as_secs_f32()).max(MIN_RATE);
         let dt = dt.as_secs_f32();
@@ -107,29 +117,31 @@ impl Pacer {
             return None;
         }
 
-        let mut end = self
-            .text
+        let mut end = held
             .char_indices()
             .nth(self.budget as usize)
-            .map_or(self.text.len(), |(ix, _)| ix);
+            .map_or(held.len(), |(ix, _)| ix);
         // Latin text shows in whole words, as far as they have arrived.
-        let bytes = self.text.as_bytes();
+        let bytes = held.as_bytes();
         while end < bytes.len() && is_word_byte(bytes[end - 1]) && is_word_byte(bytes[end]) {
             end += 1;
         }
         // Text is complete once something came after it: no more comes for this row.
+        // (An update to a tool call already shown never waits here; see `Session::apply`.)
         let complete = !self.after.is_empty();
-        let from = self.shown.len();
-        let src = format!("{}{}", self.shown, self.text);
-        let end = self.stop(&src, from, from + end, complete, now) - from;
-        if end == 0 {
+        let from = self.shown;
+        // Taken out for `stop` to read while it keeps its place in it.
+        let row = std::mem::take(&mut self.row);
+        let stop = self.stop(&row, from, from + end, complete, now);
+        self.row = row;
+        if stop == from {
             // Waiting: don't save up a burst for when it ends.
             self.budget = self.budget.min(2.);
             return None;
         }
-        let piece: String = self.text.drain(..end).collect();
+        let piece = self.row[from..stop].to_string();
         self.budget -= piece.chars().count() as f32;
-        self.shown.push_str(&piece);
+        self.shown = stop;
         Some(piece)
     }
 
@@ -142,7 +154,8 @@ impl Pacer {
                 p = next_char(src, p);
                 continue;
             }
-            match unit_at(src, p, complete) {
+            self.fences = self.fences.read_to(src, p);
+            match unit_at(src, p, complete, self.fences.open) {
                 Unit::Char => p = next_char(src, p),
                 Unit::Through(end) => p = end.max(next_char(src, p)),
                 Unit::Wait => {
@@ -168,6 +181,36 @@ fn is_word_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'_'
 }
 
+/// Whether the text read so far ends inside a fenced code block. Kept as the pacer reads
+/// on, as finding out afresh means reading the row from its start for every character.
+#[derive(Clone, Copy, Default)]
+struct Fences {
+    /// The start of the line it has read up to.
+    line: usize,
+    /// The lines before it leave a code block open.
+    open: bool,
+}
+
+impl Fences {
+    /// The same, read on to the line `p` is in: an odd number of fence lines ending
+    /// before it leave it in a code block.
+    fn read_to(mut self, src: &str, p: usize) -> Self {
+        if p < self.line {
+            self = Fences::default();
+        }
+        loop {
+            let end = line_end(src, self.line);
+            if end >= p {
+                return self;
+            }
+            if src[self.line..end].starts_with("```") {
+                self.open = !self.open;
+            }
+            self.line = end + 1;
+        }
+    }
+}
+
 /// What has to show together from a point in the text so that what shows renders as it
 /// will once more arrives.
 #[derive(Debug, PartialEq)]
@@ -181,8 +224,8 @@ enum Unit {
 }
 
 /// The unit starting at `p` in a row's markdown `src`. `complete` says no more text comes
-/// for the row, so nothing waits.
-fn unit_at(src: &str, p: usize, complete: bool) -> Unit {
+/// for the row, so nothing waits; `fenced` that `p` is inside a fenced code block.
+fn unit_at(src: &str, p: usize, complete: bool, fenced: bool) -> Unit {
     let end = line_end(src, p);
     let line_done = end < src.len() || complete;
     let line = &src[p..end];
@@ -195,7 +238,7 @@ fn unit_at(src: &str, p: usize, complete: bool) -> Unit {
         }
     };
 
-    if in_fence(src, p) {
+    if fenced {
         // Only a closing fence matters inside a code block; it shows whole.
         return match () {
             _ if at_start && line.starts_with("```") => whole_line(),
@@ -235,7 +278,7 @@ fn unit_at(src: &str, p: usize, complete: bool) -> Unit {
         // takes its look at once.
         if let Some(marker) = block_marker(line) {
             let first = p + marker;
-            return match unit_at(src, first, complete) {
+            return match unit_at(src, first, complete, false) {
                 Unit::Wait => Unit::Wait,
                 Unit::Char => Unit::Through(next_char(src, first)),
                 through => through,
@@ -245,21 +288,48 @@ fn unit_at(src: &str, p: usize, complete: bool) -> Unit {
             return Unit::Wait;
         }
     }
-    // An inline run shows whole once it closes on its line.
     let rest = &src[p..];
-    for mark in ["**", "`"] {
-        if rest.starts_with(mark) {
-            let inner = p + mark.len();
-            return match src[inner..end].find(mark) {
-                Some(close) if close > 0 => Unit::Through(inner + close + mark.len()),
-                _ if line_done => Unit::Char,
-                _ => Unit::Wait,
-            };
-        }
+    let waiting = if line_done { Unit::Char } else { Unit::Wait };
+    // A link or an image shows whole once its target closes on its line.
+    if rest.starts_with('[') || rest.starts_with("![") {
+        let label = p + rest.find('[').unwrap_or(0) + 1;
+        let Some(close) = src[label..end].find(']') else {
+            return waiting;
+        };
+        let after = label + close + 1;
+        return match src[after..end].chars().next() {
+            Some('(') => src[after..end]
+                .find(')')
+                .map_or(waiting, |target| Unit::Through(after + target + 1)),
+            // Brackets with no target after them are text.
+            Some(_) => Unit::Char,
+            None => waiting,
+        };
     }
-    // A lone `*` at the end may be the start of `**`.
-    if rest == "*" && !complete {
-        return Unit::Wait;
+    // An inline run shows whole once it closes on its line.
+    for mark in ["**", "__", "~~", "`", "*", "_"] {
+        if !rest.starts_with(mark) {
+            continue;
+        }
+        // Underscores inside a word, as in `snake_case`, are text.
+        let before = src[..p].chars().next_back();
+        if mark.starts_with('_') && before.is_some_and(|c| c.is_alphanumeric() || c == '_') {
+            return Unit::Char;
+        }
+        let inner = p + mark.len();
+        // A single `*` or `_` opens a run only right before text; one at the end of what
+        // has arrived may still be half of `**`.
+        if mark.len() == 1 && mark != "`" {
+            match src[inner..end].chars().next() {
+                None => return waiting,
+                Some(c) if c.is_whitespace() => return Unit::Char,
+                Some(_) => {}
+            }
+        }
+        return match src[inner..end].find(mark) {
+            Some(close) if close > 0 => Unit::Through(inner + close + mark.len()),
+            _ => waiting,
+        };
     }
     Unit::Char
 }
@@ -285,23 +355,6 @@ fn previous_line(src: &str, p: usize) -> &str {
     let end = p - 1;
     let start = src[..end].rfind('\n').map_or(0, |ix| ix + 1);
     &src[start..end]
-}
-
-/// Whether `p` is inside a fenced code block: an odd number of fence lines end before it.
-fn in_fence(src: &str, p: usize) -> bool {
-    let mut open = false;
-    let mut start = 0;
-    while start < p {
-        let end = line_end(src, start);
-        if end >= p {
-            break;
-        }
-        if src[start..end].starts_with("```") {
-            open = !open;
-        }
-        start = end + 1;
-    }
-    open
 }
 
 /// The length of a heading or list marker and the space after it, when text follows.
@@ -358,8 +411,12 @@ fn is_delimiter_row(line: &str, columns: usize) -> bool {
 mod tests {
     use super::*;
 
+    fn in_fence(src: &str, p: usize) -> bool {
+        Fences::default().read_to(src, p).open
+    }
+
     fn unit(src: &str, p: usize) -> Unit {
-        unit_at(src, p, false)
+        unit_at(src, p, false, in_fence(src, p))
     }
 
     #[test]
@@ -376,7 +433,32 @@ mod tests {
         // The line ended without a close, so the asterisks are text.
         assert_eq!(unit("a **bold\nmore", 2), Unit::Char);
         assert_eq!(unit("a *", 2), Unit::Wait);
-        assert_eq!(unit_at("a *", 2, true), Unit::Char);
+        assert_eq!(unit_at("a *", 2, true, false), Unit::Char);
+    }
+
+    #[test]
+    fn links_show_whole_once_their_target_closes() {
+        let src = "see [session.rs](crates/acp-gui/src/session.rs) now";
+        assert_eq!(unit(src, 4), Unit::Through(47));
+        assert_eq!(unit("see [session.rs](crates/ac", 4), Unit::Wait);
+        assert_eq!(unit("see [session.rs]", 4), Unit::Wait);
+        assert_eq!(unit("see ![logo](a.png)", 4), Unit::Through(18));
+        // Brackets with no target are text, as is one that never closes on its line.
+        assert_eq!(unit("a [x] b", 2), Unit::Char);
+        assert_eq!(unit("a [x\nb", 2), Unit::Char);
+    }
+
+    #[test]
+    fn single_marks_and_strikethrough_wait_for_their_close() {
+        assert_eq!(unit("a *note", 2), Unit::Wait);
+        assert_eq!(unit("a *note* b", 2), Unit::Through(8));
+        assert_eq!(unit("a _note_ b", 2), Unit::Through(8));
+        assert_eq!(unit("a ~~old~~ b", 2), Unit::Through(9));
+        assert_eq!(unit("a ~~ol", 2), Unit::Wait);
+        // Before a space a mark opens nothing, and underscores inside a word are text.
+        assert_eq!(unit("2 * 3", 2), Unit::Char);
+        assert_eq!(unit("snake_case", 5), Unit::Char);
+        assert_eq!(unit("my__var", 3), Unit::Char);
     }
 
     #[test]
@@ -502,6 +584,31 @@ mod tests {
             }
         }
         assert_eq!(shown, reply);
+    }
+
+    #[test]
+    fn a_new_row_starts_from_rest_after_a_fast_one() {
+        let tick = Duration::from_millis(16);
+        let start = Instant::now();
+        let mut pacer = Pacer::default();
+        pacer.start_row(false);
+        // A long reply that ends while catching up, with the turn's end behind it.
+        pacer.arrived(&"字".repeat(400), start);
+        pacer
+            .after
+            .push_back(SessionEvent::TurnFailed(String::new()));
+        let mut now = start;
+        while pacer.has_text() {
+            now += tick;
+            pacer.next(tick, now);
+        }
+        pacer.after.clear();
+        pacer.start_row(false);
+        let next = "下一个回合的第一句话，大约二十个字。";
+        pacer.arrived(next, now);
+        now += tick;
+        let first = pacer.next(tick, now).unwrap_or_default();
+        assert!(first.chars().count() < 5, "{first}");
     }
 
     #[test]
