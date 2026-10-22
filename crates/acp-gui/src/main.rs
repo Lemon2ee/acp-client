@@ -1106,8 +1106,12 @@ const PANEL_HEIGHT: Pixels = px(420.);
 /// How wide the panel's column of tabs is, and how big each tab is.
 const TAB_COLUMN_WIDTH: Pixels = px(56.);
 const TAB_SIZE: Pixels = px(40.);
+/// The agent's mark inside its tab.
+const TAB_ICON_SIZE: Pixels = px(20.);
 /// How tall the search box's row along the top of the panel is.
 const SEARCH_ROW_HEIGHT: Pixels = px(44.);
+/// The magnifier before the search box.
+const SEARCH_ICON_SIZE: Pixels = px(16.);
 /// Groups a model's row with its star, which shows while the row is pointed at.
 const MODEL_ROW_GROUP: &str = "model-panel-row";
 
@@ -1119,36 +1123,56 @@ const CLAUDE_ORANGE: u32 = 0xD97757;
 
 /// The agent's mark for its tab: its harness's, or a terminal for a command.
 fn agent_logo(name: &str) -> Icon {
-    if name == Harness::Claude.name() {
-        Icon::empty()
+    match harness_of(name) {
+        Some(Harness::Claude) => Icon::empty()
             .data(CLAUDE_LOGO)
-            .text_color(rgb(CLAUDE_ORANGE))
-    } else if name == Harness::Codex.name() {
-        Icon::empty().data(OPENAI_LOGO)
-    } else {
-        Icon::new(IconName::SquareTerminal)
+            .text_color(rgb(CLAUDE_ORANGE)),
+        Some(Harness::Codex) => Icon::empty().data(OPENAI_LOGO),
+        None => Icon::new(IconName::SquareTerminal),
     }
 }
 
-/// Whether the choice is an adapter's "default" entry, which stands for one of the
-/// other choices and isn't listed.
-fn is_default(choice: &SettingChoice) -> bool {
-    choice.id == "default"
-}
+/// The kinds of setting whose "default" choice can stand for another: Claude's adapter
+/// lists the model and the thought level that way. A mode named "default" is a mode.
+const STAND_IN_KINDS: [SettingKind; 2] = [SettingKind::Model, SettingKind::ThoughtLevel];
 
-/// The choice a setting shows as its value. An adapter can set a setting to its
-/// "default" entry, which isn't listed; its description names the choice it stands for.
-fn shown_choice(setting: &Setting) -> Option<&SettingChoice> {
-    let chosen = setting.chosen()?;
-    if !is_default(chosen) {
-        return Some(chosen);
+/// The setting's "default" choice and the choice it stands for, when it stands for one:
+/// its description names that choice. A "default" that names none is a choice of its
+/// own, and is shown and listed like the others.
+fn stand_in(setting: &Setting) -> Option<(&SettingChoice, &SettingChoice)> {
+    if !STAND_IN_KINDS.contains(&setting.kind) {
+        return None;
     }
-    let stands_for = chosen.description.as_deref();
+    let default = setting
+        .choices
+        .iter()
+        .find(|choice| choice.id == "default")?;
+    let stands_for = default.description.as_deref()?;
     let choice = setting
         .choices
         .iter()
-        .find(|choice| !is_default(choice) && Some(choice.name.as_str()) == stands_for);
-    Some(choice.unwrap_or(chosen))
+        .find(|choice| choice.id != "default" && choice.name == stands_for)?;
+    Some((default, choice))
+}
+
+/// The setting's choices as they are listed: all of them but a "default" that stands
+/// for one of the others.
+fn listed_choices(setting: &Setting) -> impl Iterator<Item = &SettingChoice> {
+    let hidden = stand_in(setting).map(|(default, _)| default.id.as_str());
+    setting
+        .choices
+        .iter()
+        .filter(move |choice| Some(choice.id.as_str()) != hidden)
+}
+
+/// The choice a setting shows as its value: the one it is set to, or the one its
+/// "default" stands for when it is set to that.
+fn shown_choice(setting: &Setting) -> Option<&SettingChoice> {
+    let chosen = setting.chosen()?;
+    match stand_in(setting) {
+        Some((default, stands_for)) if default.id == chosen.id => Some(stands_for),
+        _ => Some(chosen),
+    }
 }
 
 /// What the model panel keeps while it is open.
@@ -1167,8 +1191,9 @@ enum ModelTab {
     Agent(usize),
 }
 
-/// A model the user starred: its agent's name and its id. The agent goes by name, not
-/// index, so the star holds across runs that start the agents in another order.
+/// A model the user starred: its agent's `kept_name` and its id. The agent goes by
+/// name, not index, so the star holds across runs that start the agents in another
+/// order, or start one of them by the `claude` or `codex` argument.
 #[derive(Clone, PartialEq, Eq)]
 struct Favorite {
     agent: String,
@@ -1179,6 +1204,9 @@ struct Favorite {
 struct ModelGroup {
     agent: usize,
     name: String,
+    /// The name the agent's favorites go by, from `kept_name`. None for a command,
+    /// whose models can't be starred: the favorites file would name the command.
+    kept: Option<&'static str>,
     setting: Setting,
     /// Whether this is the session's own agent, whose model is set in place. Another
     /// agent's model goes on to a session on that agent.
@@ -1224,7 +1252,7 @@ impl ModelPanel<'_> {
             .hover(move |style| style.bg(selected_bg).text_color(foreground))
             .when(selected, |tab| tab.bg(selected_bg).text_color(foreground))
             .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
-            .child(icon.size(px(20.)))
+            .child(icon.size(TAB_ICON_SIZE))
             .on_click(move |_, _, cx| {
                 let _ = view.update(cx, |this, cx| this.show_model_tab(tab, cx));
             })
@@ -1265,7 +1293,11 @@ impl ModelPanel<'_> {
                     .text_ellipsis()
                     .child(SharedString::from(choice.name.clone())),
             )
-            .child(self.star(group, choice, starred))
+            .children(
+                group
+                    .kept
+                    .map(|kept| self.star(kept, group.agent, choice, starred)),
+            )
             .when(current, |row| {
                 row.child(Icon::new(IconName::Check).xsmall())
             })
@@ -1284,11 +1316,17 @@ impl ModelPanel<'_> {
 
     /// The star on a model's row, which stars the model or takes its star off. A
     /// starred model's star is filled and always shows; the others show while their
-    /// row is pointed at.
-    fn star(&self, group: &ModelGroup, choice: &SettingChoice, starred: bool) -> AnyElement {
+    /// row is pointed at. `kept` is the agent's name in the favorites.
+    fn star(
+        &self,
+        kept: &'static str,
+        agent: usize,
+        choice: &SettingChoice,
+        starred: bool,
+    ) -> AnyElement {
         let view = self.view.clone();
         let favorite = Favorite {
-            agent: group.name.clone(),
+            agent: kept.to_string(),
             model: choice.id.clone(),
         };
         div()
@@ -1302,7 +1340,7 @@ impl ModelPanel<'_> {
             })
             .child(
                 Button::new(ElementId::Name(
-                    format!("model-star-{}-{}", group.agent, choice.id).into(),
+                    format!("model-star-{agent}-{}", choice.id).into(),
                 ))
                 .ghost()
                 .xsmall()
@@ -1397,18 +1435,20 @@ fn come_in<E: Styled + IntoElement + 'static>(
     })
 }
 
-/// The models of `group` named like `query`, with whether each is the session's model.
-fn listed_models<'a>(group: &'a ModelGroup, query: &str) -> Vec<(&'a SettingChoice, bool)> {
+/// The models of `group` that pass `only` and are named like `query`, with whether
+/// each is the session's model. `only` goes first, as it is the cheaper test.
+fn listed_models<'a>(
+    group: &'a ModelGroup,
+    only: impl Fn(&SettingChoice) -> bool,
+    query: &str,
+) -> Vec<(&'a SettingChoice, bool)> {
     let current = group
         .own
         .then(|| shown_choice(&group.setting))
         .flatten()
         .map(|choice| choice.id.as_str());
-    group
-        .setting
-        .choices
-        .iter()
-        .filter(|choice| !is_default(choice))
+    listed_choices(&group.setting)
+        .filter(|choice| only(choice))
         .filter(|choice| query.is_empty() || choice.name.to_lowercase().contains(query))
         .map(|choice| (choice, current == Some(choice.id.as_str())))
         .collect()
@@ -1428,50 +1468,48 @@ fn model_panel(
 ) -> AnimationElement<Div> {
     let (border, muted) = (cx.theme().border, panel.muted);
     let query = panel.search.read(cx).value().trim().to_lowercase();
-    let starred = |group: &ModelGroup, choice: &SettingChoice| {
-        favorites
-            .iter()
-            .any(|favorite| favorite.agent == group.name && favorite.model == choice.id)
+    let is_starred = |group: &ModelGroup, choice: &SettingChoice| {
+        group.kept.is_some_and(|kept| {
+            favorites
+                .iter()
+                .any(|favorite| favorite.agent == kept && favorite.model == choice.id)
+        })
     };
     let mut rows: Vec<AnyElement> = Vec::new();
-    let empty =
-        match tab {
-            ModelTab::Favorites => {
-                // Each agent's starred models under its name.
-                for group in groups {
-                    let starred: Vec<_> = listed_models(group, &query)
-                        .into_iter()
-                        .filter(|(choice, _)| starred(group, choice))
-                        .collect();
-                    if starred.is_empty() {
-                        continue;
-                    }
-                    rows.push(panel.group_header(&group.name));
-                    rows.extend(starred.into_iter().map(|(choice, current)| {
+    let empty = match tab {
+        ModelTab::Favorites => {
+            // Each agent's starred models under its name.
+            for group in groups {
+                let starred = listed_models(group, |choice| is_starred(group, choice), &query);
+                if starred.is_empty() {
+                    continue;
+                }
+                rows.push(panel.group_header(&group.name));
+                rows.extend(starred.into_iter().map(|(choice, current)| {
+                    panel
+                        .model_row(group, choice, current, true)
+                        .into_any_element()
+                }));
+            }
+            if query.is_empty() {
+                "No favorites yet. Star a model to keep it here."
+            } else {
+                "No favorites match."
+            }
+        }
+        ModelTab::Agent(agent) => {
+            for group in groups.iter().filter(|group| group.agent == agent) {
+                rows.extend(listed_models(group, |_| true, &query).into_iter().map(
+                    |(choice, current)| {
                         panel
-                            .model_row(group, choice, current, true)
+                            .model_row(group, choice, current, is_starred(group, choice))
                             .into_any_element()
-                    }));
-                }
-                if query.is_empty() {
-                    "No favorites yet. Star a model to keep it here."
-                } else {
-                    "No favorites match."
-                }
+                    },
+                ));
             }
-            ModelTab::Agent(agent) => {
-                for group in groups.iter().filter(|group| group.agent == agent) {
-                    rows.extend(listed_models(group, &query).into_iter().map(
-                        |(choice, current)| {
-                            panel
-                                .model_row(group, choice, current, starred(group, choice))
-                                .into_any_element()
-                        },
-                    ));
-                }
-                "No models match."
-            }
-        };
+            "No models match."
+        }
+    };
 
     let tabs = div()
         .w(TAB_COLUMN_WIDTH)
@@ -1508,7 +1546,11 @@ fn model_panel(
         .gap_2()
         .border_b_1()
         .border_color(border)
-        .child(Icon::new(IconName::Search).size(px(16.)).text_color(muted))
+        .child(
+            Icon::new(IconName::Search)
+                .size(SEARCH_ICON_SIZE)
+                .text_color(muted),
+        )
         .child(
             Input::new(panel.search)
                 .appearance(false)
@@ -1717,6 +1759,7 @@ impl ChatView {
                 Some(ModelGroup {
                     agent: ix,
                     name: slot.name.clone(),
+                    kept: kept_name(&slot.name),
                     setting: setting.clone(),
                     own,
                 })
@@ -1738,7 +1781,11 @@ impl ChatView {
             .map_or(ModelTab::Favorites, |group| ModelTab::Agent(group.agent));
         let view = cx.entity().downgrade();
         let key = session.key;
-        let tab = self.model_panel.tab;
+        // The tab on show may be an agent's that went away while the panel was open.
+        let tab = match self.model_panel.tab {
+            ModelTab::Agent(agent) if !groups.iter().any(|group| group.agent == agent) => first_tab,
+            tab => tab,
+        };
         let search = self.model_panel.search.clone();
         let favorites = self.favorites.clone();
         let trigger = model_button(shown).cursor_pointer();
@@ -1778,7 +1825,7 @@ impl ChatView {
     }
 
     /// The button for how hard the model thinks, and a menu of the levels that opens
-    /// upward. The adapter's "default" level is left out: it stands for one of the others.
+    /// upward. A "default" level that stands for one of the others is left out.
     fn render_effort_picker(
         &self,
         key: SessionKey,
@@ -1791,29 +1838,24 @@ impl ChatView {
             .cursor_pointer()
             .dropdown_menu_with_anchor(Anchor::BottomLeft, move |menu, _, _| {
                 let current = shown_choice(&setting).map(|choice| choice.id.clone());
-                setting
-                    .choices
-                    .iter()
-                    .filter(|choice| !is_default(choice))
-                    .fold(menu, |menu, choice| {
-                        let checked = current.as_deref() == Some(choice.id.as_str());
-                        let (view, id, value) =
-                            (view.clone(), setting.id.clone(), choice.id.clone());
-                        menu.item(
-                            PopupMenuItem::new(choice.name.clone())
-                                .checked(checked)
-                                .on_click(move |_, _, cx| {
-                                    let _ = view.update(cx, |this, cx| {
-                                        this.change_setting(
-                                            key,
-                                            id.clone(),
-                                            SettingValue::Choice(value.clone()),
-                                            cx,
-                                        )
-                                    });
-                                }),
-                        )
-                    })
+                listed_choices(&setting).fold(menu, |menu, choice| {
+                    let checked = current.as_deref() == Some(choice.id.as_str());
+                    let (view, id, value) = (view.clone(), setting.id.clone(), choice.id.clone());
+                    menu.item(
+                        PopupMenuItem::new(choice.name.clone())
+                            .checked(checked)
+                            .on_click(move |_, _, cx| {
+                                let _ = view.update(cx, |this, cx| {
+                                    this.change_setting(
+                                        key,
+                                        id.clone(),
+                                        SettingValue::Choice(value.clone()),
+                                        cx,
+                                    )
+                                });
+                            }),
+                    )
+                })
             })
             .into_any_element()
     }
@@ -2211,7 +2253,8 @@ fn config_folder() -> Option<PathBuf> {
     Some(dirs::config_dir()?.join("acp-client"))
 }
 
-/// Holds the models the user starred, one a line: the agent's name, a tab, the model's id.
+/// Holds the models the user starred, one a line: the agent's `kept_name`, a tab, the
+/// model's id.
 const FAVORITES: &str = "favorite-models";
 
 fn load_favorites() -> Vec<Favorite> {
@@ -2266,14 +2309,19 @@ fn change_favorites(
 /// Holds the settings each agent last created a session with, by `kept_name`, as JSON.
 const LAST_SETTINGS: &str = "last-settings";
 
-/// The name an agent's settings are kept under on disk: its harness's, whether the
-/// window started it as that or by the `claude` or `codex` argument. None for any other
-/// command, which is all that names such an agent and may carry a secret, such as a key.
-fn kept_name(name: &str) -> Option<&'static str> {
+/// The harness an agent is, whether the window started it as that or by the `claude`
+/// or `codex` argument. None for any other command.
+fn harness_of(name: &str) -> Option<Harness> {
     Harness::ALL
         .into_iter()
-        .map(Harness::name)
-        .find(|kept| kept.eq_ignore_ascii_case(name))
+        .find(|harness| harness.name().eq_ignore_ascii_case(name))
+}
+
+/// The name an agent's settings and favorites are kept under on disk: its harness's.
+/// None for any other command, which is all that names such an agent and may carry a
+/// secret, such as a key, so nothing of it is written.
+fn kept_name(name: &str) -> Option<&'static str> {
+    harness_of(name).map(Harness::name)
 }
 
 /// A file that is missing or can't be read gives none, and the buttons wait for the
