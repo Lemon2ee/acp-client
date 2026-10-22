@@ -34,11 +34,13 @@ const LIST_HEADER_HEIGHT: Pixels = px(26.);
 const LIST_HEADER_GAP: Pixels = px(6.);
 /// The heading over the effort menu's levels and the mode menu's modes.
 const MENU_HEADING_HEIGHT: Pixels = px(24.);
-/// A row's padding. The right is narrower, as the star's button has room of its own.
-const ROW_PAD_LEFT: Pixels = px(6.);
-const ROW_PAD_RIGHT: Pixels = px(4.);
-/// The column every row starts with, for a check, an agent's mark or the magnifier, so
-/// that names, headings and the search text all start on one line, 32px into the list.
+/// A row's padding on either side. A menu's heading starts as far in, and the check at a
+/// row's end stops as far from the edge as a switch does.
+const ROW_PAD: Pixels = px(6.);
+/// The column every row starts with, for what the button below shows before its name
+/// (a mode's icon, an effort level's meter), an agent's mark or the magnifier, so that
+/// names and the search text all start on one line, 32px into the list. A row ends in a
+/// column as wide for its check.
 const LEAD_WIDTH: Pixels = px(16.);
 const LEAD_ICON_SIZE: Pixels = px(14.);
 const LEAD_GAP: Pixels = px(6.);
@@ -182,15 +184,15 @@ impl MenuLook {
         })
     }
 
-    /// A row of the panel or the effort menu, which lights up under the pointer.
+    /// A row of the model panel, which lights up under the pointer. The menus' rows light
+    /// up for the keys too (see `MenuParts::row`).
     fn row(&self, id: impl Into<ElementId>) -> Stateful<Div> {
         let hover = self.hover;
         div()
             .id(id)
             .h(LIST_ROW_HEIGHT)
             .flex_none()
-            .pl(ROW_PAD_LEFT)
-            .pr(ROW_PAD_RIGHT)
+            .px(ROW_PAD)
             .flex()
             .items_center()
             .gap(LEAD_GAP)
@@ -208,7 +210,8 @@ impl MenuLook {
     }
 }
 
-/// The column a row starts with, for its check or mark.
+/// The column a row starts with, for its icon or mark, and the one it ends with for its
+/// check.
 fn lead() -> Div {
     div()
         .w(LEAD_WIDTH)
@@ -218,9 +221,15 @@ fn lead() -> Div {
         .justify_center()
 }
 
-/// A check in a row's `lead`, before the model or level in use.
+/// The check at the end of the row in use.
 fn check() -> Icon {
     Icon::new(IconName::Check).size(LEAD_ICON_SIZE)
+}
+
+/// The column a model's or a level's row ends with: the check if it is the one in use.
+/// Kept when empty, so the stars before it line up.
+fn check_column(current: bool) -> Div {
+    lead().when(current, |column| column.child(check()))
 }
 
 /// The harnesses' marks, for the panel's tabs.
@@ -470,7 +479,7 @@ impl MenuParts<'_> {
         div()
             .h(MENU_HEADING_HEIGHT)
             .flex_none()
-            .pl(ROW_PAD_LEFT)
+            .pl(ROW_PAD)
             .flex()
             .items_center()
             .text_size(MENU_HEADING_SIZE)

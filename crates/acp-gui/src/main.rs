@@ -140,9 +140,9 @@ fn main() {
                 KeyBinding::new("cmd-,", CloseSettings, Some("Settings")),
                 KeyBinding::new("escape", CloseSettings, Some("Settings")),
             ]);
-            // In the mode menu, Up and Down move the light and Enter or Space picks the
-            // lit row. Esc is the popover's, which closes it. These are the component
-            // library's own actions, as its menus take them.
+            // In the effort and mode menus, Up and Down move the light and Enter or Space
+            // picks the lit row. Esc is the popover's, which closes it. These are the
+            // component library's own actions, as its menus take them.
             cx.bind_keys([
                 KeyBinding::new("up", SelectUp, Some("PickerMenu")),
                 KeyBinding::new("down", SelectDown, Some("PickerMenu")),

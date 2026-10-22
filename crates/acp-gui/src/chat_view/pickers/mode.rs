@@ -10,7 +10,7 @@ use gpui_kit::*;
 use crate::chat_view::ChatView;
 use crate::chat_view::pickers::{
     EFFORT_MENU_WIDTH, LEAD_ICON_SIZE, MENU_LINE_HEIGHT, MenuLook, MenuNav, MenuParts,
-    PICKER_ICON_SIZE, ROW_PAD_LEFT, check, lead, menu_popover, pick_choice, picker_button, rise_in,
+    PICKER_ICON_SIZE, ROW_PAD, check, lead, menu_popover, pick_choice, picker_button, rise_in,
 };
 
 /// How wide a mode's name and description may run, each on one line. Codex's longest
@@ -36,7 +36,7 @@ fn mode_row(menu: &MenuParts, choice: &SettingChoice, row: usize, current: bool)
     .when_some(choice.description.clone(), |row, description| {
         row.aria_description(SharedString::from(description))
     })
-    .p(ROW_PAD_LEFT)
+    .p(ROW_PAD)
     .items_start()
     .child(
         line().child(
