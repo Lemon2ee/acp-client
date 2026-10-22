@@ -17,6 +17,7 @@ use gpui_kit::component::text::{TextViewMotion, TextViewState};
 use gpui_kit::*;
 
 use crate::chat_view::scroller::TranscriptScroll;
+use crate::config::TitleSource;
 use pacing::Pacer;
 
 /// How much later each word of a streamed piece starts fading in than the one before,
@@ -49,8 +50,10 @@ pub(crate) struct Session {
     /// Index into `ChatView::agents` of the agent it runs on. A session never moves:
     /// ACP has no way to carry one over to another agent.
     pub(crate) agent: usize,
-    /// The first line of the first prompt, shown on the session's card.
+    /// Shown on the session's card and above its transcript: the first line of the first
+    /// prompt, until the agent sends a title for the session or the user renames it.
     pub(crate) title: Option<String>,
+    pub(crate) title_source: TitleSource,
     pub(crate) rows: Vec<Row>,
     pub(crate) scroller: Entity<TranscriptScroll>,
     /// Not ready for a prompt: a spare still being created, a turn is running, or the
@@ -112,6 +115,7 @@ impl Session {
             key,
             agent,
             title: None,
+            title_source: TitleSource::Prompt,
             rows: Vec::new(),
             scroller: cx.new(|_| TranscriptScroll::new()),
             busy: false,
@@ -386,7 +390,25 @@ impl Session {
                 self.answered(&setting);
                 self.push_error(message, cx)
             }
+            SessionEvent::Title(title) => {
+                if self.title_source == TitleSource::User || self.echoes_prompt(&title) {
+                    return;
+                }
+                self.title = Some(title);
+                self.title_source = TitleSource::Agent;
+            }
         }
+    }
+
+    /// Whether the title is only the first prompt run onto one line: what the adapters
+    /// send when they couldn't have a title made (Claude's), or until it is made (Codex's).
+    /// The first line shows already and reads better.
+    fn echoes_prompt(&self, title: &str) -> bool {
+        let prompt = self.rows.iter().find_map(|row| match row {
+            Row::User(text) => Some(text),
+            _ => None,
+        });
+        prompt.is_some_and(|prompt| echoes(prompt, title))
     }
 
     /// acp-core stops taking answers to a turn's permission requests once the turn is
@@ -501,7 +523,19 @@ fn in_transcript(event: &SessionEvent) -> bool {
             | SessionEvent::SettingChanged { .. }
             | SessionEvent::ModeChanged(_)
             | SessionEvent::SettingFailed { .. }
+            | SessionEvent::Title(_)
     )
+}
+
+/// Whether `title` is `prompt` with its whitespace run together, whole or cut short with
+/// an ellipsis, as both adapters cut a title at 256 characters.
+fn echoes(prompt: &str, title: &str) -> bool {
+    let prompt = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
+    let title = title.split_whitespace().collect::<Vec<_>>().join(" ");
+    match title.strip_suffix('…') {
+        Some(head) => prompt.len() > head.len() && prompt.starts_with(head.trim_end()),
+        None => prompt == title,
+    }
 }
 
 /// The agent's text fading in as it streams: each piece over the theme's slow duration,
@@ -519,4 +553,30 @@ fn stream_fade(cx: &App) -> TextViewMotion {
 /// never inherits the selection state of another session's row at the same index.
 pub(crate) fn row_id(kind: &str, key: SessionKey, ix: usize) -> ElementId {
     ElementId::Name(format!("{kind}-{}-{ix}", key.0).into())
+}
+
+#[cfg(test)]
+mod tests {
+    // Not a glob: gpui's own `test` attribute would shadow the standard one.
+    use super::echoes;
+
+    #[test]
+    fn a_prompt_run_onto_one_line_echoes_it() {
+        let prompt = "Fix the build\n\nIt fails on  macOS";
+        assert!(echoes(prompt, "Fix the build It fails on macOS"));
+        assert!(echoes(prompt, "Fix the build It fails…"));
+        assert!(echoes(
+            "先列出文件\n再读 Cargo.toml",
+            "先列出文件 再读 Cargo.toml"
+        ));
+    }
+
+    #[test]
+    fn a_made_title_doesnt_echo_the_prompt() {
+        let prompt = "Fix the build\n\nIt fails on macOS";
+        assert!(!echoes(prompt, "Fix macOS build failure"));
+        assert!(!echoes(prompt, "Fix the build"));
+        // An ellipsis on the whole prompt cuts nothing off it.
+        assert!(!echoes("Fix the build", "Fix the build…"));
+    }
 }

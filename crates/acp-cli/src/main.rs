@@ -105,6 +105,8 @@ fn pump(events: &Receiver<Event>, lines: &mut impl Iterator<Item = io::Result<St
                     return true;
                 }
                 SessionEvent::ModeChanged(mode) => println!("\n[mode: {mode}]"),
+                // Comes a few seconds after a turn, so it shows as the next one starts.
+                SessionEvent::Title(title) => println!("\n[title: {title}]"),
                 // The CLI keeps no sessions between runs, so it never loads one, and
                 // the agent replays no messages to it.
                 SessionEvent::Created(_) | SessionEvent::UserText(_) => {}

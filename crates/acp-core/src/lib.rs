@@ -15,7 +15,6 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
     AuthMethod, BooleanConfigOptionCapabilities, CancelNotification, ClientCapabilities,
     ClientSessionCapabilities, CloseSessionRequest, ContentBlock, DeleteSessionRequest, ErrorCode,
@@ -26,6 +25,7 @@ use agent_client_protocol::schema::v1::{
     SessionId, SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
     SetSessionConfigOptionResponse, StopReason, ToolCallStatus,
 };
+use agent_client_protocol::schema::{MaybeUndefined, ProtocolVersion};
 use agent_client_protocol::util::{MatchDispatch, internal_error};
 pub use agent_client_protocol::{AcpAgent, Error};
 use agent_client_protocol::{
@@ -129,6 +129,10 @@ pub enum SessionEvent {
     /// The agent moved the session to another mode, by the id of its choice in the
     /// `Mode` setting.
     ModeChanged(String),
+    /// The agent's title for the session. Claude's and Codex's adapters have a small model
+    /// make one a few seconds after the first turn, so it can come between turns, and the
+    /// same title can come again.
+    Title(String),
     /// The agent refused a `ChangeSetting`, or hadn't answered it by the time a prompt
     /// stopped waiting; the setting keeps its value.
     SettingFailed {
@@ -737,19 +741,21 @@ async fn serve(
     events: &SessionEvents,
     login_options: &[String],
 ) {
+    // Off once the connection has gone, which the next prompt then reports.
+    let mut reading = true;
     loop {
         let text = match waiting.pop_front() {
             Some(text) => text,
-            None => match commands.recv().await {
-                Ok(SessionCommand::Prompt(text)) => text,
+            None => match between_turns(session, commands, events, &mut reading).await {
+                Some(SessionCommand::Prompt(text)) => text,
                 // Nothing is running, so there is nothing to stop.
-                Ok(SessionCommand::Cancel) => continue,
-                Ok(SessionCommand::ChangeSetting(setting, value)) => {
+                Some(SessionCommand::Cancel) => continue,
+                Some(SessionCommand::ChangeSetting(setting, value)) => {
                     // Only a closed connection fails this, which ends the session anyway.
                     let _ = change_setting(session, setting, value, events, &mut changes);
                     continue;
                 }
-                Err(_) => return,
+                None => return,
             },
         };
         // The agent may still be applying a change, and a prompt it took first would
@@ -777,6 +783,46 @@ async fn serve(
             return;
         }
         events.emit(outcome);
+    }
+}
+
+/// Waits between turns for the front end's next command, passing on meanwhile what the
+/// agent sends outside a turn, such as the title it makes once the first turn is over.
+/// `None` once the front end has gone. `reading` is turned off when the connection has.
+async fn between_turns(
+    session: &mut ActiveSession<'_, Agent>,
+    commands: &Receiver<SessionCommand>,
+    events: &SessionEvents,
+    reading: &mut bool,
+) -> Option<SessionCommand> {
+    enum Next {
+        // Boxed, as an update is far larger than a command.
+        Update(Box<Result<SessionMessage, Error>>),
+        Command(Option<SessionCommand>),
+    }
+    loop {
+        let open = *reading;
+        let update = async {
+            if !open {
+                return smol::future::pending().await;
+            }
+            Next::Update(Box::new(session.read_update().await))
+        };
+        let command = async { Next::Command(commands.recv().await.ok()) };
+        let update = match smol::future::or(update, command).await {
+            Next::Command(command) => return command,
+            Next::Update(update) => *update,
+        };
+        match update {
+            Ok(SessionMessage::SessionMessage(dispatch)) => {
+                // No turn is running to show a permission request in, so one that comes
+                // is answered as cancelled as this drops.
+                let mut permissions = Vec::new();
+                let _ = handle(dispatch, events, &mut permissions, false).await;
+            }
+            Ok(_) => {}
+            Err(_) => *reading = false,
+        }
     }
 }
 
@@ -1381,6 +1427,12 @@ fn flatten(update: SessionUpdate, replaying: bool) -> Option<SessionEvent> {
         SessionUpdate::CurrentModeUpdate(update) => {
             SessionEvent::ModeChanged(update.current_mode_id.0.to_string())
         }
+        // Both adapters also send this update with only `_meta` in it. One without a
+        // title, or clearing it, leaves the title as it was.
+        SessionUpdate::SessionInfoUpdate(info) => match info.title {
+            MaybeUndefined::Value(title) if !title.trim().is_empty() => SessionEvent::Title(title),
+            _ => return None,
+        },
         _ => return None,
     })
 }

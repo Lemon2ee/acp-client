@@ -14,6 +14,7 @@ use gpui_kit::*;
 
 use crate::chat_view::ChatView;
 use crate::chrome::as_title_bar;
+use crate::config::TitleSource;
 
 /// What the sidebar keeps for the whole window, whichever session is on screen.
 pub(crate) struct SidebarState {
@@ -113,8 +114,9 @@ impl ChatView {
         if !keep || title.is_empty() || session.title.as_ref() == Some(&title) {
             return;
         }
-        session.title = Some(title.clone());
-        self.change_kept(renaming.key, |saved| saved.title = title);
+        session.title = Some(title);
+        session.title_source = TitleSource::User;
+        self.keep_title(renaming.key);
     }
 
     /// Asks before deleting the session, as nothing brings it back.

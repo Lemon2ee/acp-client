@@ -287,6 +287,7 @@ impl ChatView {
             self.next_key += 1;
             let mut session = Session::new(key, agent, cx);
             session.title = Some(saved.title);
+            session.title_source = saved.title_source;
             session.id = Some(saved.id);
             session.origin = Origin::Saved(saved.cwd);
             session.archived = saved.archived;
@@ -333,6 +334,7 @@ impl ChatView {
             title: title.clone(),
             cwd: self.cwd.clone(),
             archived: session.archived,
+            title_source: session.title_source,
         };
         let changed = config_folder()
             .ok_or_else(|| std::io::Error::other("there is no config folder"))
@@ -542,6 +544,21 @@ impl ChatView {
         cx.notify();
     }
 
+    /// Keeps the session's title as it now stands, and where it came from, for later runs.
+    fn keep_title(&self, key: SessionKey) {
+        let Some(session) = self.session(key) else {
+            return;
+        };
+        let Some(title) = session.title.clone() else {
+            return;
+        };
+        let source = session.title_source;
+        self.change_kept(key, |saved| {
+            saved.title = title;
+            saved.title_source = source;
+        });
+    }
+
     /// Makes `change` to the session as kept for later runs, if it is kept already.
     /// One whose agent hasn't given it an id yet is kept as it stands once the agent does.
     fn change_kept(&self, key: SessionKey, change: impl FnOnce(&mut SavedSession)) {
@@ -618,6 +635,7 @@ impl ChatView {
         let mut fresh = Session::new(SessionKey(self.next_key), session.agent, cx);
         self.next_key += 1;
         fresh.title = session.title.clone();
+        fresh.title_source = session.title_source;
         fresh.id = session.id.clone();
         fresh.origin = Origin::Saved(folder);
         fresh.archived = session.archived;
@@ -873,14 +891,20 @@ impl ChatView {
                     self.agents[agent].spare_failed = false;
                 }
                 let created = matches!(event, SessionEvent::Created(_));
+                let mut retitled = false;
                 if let Some(session) = self.session_mut(key) {
+                    let title = session.title.clone();
                     session.apply(event, cx);
+                    retitled = session.title != title;
                     if session.pacing() {
                         self.pace(cx);
                     }
                 }
                 if created {
                     self.save_session(key);
+                }
+                if retitled {
+                    self.keep_title(key);
                 }
             }
             // Connection-wide failures show in the session on screen when it is the

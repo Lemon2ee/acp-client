@@ -233,6 +233,25 @@ pub(crate) struct SavedSession {
     /// In the sidebar's Archived list. Missing from files written before there was one.
     #[serde(default)]
     pub(crate) archived: bool,
+    /// Missing from files written before titles came from the agent.
+    #[serde(default)]
+    pub(crate) title_source: TitleSource,
+}
+
+/// Where a session's title came from, which decides whether a title the agent sends
+/// replaces it.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum TitleSource {
+    /// The first line of the first prompt, until the agent sends a title of its own.
+    Prompt,
+    /// The agent's, which the next one it sends replaces.
+    Agent,
+    /// The user's, as they renamed the session, which the agent never replaces. A
+    /// session kept before titles came from the agent counts as this, as nothing tells
+    /// whether it was renamed.
+    #[default]
+    User,
 }
 
 /// A file that is missing or can't be read gives none.
