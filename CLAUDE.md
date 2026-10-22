@@ -29,6 +29,7 @@ clearly needs splitting. acp-gui is split by what each part keeps or draws:
 | `session.rs` | `Session`: one conversation's transcript rows and settings, and how each `SessionEvent` lands on it. |
 | `session/pacing.rs` | The agent's text in a live turn, held back and shown at an even pace, and where it may stop so half-arrived markdown never shows. |
 | `session/tool_call.rs` | A tool call as its row keeps it: its content made ready to draw once (a command's lines, a file's numbered lines, a diff), how long it ran, and the agent's permission request on it with its answer. |
+| `sound.rs` | The effort meter's ticks and knock, made as WAV data and played through NSSound while macOS's interface sounds are on (macOS only; silent elsewhere). |
 | `chrome.rs` | The window around the content: the macOS title bar row, the traffic lights, the blur, the light or dark theme. |
 | `chat_view.rs` | `ChatView`: the agents, the sessions and what happens to them, and the window's layout (`Render`). |
 | `chat_view/transcript.rs` | How each row of a transcript is drawn. |
@@ -37,7 +38,7 @@ clearly needs splitting. acp-gui is split by what each part keeps or draws:
 | `chat_view/sidebar.rs` | The session cards, renaming, the delete prompt, the Archived list, the draggable edge. |
 | `chat_view/settings_page.rs` | The settings, which take the window while open. |
 | `chat_view/pickers.rs` | What the buttons below the prompt and their menus share: `MenuLook`, sizes, `picker_button`. |
-| `chat_view/pickers/` | One file each for the model panel, the effort menu and the mode menu. |
+| `chat_view/pickers/` | One file each for the model panel, the effort meter with its slider, and the mode menu; `effort/wheel.rs` is how the meter reads a scroll (wheel notches, trackpad pixels, momentum, scrolls begun elsewhere). |
 
 `ChatView`'s fields stay private: its parts sit under `chat_view/`, and a child module can
 read its parent's private fields. What another module needs is `pub(crate)`, and no more.
@@ -60,9 +61,10 @@ cargo fmt --all
   Bump those pins deliberately; they tie the adapter to the agent CLI it was tested with.
 - Build output goes to `target.nosync/` (see `.cargo/config.toml`): `~/Documents` syncs to
   iCloud, which skips `.nosync` names. Do not change the target dir.
-- Tests are few: only acp-gui's pacing rules have unit tests, as plain functions need no
-  window. "Verified" means `cargo build`, `cargo test`, `cargo clippy` and `cargo fmt` are
-  clean, plus a run of the affected front end when the change is user-visible.
+- Tests are few: only acp-gui's pacing, tool-call content and effort meter rules have
+  unit tests, as plain functions need no window. "Verified" means `cargo build`,
+  `cargo test`, `cargo clippy` and `cargo fmt` are clean, plus a run of the affected
+  front end when the change is user-visible.
 - `dist` (workspace `Cargo.toml`) is `release` with fat LTO and one codegen unit: 20.6 MB
   instead of 30.8 MB on macOS arm64, but a clean build takes minutes and no rebuild is
   incremental. Keep it for builds that get shipped; its output is `target.nosync/dist/`.

@@ -2,7 +2,7 @@
 //! menus share: the sizes, `MenuLook`'s colors and shadows, how a menu comes in, how the
 //! keys move through a menu, and how a setting's "default" choice can stand for another.
 
-mod effort;
+pub(crate) mod effort;
 mod mode;
 pub(crate) mod model_panel;
 
@@ -25,14 +25,14 @@ use crate::config::harness_of;
 const MENU_TEXT_SIZE: Pixels = px(13.);
 const MENU_LINE_HEIGHT: Pixels = px(16.);
 const MENU_HEADING_SIZE: Pixels = px(11.);
-/// How tall a model's or an effort level's row is, a switch's row, and the line naming
-/// an agent above its models in the favorites, which gets more room above it after the
-/// first agent's.
+/// How tall a model's row and the effort slider's Default row are, a switch's row, and
+/// the line naming an agent above its models in the favorites, which gets more room
+/// above it after the first agent's.
 const LIST_ROW_HEIGHT: Pixels = px(28.);
 const SWITCH_ROW_HEIGHT: Pixels = px(30.);
 const LIST_HEADER_HEIGHT: Pixels = px(26.);
 const LIST_HEADER_GAP: Pixels = px(6.);
-/// The heading over the effort menu's levels and the mode menu's modes.
+/// The heading over the effort slider's levels and the mode menu's modes.
 const MENU_HEADING_HEIGHT: Pixels = px(24.);
 /// A row's padding on either side. A menu's heading starts as far in, and the check at a
 /// row's end stops as far from the edge as a switch does.
@@ -50,7 +50,7 @@ const HEADING_ICON_SIZE: Pixels = px(12.);
 /// as tall as one with many.
 const PANEL_WIDTH: Pixels = px(320.);
 const PANEL_HEIGHT: Pixels = px(380.);
-/// How wide the effort menu is, and the narrowest the mode menu gets.
+/// How wide the effort slider is, and the narrowest the mode menu gets.
 const EFFORT_MENU_WIDTH: Pixels = px(196.);
 /// How round the panel and the menus are, and the rows and tabs in them. The rows
 /// sit 4px in from the edge, so their corners follow the surface's.
@@ -98,8 +98,14 @@ pub(crate) struct MenuLook {
     muted: Hsla,
     /// A starred model's star.
     star: Hsla,
-    /// The effort meter's bars above the level.
+    /// The effort meter's marks above the level, and those of the button's meter while
+    /// it is pointed at.
     meter_off: Hsla,
+    meter_off_hover: Hsla,
+    /// The marks up to where a "default" with no level of its own is taken to stand.
+    meter_assumed: Hsla,
+    /// The slider's marks that would change if the level under the pointer were picked.
+    meter_previewed: Hsla,
 }
 
 impl MenuLook {
@@ -118,6 +124,9 @@ impl MenuLook {
                 muted: theme.muted_foreground,
                 star: rgb(0xF5B83D).into(),
                 meter_off: white().opacity(0.18),
+                meter_off_hover: white().opacity(0.26),
+                meter_assumed: foreground.opacity(0.38),
+                meter_previewed: foreground.opacity(0.42),
             }
         } else {
             Self {
@@ -134,6 +143,9 @@ impl MenuLook {
                 // Darker than the dark mode's amber, to stay 3:1 on white.
                 star: rgb(0xB07800).into(),
                 meter_off: black().opacity(0.16),
+                meter_off_hover: black().opacity(0.24),
+                meter_assumed: foreground.opacity(0.34),
+                meter_previewed: foreground.opacity(0.38),
             }
         }
     }

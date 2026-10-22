@@ -66,6 +66,10 @@ pub(crate) struct Session {
     /// switches, and every setting of a session the agent hasn't created yet, as no
     /// answer comes until it has.
     pub(crate) asked: HashMap<String, Asked>,
+    /// A setting changed here that goes to the agent once the user stops changing it, as
+    /// the effort meter's levels do: a scroll from Low to Max asks for one change, not
+    /// four.
+    pub(crate) held: Option<Held>,
     /// The agent's id for it, once the agent has it, which keeps it for later runs.
     pub(crate) id: Option<String>,
     pub(crate) origin: Origin,
@@ -103,6 +107,15 @@ pub(crate) enum Origin {
     Loaded(PathBuf),
 }
 
+/// A setting's value that shows at once and is asked for after a pause (see
+/// `ChatView::hold_setting`).
+pub(crate) struct Held {
+    pub(crate) setting: String,
+    pub(crate) value: SettingValue,
+    /// Asks for it once the pause is over. A newer value drops it, and its own pause.
+    pub(crate) _send: Task<()>,
+}
+
 /// A setting changed here, until the agent has answered every change it was asked for.
 pub(crate) struct Asked {
     /// The value last asked for, which the setting shows meanwhile.
@@ -125,6 +138,7 @@ impl Session {
             settings: Vec::new(),
             created: false,
             asked: HashMap::new(),
+            held: None,
             id: None,
             origin: Origin::New,
             archived: false,
@@ -171,11 +185,14 @@ impl Session {
     }
 
     /// A setting as it shows: one changed here shows the value last asked for until the
-    /// agent has answered all its changes.
+    /// agent has answered all its changes, or the value held to ask for (see `held`).
     pub(crate) fn shown(&self, setting: &Setting) -> Setting {
         let mut setting = setting.clone();
         if let Some(asked) = self.asked.get(&setting.id) {
             setting.value = asked.value.clone();
+        }
+        if let Some(held) = self.held.as_ref().filter(|held| held.setting == setting.id) {
+            setting.value = held.value.clone();
         }
         setting
     }
