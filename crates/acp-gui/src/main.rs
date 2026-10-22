@@ -327,18 +327,24 @@ struct ChatView {
     /// The models the user starred, which the model panel's favorites tab lists.
     /// Kept on disk.
     favorites: Vec<Favorite>,
-    /// The desktop shows through the window, blurred, behind the sidebar and the chat.
+    /// The blur is on: the desktop shows through the window, blurred, behind the sidebar
+    /// and the chat, except in full screen.
     window_blur: bool,
+    /// The window is blurred now, and its sidebar and chat translucent.
+    blurred: bool,
     _input_events: Subscription,
     _search_events: Subscription,
+    _bounds_events: Subscription,
 }
 
 impl ChatView {
     /// Starts every agent in `agents`, each by name, and shows a session on the first
-    /// that no agent creates until its first prompt.
+    /// that no agent creates until its first prompt. `blur` is whether the window opened
+    /// blurred (see `window_background`).
     fn new(
         agents: Vec<(String, AcpAgent)>,
         cwd: PathBuf,
+        blur: bool,
         title_bar_height: Pixels,
         traffic_lights_end: Pixels,
         window: &mut Window,
@@ -360,6 +366,10 @@ impl ChatView {
             if matches!(event, InputEvent::Change) {
                 cx.notify();
             }
+        });
+        // Going into full screen or out of it resizes the window.
+        let bounds_events = cx.observe_window_bounds(window, |this, window, cx| {
+            this.update_window_background(window, cx)
         });
         window.on_window_should_close(cx, |_, cx| {
             cx.quit();
@@ -411,9 +421,11 @@ impl ChatView {
                 search,
             },
             favorites: load_favorites(),
-            window_blur: false,
+            window_blur: blur,
+            blurred: blur,
             _input_events: input_events,
             _search_events: search_events,
+            _bounds_events: bounds_events,
         };
         view.new_session(window, cx);
         view
@@ -421,17 +433,23 @@ impl ChatView {
 
     /// Has the desktop show through the window, blurred, behind the sidebar and the chat,
     /// or stop. Where gpui can't blur (see `WINDOW_BLUR`) the window stays opaque.
+    #[expect(dead_code, reason = "the settings page will turn the blur on and off")]
     fn set_window_blur(&mut self, on: bool, window: &mut Window, cx: &mut Context<Self>) {
-        let on = on && WINDOW_BLUR;
-        if on == self.window_blur {
+        self.window_blur = on && WINDOW_BLUR;
+        self.update_window_background(window, cx);
+    }
+
+    /// Blurs the window while the blur is on and the window isn't in full screen, and
+    /// makes it opaque otherwise. In full screen the window fills a space of its own,
+    /// and being opaque there spares the window server blending it with what's behind.
+    fn update_window_background(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let blurred = self.window_blur && !window.is_fullscreen();
+        // Called on every resize, so only a change reaches the platform.
+        if blurred == self.blurred {
             return;
         }
-        self.window_blur = on;
-        window.set_background_appearance(if on {
-            WindowBackgroundAppearance::Blurred
-        } else {
-            WindowBackgroundAppearance::Opaque
-        });
+        self.blurred = blurred;
+        window.set_background_appearance(window_background(blurred));
         cx.notify();
     }
 
@@ -1035,6 +1053,14 @@ const WINDOW_BLUR: bool = cfg!(target_os = "macos");
 /// little enough that its text reads as well as on an opaque window.
 const BLURRED_SIDEBAR_ALPHA: f32 = 0.6;
 const BLURRED_CHAT_ALPHA: f32 = 0.85;
+
+fn window_background(blurred: bool) -> WindowBackgroundAppearance {
+    if blurred {
+        WindowBackgroundAppearance::Blurred
+    } else {
+        WindowBackgroundAppearance::Opaque
+    }
+}
 
 /// Where the traffic lights go, and the top row that holds them, with as much space to
 /// the lights' left and below them as above.
@@ -2054,9 +2080,7 @@ impl Render for ChatView {
             theme.sidebar,
             theme.input,
         );
-        // In full screen the window has a space of its own, with nothing behind it to
-        // blur, so the colors stay opaque there.
-        let (background, sidebar) = if self.window_blur && !window.is_fullscreen() {
+        let (background, sidebar) = if self.blurred {
             (
                 background.opacity(BLURRED_CHAT_ALPHA),
                 sidebar.opacity(BLURRED_SIDEBAR_ALPHA),
@@ -2517,8 +2541,9 @@ fn main() {
                 theme.dark_theme = with_panel_colors(&theme.dark_theme, "#111111", "#151515");
             });
             let lights = TrafficLights::new(traffic_light_size());
-            // Blurred from the start, where the platform can blur.
-            let blur = true;
+            // Blurred from the start, where the platform can blur. The window opens that
+            // way, so its first frame already is.
+            let blur = WINDOW_BLUR;
             let options = WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
                     None,
@@ -2534,6 +2559,7 @@ fn main() {
                 // does it from the strip around the traffic lights, and on macOS 27 it
                 // holds back every click there while it waits for a double-click.
                 app_owns_titlebar_drag: OWN_TITLE_BAR,
+                window_background: window_background(blur),
                 ..Default::default()
             };
             // What `gpui_kit::open_window` does, but the root paints no background of its
@@ -2549,9 +2575,8 @@ fn main() {
                     .detach();
                 let lights_end = lights.end(window);
                 let view = cx.new(|cx| {
-                    ChatView::new(agents, cwd, lights.row_height, lights_end, window, cx)
+                    ChatView::new(agents, cwd, blur, lights.row_height, lights_end, window, cx)
                 });
-                view.update(cx, |view, cx| view.set_window_blur(blur, window, cx));
                 cx.new(|cx| gpui_kit::base::Root::new(view, window, cx).bg(transparent_black()))
             })
             .expect("failed to open the window");
