@@ -1790,8 +1790,14 @@ impl Render for ChatView {
             .text_color(foreground)
             // A drag of the sidebar's edge can leave the edge's own band within a pixel,
             // so the whole window follows it: the sidebar ends where the pointer is.
+            // While the sidebar slides in its edge is short of its width, so a drag
+            // caught mid-slide waits for the slide to end; this listener is made anew
+            // on every frame of it.
             .on_drag_move(
-                cx.listener(|this, event: &DragMoveEvent<ResizeSidebar>, _, cx| {
+                cx.listener(move |this, event: &DragMoveEvent<ResizeSidebar>, _, cx| {
+                    if hidden > 0. {
+                        return;
+                    }
                     let width = event.event.position.x - event.bounds.left();
                     this.sidebar_width = width.clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH);
                     cx.notify();
