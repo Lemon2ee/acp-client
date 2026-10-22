@@ -63,9 +63,16 @@ struct Session {
     /// What the agent lets the user choose for this session, such as its model; none
     /// until the agent has created it.
     settings: Vec<Setting>,
-    /// Switches flipped here whose change the agent hasn't answered yet, by setting id,
-    /// with the value asked for. They show that value meanwhile.
-    flipped: HashMap<String, bool>,
+    /// Switches flipped here whose changes the agent hasn't all answered, by setting id.
+    flipped: HashMap<String, Flip>,
+}
+
+/// A switch flipped here, until the agent has answered every change it was asked for.
+struct Flip {
+    /// The value last asked for, which the switch shows meanwhile.
+    on: bool,
+    /// How many of its changes have no answer yet.
+    out: u32,
 }
 
 impl Session {
@@ -82,14 +89,27 @@ impl Session {
         }
     }
 
-    /// A setting as it shows: a switch flipped here shows the value asked for until the
-    /// agent answers.
+    /// A setting as it shows: a switch flipped here shows the value last asked for until
+    /// the agent has answered all its changes.
     fn shown(&self, setting: &Setting) -> Setting {
         let mut setting = setting.clone();
-        if let Some(&on) = self.flipped.get(&setting.id) {
-            setting.value = SettingValue::Switch(on);
+        if let Some(flip) = self.flipped.get(&setting.id) {
+            setting.value = SettingValue::Switch(flip.on);
         }
         setting
+    }
+
+    /// One of a setting's changes has its answer. A switch shows the agent's value
+    /// again once all of its have, as an answer to an earlier flip can arrive while a
+    /// later one is still out.
+    fn answered(&mut self, setting: &str) {
+        if let Some(flip) = self.flipped.get_mut(setting) {
+            // A late answer to a change already given up on finds nothing to count.
+            flip.out = flip.out.saturating_sub(1);
+            if flip.out == 0 {
+                self.flipped.remove(setting);
+            }
+        }
     }
 
     fn apply(&mut self, event: SessionEvent, cx: &mut App) {
@@ -147,14 +167,10 @@ impl Session {
                 self.cancel_open_permissions(cx);
                 self.push(Row::Error(message), cx);
             }
-            SessionEvent::Settings(settings) => {
-                // A flip is done once the agent's settings show it.
-                self.flipped.retain(|id, on| {
-                    !settings.iter().any(|setting| {
-                        setting.id == *id && setting.value == SettingValue::Switch(*on)
-                    })
-                });
+            SessionEvent::Settings(settings) => self.settings = settings,
+            SessionEvent::SettingChanged { setting, settings } => {
                 self.settings = settings;
+                self.answered(&setting);
             }
             SessionEvent::ModeChanged(mode) => {
                 for setting in &mut self.settings {
@@ -164,8 +180,7 @@ impl Session {
                 }
             }
             SessionEvent::SettingFailed { setting, message } => {
-                // A switch whose flip failed shows the agent's value again.
-                self.flipped.remove(&setting);
+                self.answered(&setting);
                 self.push(Row::Error(message), cx)
             }
         }
@@ -404,7 +419,12 @@ impl ChatView {
             return;
         }
         if let Some(session) = self.session_mut(key) {
-            session.flipped.insert(setting, !on);
+            let flip = session
+                .flipped
+                .entry(setting)
+                .or_insert(Flip { on, out: 0 });
+            flip.on = !on;
+            flip.out += 1;
         }
         cx.notify();
     }

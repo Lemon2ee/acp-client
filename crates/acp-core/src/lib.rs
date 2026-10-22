@@ -44,8 +44,7 @@ pub enum Command {
     /// Stop the session's turn in flight; ignored when idle.
     Cancel(SessionKey),
     /// Sets one of the session's settings, by id, during a turn or not. Answered with
-    /// the session's `Settings`, or `SettingFailed`; a prompt sent after it waits for
-    /// the answer.
+    /// `SettingChanged`, or `SettingFailed`; a prompt sent after it waits for the answer.
     ChangeSetting(SessionKey, String, SettingValue),
 }
 
@@ -87,8 +86,15 @@ pub enum SessionEvent {
     /// The prompt failed; the session stays usable.
     TurnFailed(String),
     /// Every setting the agent offers for the session, as they stand now. Comes once
-    /// the session exists, and again whenever they change.
+    /// the session exists, and again whenever the agent says they changed.
     Settings(Vec<Setting>),
+    /// The agent answered a `ChangeSetting` of `setting`, with every setting as it now
+    /// stands. Each change gets one answer, this or `SettingFailed`, in the order the
+    /// changes were made.
+    SettingChanged {
+        setting: String,
+        settings: Vec<Setting>,
+    },
     /// The agent moved the session to another mode, by the id of its choice in the
     /// `Mode` setting.
     ModeChanged(String),
@@ -698,7 +704,10 @@ fn send_change(
         let (connection, queue) = (connection.clone(), queue.clone());
         async move |result: Result<SetSessionConfigOptionResponse, Error>| {
             let event = match result {
-                Ok(response) => SessionEvent::Settings(settings_of(&response.config_options)),
+                Ok(response) => SessionEvent::SettingChanged {
+                    settings: settings_of(&response.config_options),
+                    setting,
+                },
                 Err(err) => SessionEvent::SettingFailed {
                     message: format!("couldn't change {setting}: {err}"),
                     setting,
