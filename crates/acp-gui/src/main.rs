@@ -284,9 +284,10 @@ struct AgentSlot {
     /// The spare couldn't be created, and the user has been told; said once, as each
     /// session added tries the spare again.
     spare_failed: bool,
-    /// The settings the agent last created a session with, in this run or one before,
-    /// which a session on it shows while the agent creates it. Creating one takes the
-    /// agent seconds: Claude's adapter starts the Claude Code CLI for it.
+    /// The settings the agent last created a session with, in this run or, for Claude
+    /// and Codex, one before, which a session on it shows while the agent creates it.
+    /// Creating one takes the agent seconds: Claude's adapter starts the Claude Code
+    /// CLI for it.
     last_settings: Vec<Setting>,
     _events: Task<()>,
 }
@@ -359,7 +360,9 @@ impl ChatView {
                     }
                 });
                 AgentSlot {
-                    last_settings: last_settings.remove(&name).unwrap_or_default(),
+                    last_settings: kept_name(&name)
+                        .and_then(|kept| last_settings.remove(kept))
+                        .unwrap_or_default(),
                     name,
                     commands: handle.commands,
                     spare: None,
@@ -709,9 +712,12 @@ impl ChatView {
             return;
         }
         slot.last_settings = settings.to_vec();
+        let Some(kept) = kept_name(&slot.name) else {
+            return;
+        };
         let saved = config_folder()
             .ok_or_else(|| std::io::Error::other("there is no config folder"))
-            .and_then(|folder| save_last_settings(&folder, &slot.name, settings));
+            .and_then(|folder| save_last_settings(&folder, kept, settings));
         if let Err(err) = saved {
             eprintln!("couldn't save {}'s settings: {err}", slot.name);
         }
@@ -2304,8 +2310,18 @@ fn change_added_models(
     Ok(models)
 }
 
-/// Holds the settings each agent last created a session with, by the agent's name, as JSON.
+/// Holds the settings each agent last created a session with, by `kept_name`, as JSON.
 const LAST_SETTINGS: &str = "last-settings";
+
+/// The name an agent's settings are kept under on disk: its harness's, whether the
+/// window started it as that or by the `claude` or `codex` argument. None for any other
+/// command, which is all that names such an agent and may carry a secret, such as a key.
+fn kept_name(name: &str) -> Option<&'static str> {
+    Harness::ALL
+        .into_iter()
+        .map(Harness::name)
+        .find(|kept| kept.eq_ignore_ascii_case(name))
+}
 
 /// A file that is missing or can't be read gives none, and the buttons wait for the
 /// agent as they did before there was one.
