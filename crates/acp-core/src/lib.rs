@@ -5,7 +5,9 @@
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
+use std::time::Duration;
 
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
@@ -15,7 +17,8 @@ use agent_client_protocol::schema::v1::{
     RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
     SelectedPermissionOutcome, SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory,
     SessionConfigOptionValue, SessionConfigOptionsCapabilities, SessionConfigSelectOptions,
-    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest, StopReason,
+    SessionId, SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
+    SetSessionConfigOptionResponse, StopReason,
 };
 use agent_client_protocol::util::{MatchDispatch, internal_error};
 pub use agent_client_protocol::{AcpAgent, Error};
@@ -89,7 +92,8 @@ pub enum SessionEvent {
     /// The agent moved the session to another mode, by the id of its choice in the
     /// `Mode` setting.
     ModeChanged(String),
-    /// The agent refused a `ChangeSetting`; the setting keeps its value.
+    /// The agent refused a `ChangeSetting`, or hadn't answered it by the time a prompt
+    /// stopped waiting; the setting keeps its value.
     SettingFailed {
         setting: String,
         message: String,
@@ -384,7 +388,7 @@ async fn serve(
     events: &Sender<Event>,
     login_options: &[String],
 ) {
-    let mut changing = Vec::new();
+    let mut changes = Changes::default();
     loop {
         let text = match waiting.pop_front() {
             Some(text) => text,
@@ -394,7 +398,7 @@ async fn serve(
                 Ok(SessionCommand::Cancel) => continue,
                 Ok(SessionCommand::ChangeSetting(setting, value)) => {
                     // Only a closed connection fails this, which ends the session anyway.
-                    let _ = change_setting(key, session, setting, value, events, &mut changing);
+                    let _ = change_setting(key, session, setting, value, events, &mut changes);
                     continue;
                 }
                 Err(_) => return,
@@ -402,8 +406,20 @@ async fn serve(
         };
         // The agent may still be applying a change, and a prompt it took first would
         // run with the setting as it was.
-        for answer in changing.drain(..) {
-            let _ = answer.await;
+        let waited =
+            wait_for_changes(key, session, &mut waiting, commands, events, &mut changes).await;
+        match waited {
+            Waited::Answered => {}
+            // Stopped before it was sent, so it never runs.
+            Waited::Stopped => {
+                let stop_reason = format!("{:?}", StopReason::Cancelled);
+                emit(
+                    events,
+                    Event::Session(key, SessionEvent::TurnEnded { stop_reason }),
+                );
+                continue;
+            }
+            Waited::Gone => return,
         }
         let outcome = match run_turn(
             key,
@@ -411,7 +427,7 @@ async fn serve(
             text,
             commands,
             &mut waiting,
-            &mut changing,
+            &mut changes,
             events,
         )
         .await
@@ -434,7 +450,7 @@ async fn run_turn(
     text: String,
     commands: &Receiver<SessionCommand>,
     waiting: &mut VecDeque<String>,
-    changing: &mut Vec<oneshot::Receiver<()>>,
+    changes: &mut Changes,
     events: &Sender<Event>,
 ) -> Result<StopReason, Error> {
     enum Next {
@@ -502,36 +518,168 @@ async fn run_turn(
             }
             Next::Command(Some(SessionCommand::Prompt(text))) => waiting.push_back(text),
             Next::Command(Some(SessionCommand::ChangeSetting(setting, value))) => {
-                change_setting(key, session, setting, value, events, changing)?
+                change_setting(key, session, setting, value, events, changes)?
             }
             Next::Command(None) => return Err(internal_error("the session was closed")),
         }
     }
 }
 
-/// Asks the agent to change one of the session's settings. Its answer, the settings
-/// as they now stand, goes to the front end whenever it comes, and `changing` hears of
-/// it then, for the next prompt to wait on.
+/// How long a prompt waits for the agent to answer the setting changes sent before it.
+/// An agent that hasn't answered by then gets the prompt anyway.
+const SETTING_ANSWER_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The session's setting changes the agent hasn't answered yet.
+#[derive(Default)]
+struct Changes {
+    queue: ChangeQueue,
+    /// Told once every change sent so far is answered, as they go one at a time.
+    last: Option<oneshot::Receiver<()>>,
+}
+
+/// The changes waiting for an answer, oldest first, shared with the callbacks that take
+/// the answers. Only the first has been sent: each goes once the agent has answered the
+/// one before, so the agent applies them in the order they were made and the last
+/// answer is the newest.
+#[derive(Clone, Default)]
+struct ChangeQueue(Arc<Mutex<VecDeque<Change>>>);
+
+struct Change {
+    setting: String,
+    value: SettingValue,
+    /// Told when the agent answers.
+    answered: oneshot::Sender<()>,
+}
+
+impl ChangeQueue {
+    fn lock(&self) -> MutexGuard<'_, VecDeque<Change>> {
+        // Nothing panics while holding it, so it is never poisoned.
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// How waiting for the setting changes before a prompt ended.
+enum Waited {
+    /// The agent answered them, or took too long and the front end was told so.
+    Answered,
+    /// The front end stopped the prompt.
+    Stopped,
+    /// The front end has gone.
+    Gone,
+}
+
+/// Waits for the agent to answer the setting changes sent so far, still taking
+/// commands meanwhile: a stop drops the prompt, and other prompts and changes queue up.
+/// After `SETTING_ANSWER_TIMEOUT`, each change the agent still owes is reported failed.
+async fn wait_for_changes(
+    key: SessionKey,
+    session: &ActiveSession<'_, Agent>,
+    waiting: &mut VecDeque<String>,
+    commands: &Receiver<SessionCommand>,
+    events: &Sender<Event>,
+    changes: &mut Changes,
+) -> Waited {
+    enum Next {
+        Answered,
+        TimedOut,
+        Command(Option<SessionCommand>),
+    }
+    let mut deadline = smol::Timer::after(SETTING_ANSWER_TIMEOUT);
+    while let Some(answer) = changes.last.as_mut() {
+        let answered = async {
+            let _ = answer.await;
+            Next::Answered
+        };
+        let timed_out = async {
+            (&mut deadline).await;
+            Next::TimedOut
+        };
+        let command = async { Next::Command(commands.recv().await.ok()) };
+        match smol::future::or(answered, smol::future::or(timed_out, command)).await {
+            Next::Answered => changes.last = None,
+            Next::TimedOut => {
+                for change in changes.queue.lock().iter() {
+                    let message = format!(
+                        "couldn't change {}: the agent didn't answer within {} s",
+                        change.setting,
+                        SETTING_ANSWER_TIMEOUT.as_secs()
+                    );
+                    let setting = change.setting.clone();
+                    let failed = SessionEvent::SettingFailed { setting, message };
+                    emit(events, Event::Session(key, failed));
+                }
+                changes.last = None;
+            }
+            Next::Command(Some(SessionCommand::Cancel)) => return Waited::Stopped,
+            Next::Command(Some(SessionCommand::Prompt(text))) => waiting.push_back(text),
+            Next::Command(Some(SessionCommand::ChangeSetting(setting, value))) => {
+                // Only a closed connection fails this, which ends the session anyway.
+                let _ = change_setting(key, session, setting, value, events, changes);
+            }
+            Next::Command(None) => return Waited::Gone,
+        }
+    }
+    Waited::Answered
+}
+
+/// Asks the agent to change one of the session's settings, once it has answered the
+/// changes asked before, for the next prompt to wait on. The answer, the settings as
+/// they then stand, goes to the front end.
 fn change_setting(
     key: SessionKey,
     session: &ActiveSession<'_, Agent>,
     setting: String,
     value: SettingValue,
     events: &Sender<Event>,
-    changing: &mut Vec<oneshot::Receiver<()>>,
+    changes: &mut Changes,
 ) -> Result<(), Error> {
-    let events = events.clone();
     let (answered, answer) = oneshot::channel();
+    changes.last = Some(answer);
+    let first = {
+        let mut queue = changes.queue.lock();
+        queue.push_back(Change {
+            setting,
+            value,
+            answered,
+        });
+        queue.len() == 1
+    };
+    if !first {
+        return Ok(());
+    }
+    send_change(
+        key,
+        session.connection().clone(),
+        session.session_id().clone(),
+        events.clone(),
+        changes.queue.clone(),
+    )
+}
+
+/// Sends the first of the session's waiting setting changes, and once the agent
+/// answers it, the next.
+fn send_change(
+    key: SessionKey,
+    connection: ConnectionTo<Agent>,
+    session_id: SessionId,
+    events: Sender<Event>,
+    queue: ChangeQueue,
+) -> Result<(), Error> {
+    let first = queue
+        .lock()
+        .front()
+        .map(|change| (change.setting.clone(), change.value.clone()));
+    let Some((setting, value)) = first else {
+        return Ok(());
+    };
     let value = match value {
         SettingValue::Choice(id) => SessionConfigOptionValue::value_id(id),
         SettingValue::Switch(on) => SessionConfigOptionValue::boolean(on),
     };
-    let request =
-        SetSessionConfigOptionRequest::new(session.session_id().clone(), setting.clone(), value);
-    session
-        .connection()
-        .prepare_request(request)
-        .on_receiving_result(async move |result| {
+    let request = SetSessionConfigOptionRequest::new(session_id.clone(), setting.clone(), value);
+    let callback = {
+        let (connection, queue) = (connection.clone(), queue.clone());
+        async move |result: Result<SetSessionConfigOptionResponse, Error>| {
             let event = match result {
                 Ok(response) => SessionEvent::Settings(settings_of(&response.config_options)),
                 Err(err) => SessionEvent::SettingFailed {
@@ -540,13 +688,22 @@ fn change_setting(
                 },
             };
             emit(&events, Event::Session(key, event));
-            let _ = answered.send(());
+            if let Some(change) = queue.lock().pop_front() {
+                let _ = change.answered.send(());
+            }
+            // Only a closed connection fails this, and then no answer will come.
+            let _ = send_change(key, connection, session_id, events, queue);
             Ok(())
-        })?;
-    // Changes made while idle pile up until a prompt; the answered ones need no wait.
-    changing.retain_mut(|answer| matches!(answer.try_recv(), Ok(None)));
-    changing.push(answer);
-    Ok(())
+        }
+    };
+    let sent = connection
+        .prepare_request(request)
+        .on_receiving_result(callback);
+    if sent.is_err() {
+        // No answer will come to any of them.
+        queue.lock().clear();
+    }
+    sent
 }
 
 async fn handle(
