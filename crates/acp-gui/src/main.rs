@@ -486,10 +486,13 @@ impl ChatView {
         if let Some(ix) = found.filter(|&ix| self.sessions[ix].agent == agent) {
             return ix;
         }
-        let session = self.take_session(agent, cx);
+        let mut session = self.take_session(agent, cx);
         match found {
             Some(ix) => {
-                // ACP can't move a session to another agent, so it goes.
+                // ACP can't move a session to another agent, so it goes. Text typed in
+                // it while another session was on screen goes with the one taking its
+                // place; on screen, that text is still in the input.
+                session.draft = std::mem::take(&mut self.sessions[ix].draft);
                 let old = std::mem::replace(&mut self.sessions[ix], session);
                 let _ = self.agents[old.agent]
                     .commands
