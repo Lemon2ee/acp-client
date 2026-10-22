@@ -14,3 +14,12 @@ futures = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 smol = "2"
+
+# What a release ships: `cargo build --profile dist -p acp-gui`. Fat LTO with one codegen
+# unit took the macOS arm64 binary from 30.8 MB to 20.6 MB (main at 1fef783); thin LTO came
+# out bigger, at 31.8 MB. A clean build then takes about 7 minutes on 4 cores and every
+# rebuild redoes the whole LTO, so day-to-day `--release` runs keep cargo's defaults.
+[profile.dist]
+inherits = "release"
+lto = "fat"
+codegen-units = 1

@@ -20,6 +20,11 @@
     "args": ["run", "--release", "-p", "acp-gui", "--features", "profile"]
   },
   {
+    "label": "acp-gui: build for shipping (dist)",
+    "command": "cargo",
+    "args": ["build", "--profile", "dist", "-p", "acp-gui"]
+  },
+  {
     "label": "acp-cli: claude",
     "command": "cargo",
     "args": ["run", "-p", "acp-cli", "--", "claude"]

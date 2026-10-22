@@ -47,6 +47,7 @@ cargo run -p acp-gui                # Claude and Codex, picked between from the 
 cargo run -p acp-gui -- claude     # or: codex, or "<any shell-style agent command>"
 cargo run -p acp-cli -- claude
 cargo run --release -p acp-gui --features profile   # see "Profiling" below
+cargo build --profile dist -p acp-gui               # what a release ships
 cargo test -p acp-gui
 cargo clippy --workspace --all-targets
 cargo fmt --all
@@ -59,6 +60,9 @@ cargo fmt --all
 - Tests are few: only acp-gui's pacing rules have unit tests, as plain functions need no
   window. "Verified" means `cargo build`, `cargo test`, `cargo clippy` and `cargo fmt` are
   clean, plus a run of the affected front end when the change is user-visible.
+- `dist` (workspace `Cargo.toml`) is `release` with fat LTO and one codegen unit: 20.6 MB
+  instead of 30.8 MB on macOS arm64, but a clean build takes minutes and no rebuild is
+  incremental. Keep it for builds that get shipped; its output is `target.nosync/dist/`.
 - `profile` is off by default, so clippy also needs a run with `-p acp-gui --features profile`
   when a change touches it.
 - Do not start `ACPClient.app` or run `.claude/hooks/run-latest-app.sh` unless the user asks.
@@ -82,6 +86,15 @@ mean little.
   and it only records while connected (`ondemand`, localhost only).
 
 In debug builds, gpui-component already binds Cmd+Option+I to gpui's element inspector.
+
+## Releasing
+
+Pushing a `v*` tag runs `.github/workflows/release.yml`: it builds the `dist` profile on an
+Apple Silicon runner, wraps it in `ACPClient.app` and attaches
+`ACPClient-<version>-macos-arm64.zip` to a GitHub release of that tag. The version comes from
+the tag, not from `Cargo.toml`, and becomes the bundle's version, which macOS wants as plain
+numbers (`v0.2.0`, not `v0.2.0-beta`). The app is signed ad hoc, not notarized, so a
+downloaded copy needs allowing once in System Settings > Privacy & Security.
 
 ## Architecture rules
 
