@@ -13,7 +13,7 @@ use acp_core::{
 };
 use gpui_kit::base::input::Copy;
 use gpui_kit::base::{HandleEdge, SelectableText, TextSelection, Transition, transition};
-use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
 use gpui_kit::component::input::{
     Escape, Input, InputEvent, InputGroup, InputGroupAddon, InputGroupAddonAlignment,
     InputGroupButton, InputState, Textarea, TextareaState,
@@ -28,7 +28,7 @@ use gpui_kit::component::text::{TextView, TextViewState};
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{
     ActiveTheme as _, FocusableExt as _, Icon, IconName, Sizable as _, Theme, ThemeConfig,
-    ThemeMode, ThemeStyled as _, h_flex, resize_handle, v_flex,
+    ThemeMode, ThemeStyled as _, WindowExt as _, h_flex, resize_handle, v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -868,6 +868,78 @@ impl ChatView {
         if let Err(err) = changed {
             eprintln!("couldn't keep the session's new name: {err}");
         }
+    }
+
+    /// Asks before deleting the session, as nothing brings it back.
+    fn confirm_delete(&mut self, key: SessionKey, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(title) = self.session(key).and_then(|session| session.title.clone()) else {
+            return;
+        };
+        let title = SharedString::from(format!("Delete “{title}”?"));
+        let view = cx.entity().downgrade();
+        // The dialog gives focus back to what had it as it opened, which is otherwise the
+        // menu it was opened from, gone by the time the dialog closes.
+        self.input.update(cx, |input, cx| input.focus(window, cx));
+        window.open_alert_dialog(cx, move |dialog, _, _| {
+            let view = view.clone();
+            dialog
+                .title(title.clone())
+                .description("The agent is asked to delete it too. This can't be undone.")
+                .show_cancel(true)
+                .ok_text("Delete")
+                .ok_variant(ButtonVariant::Danger)
+                .on_ok(move |_, window, cx| {
+                    let _ = view.update(cx, |this, cx| this.delete_session(key, window, cx));
+                    true
+                })
+        });
+    }
+
+    /// Takes the session out of the window and out of those kept for later runs, and
+    /// has its agent close and delete it. On screen, the session with no prompt yet on
+    /// its agent takes its place.
+    fn delete_session(&mut self, key: SessionKey, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(ix) = self.sessions.iter().position(|session| session.key == key) else {
+            return;
+        };
+        if self
+            .renaming
+            .as_ref()
+            .is_some_and(|renaming| renaming.key == key)
+        {
+            self.finish_rename(false, cx);
+        }
+        if ix == self.active {
+            let next = self.untitled_on(self.sessions[ix].agent, cx);
+            self.show(next, window, cx);
+        }
+        let session = self.sessions.remove(ix);
+        if ix < self.active {
+            self.active -= 1;
+        }
+        let slot = &self.agents[session.agent];
+        let command = match session.id.clone() {
+            Some(id) => Command::DeleteSession(session.key, id),
+            // The agent is still creating it, and has nothing of it to delete: its first
+            // prompt never runs.
+            None => Command::CloseSession(session.key),
+        };
+        let _ = slot.commands.try_send(command);
+        if let (Some(id), Some(agent)) = (session.id, kept_name(&slot.name)) {
+            let changed = config_folder()
+                .ok_or_else(|| std::io::Error::other("there is no config folder"))
+                .and_then(|folder| {
+                    change_saved_sessions(&folder, |sessions| {
+                        sessions.retain(|saved| saved.agent != agent || saved.id != id)
+                    })
+                });
+            if let Err(err) = changed {
+                eprintln!("couldn't drop the deleted session from those kept: {err}");
+            }
+        }
+        // Its agent may have no session on show now.
+        self.make_spares(cx);
+        cx.notify();
     }
 
     /// The session, shown or spare.
@@ -2293,10 +2365,17 @@ impl ChatView {
                         }
                     }))
                     .context_menu(move |menu, _, _| {
-                        let view = view.clone();
+                        let (rename, delete) = (view.clone(), view.clone());
                         menu.item(PopupMenuItem::new("Rename").on_click(move |_, window, cx| {
-                            let _ = view.update(cx, |this, cx| this.start_rename(key, window, cx));
+                            let _ =
+                                rename.update(cx, |this, cx| this.start_rename(key, window, cx));
                         }))
+                        .item(
+                            PopupMenuItem::new("Delete…").on_click(move |_, window, cx| {
+                                let _ = delete
+                                    .update(cx, |this, cx| this.confirm_delete(key, window, cx));
+                            }),
+                        )
                     })
                     .into_any_element()
             });

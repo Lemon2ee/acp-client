@@ -18,9 +18,9 @@ use std::time::{Duration, Instant};
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
     AuthMethod, BooleanConfigOptionCapabilities, CancelNotification, ClientCapabilities,
-    ClientSessionCapabilities, CloseSessionRequest, ContentBlock, ErrorCode, Implementation,
-    InitializeRequest, PermissionOption, PermissionOptionKind, PromptRequest, PromptResponse,
-    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
+    ClientSessionCapabilities, CloseSessionRequest, ContentBlock, DeleteSessionRequest, ErrorCode,
+    Implementation, InitializeRequest, PermissionOption, PermissionOptionKind, PromptRequest,
+    PromptResponse, RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
     SelectedPermissionOutcome, SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory,
     SessionConfigOptionValue, SessionConfigOptionsCapabilities, SessionConfigSelectOptions,
     SessionId, SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
@@ -66,6 +66,11 @@ pub enum Command {
     /// asked to close it where the agent can, once it exists if the agent is still
     /// creating it. No more of its events come.
     CloseSession(SessionKey),
+    /// Closes the session as `CloseSession` does, then asks the agent to delete what it
+    /// keeps of the session with this id, where the agent can: Claude's adapter deletes
+    /// its transcript, and Codex's archives its thread. The id may be of a session from
+    /// an earlier run that this one never loaded. A failure comes as an `Event::Error`.
+    DeleteSession(SessionKey, String),
 }
 
 /// What the agent reports, flattened for display.
@@ -230,6 +235,8 @@ struct AgentInfo {
     closes: bool,
     /// The agent takes `session/load`.
     loads: bool,
+    /// The agent takes `session/delete`.
+    deletes: bool,
 }
 
 /// A session's task and the queue it reads its commands from.
@@ -242,13 +249,14 @@ struct SessionTask {
 
 impl SessionTask {
     /// Has the task close the session: the commands it hasn't read yet are dropped, and
-    /// it sees its queue closed at the next one it waits for. It then runs on alone
-    /// until it has told the agent; dropping it would cancel it where it is, and a
-    /// `session/new` still out would leave the agent a session nobody can close.
-    fn close(self) {
+    /// it sees its queue closed at the next one it waits for. The task returned ends once
+    /// it has told the agent, and must be detached or waited for: dropping it would cancel
+    /// it where it is, and a `session/new` still out would leave the agent a session
+    /// nobody can close.
+    fn close(self) -> smol::Task<()> {
         while self.unread.try_recv().is_ok() {}
         self.queue.close();
-        self.task.detach();
+        self.task
     }
 }
 
@@ -378,6 +386,11 @@ async fn run(
                 login_options: init.auth_methods.iter().map(login_option).collect(),
                 closes: init.agent_capabilities.session_capabilities.close.is_some(),
                 loads: init.agent_capabilities.load_session,
+                deletes: init
+                    .agent_capabilities
+                    .session_capabilities
+                    .delete
+                    .is_some(),
             };
             emit(events, Event::Connected { agent });
 
@@ -428,8 +441,24 @@ async fn run(
                             }
                             Command::CloseSession(key) => {
                                 if let Some(session) = sessions.remove(&key) {
-                                    session.close();
+                                    session.close().detach();
                                 }
+                                continue;
+                            }
+                            Command::DeleteSession(key, id) => {
+                                let closing = sessions.remove(&key).map(SessionTask::close);
+                                let (cx, events, deletes) =
+                                    (cx.clone(), events.clone(), info.deletes);
+                                // After the session's task has asked the agent to close it,
+                                // so the delete doesn't overtake the close.
+                                tasks
+                                    .spawn(async move {
+                                        if let Some(closing) = closing {
+                                            closing.await;
+                                        }
+                                        delete(&cx, key, id.into(), deletes, events);
+                                    })
+                                    .detach();
                                 continue;
                             }
                         };
@@ -737,6 +766,43 @@ fn close(key: SessionKey, session: &ActiveSession<'_, Agent>, closes: bool) {
                     error = %err,
                     "session/close failed"
                 ),
+            }
+            Ok(())
+        });
+}
+
+/// Asks the agent to delete the session, if `deletes` says it can. Its answer is only
+/// logged, but for a failure, which shows as an error: the session is gone from the
+/// front end, and the user would take it as deleted.
+fn delete(
+    cx: &ConnectionTo<Agent>,
+    key: SessionKey,
+    id: SessionId,
+    deletes: bool,
+    events: Sender<Event>,
+) {
+    if !deletes {
+        return;
+    }
+    let asked = Instant::now();
+    // Only a closed connection fails this, and the front end hears of that anyway.
+    let _ = cx
+        .prepare_request(DeleteSessionRequest::new(id))
+        .on_receiving_result(async move |result| {
+            match result {
+                Ok(_) => tracing::info!(session = key.0, took_ms = millis(asked), "session/delete"),
+                Err(err) => {
+                    tracing::warn!(
+                        session = key.0,
+                        took_ms = millis(asked),
+                        error = %err,
+                        "session/delete failed"
+                    );
+                    emit(
+                        &events,
+                        Event::Error(format!("couldn't delete the session: {err}")),
+                    );
+                }
             }
             Ok(())
         });
