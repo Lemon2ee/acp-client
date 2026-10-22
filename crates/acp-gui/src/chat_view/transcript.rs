@@ -65,13 +65,17 @@ impl ChatView {
             .into_any_element()
     }
 
-    /// The row at `ix` and the one after it are both tool calls, which sit close together
-    /// rather than a paragraph apart.
+    /// The row at `ix` and the one after it sit close together rather than a paragraph
+    /// apart: tool calls in a row, and a tool call beside the agent's text or thoughts
+    /// in the same turn, which leaves 10px between them, the rows' own padding.
     pub(crate) fn joins_next(&self, ix: usize) -> bool {
         let rows = &self.sessions[self.active].rows;
         matches!(
             (rows.get(ix), rows.get(ix + 1)),
-            (Some(Row::Tool(_)), Some(Row::Tool(_)))
+            (
+                Some(Row::Tool(_)),
+                Some(Row::Tool(_) | Row::Agent(_) | Row::Thought(_))
+            ) | (Some(Row::Agent(_) | Row::Thought(_)), Some(Row::Tool(_)))
         )
     }
 
