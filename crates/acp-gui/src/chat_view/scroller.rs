@@ -1,11 +1,15 @@
-//! The transcript's list. gpui-component's `MessageScroller` keeps the newest text in view
-//! by putting the list's end at the bottom on every layout, so each line a live reply adds
-//! shoves the transcript up at once. This list glides there instead, on a spring that
-//! keeps its speed from one line to the next. The rest is as `MessageScroller` has it:
-//! scrolling up stops the following and scrolling back to the end starts it again, the
-//! rows are spaced the same, and a button brings the newest text back.
+//! The transcript's list. It keeps the newest text in view as gpui-component's
+//! `MessageScroller` does, with the list's tail mode: each layout puts the end at the
+//! bottom, so a line a live reply adds moves the transcript up in the same frame it shows.
+//! Gliding there instead trailed each new line, which read as a jolt per line. Scrolling up
+//! stops the following, scrolling back to the end starts it again, and a button brings the
+//! newest text back.
+//!
+//! Its own list rather than `MessageScroller` for the padding: the wheel and the scrollbar
+//! reach only the rows' own height, so padding on the list left them 16px short of the end,
+//! where tail mode never starts following again. The first and last rows carry it here.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use gpui_kit::base::{ScrollBounce, Transition, transition};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -25,168 +29,36 @@ const JUMP_BUTTON_FADE: Duration = Duration::from_millis(200);
 /// it rises from there, in rems, as in `MessageScroller`.
 const JUMP_BUTTON_FROM: f32 = 0.5;
 const JUMP_BUTTON_RISE: f32 = 0.5;
-/// Closer to the end than this counts as there.
-const SETTLED: Pixels = px(0.5);
-/// How quickly the view follows the newest text: the period of the spring it moves on,
-/// as gpui-base's `Spring` takes one. Each line a reply wraps onto moves the end down
-/// about 22px at once; a shorter period kicks the view at each one, a longer one trails
-/// further behind. At 450ms it trails by less than a line and changes speed by at most
-/// about 30px/s a frame at 120Hz.
-const FOLLOW_RESPONSE: Duration = Duration::from_millis(450);
-/// One frame at 60Hz. The first step of a glide after the view has kept still covers
-/// this long, not all the time since the last frame.
-const LONGEST_STEP: Duration = Duration::from_micros(16_667);
 
 /// Where a session's transcript is scrolled, kept per session so each keeps its place
 /// while another is on screen.
 pub(crate) struct TranscriptScroll {
-    /// In the list's normal follow mode: its tail mode would put the end in view itself
-    /// on each layout.
+    /// In tail mode: it follows the end until the user scrolls away from it, and again
+    /// once they are back at it.
     list: ListState,
-    /// The newest text is kept in view: until the user scrolls away from the end, and
-    /// again once they are back at it.
-    following: bool,
-    /// Where `follow` left the top of the view, to tell the user's scrolls from its own.
-    placed: Option<ListOffset>,
-    /// When `follow` last ran.
-    ran: Instant,
-    /// The viewport's size then, as the list last laid out.
-    size: Size<Pixels>,
-    /// Rows changed since then. The list measures them as it lays out, after `follow`, so
-    /// the end they move is only known a frame later.
-    unmeasured: bool,
-    /// The rows last changed in a live turn, so the view glides to their end. A loaded
-    /// session's replay goes straight there, as it always shows at once.
-    glide: bool,
-    /// How fast the glide is moving the view down, in pixels a second. Kept from frame to
-    /// frame, so a line that comes while the view is still moving doesn't start it over.
-    velocity: f32,
 }
 
 impl TranscriptScroll {
     pub(crate) fn new() -> Self {
-        Self {
-            list: ListState::new(0, ListAlignment::Top, OVERDRAW),
-            following: true,
-            placed: None,
-            ran: Instant::now(),
-            size: Size::default(),
-            unmeasured: false,
-            glide: false,
-            velocity: 0.,
-        }
+        let list = ListState::new(0, ListAlignment::Top, OVERDRAW);
+        list.set_follow_mode(FollowMode::Tail);
+        Self { list }
     }
 
-    /// A row was added at the end; `live` is whether a live turn added it.
-    pub(crate) fn push(&mut self, live: bool) {
+    /// A row was added at the end.
+    pub(crate) fn push(&mut self) {
         let count = self.list.item_count();
         self.list.splice(count..count, 1);
         // The row that was last now has the gap before the next one under it.
         if let Some(last) = count.checked_sub(1) {
             self.list.remeasure_items(last..count);
         }
-        self.unmeasured = true;
-        self.glide = live;
     }
 
     /// The row at `ix` changed and may have changed height.
-    pub(crate) fn remeasure(&mut self, ix: usize, live: bool) {
+    pub(crate) fn remeasure(&mut self, ix: usize) {
         self.list.remeasure_items(ix..ix + 1);
-        self.unmeasured = true;
-        self.glide = live;
     }
-
-    /// The session comes on screen. One that follows its newest text shows the end of it
-    /// at once, where rows that came while it was away would otherwise glide in.
-    pub(crate) fn catch_up(&mut self) {
-        if self.following {
-            self.jump_to_end();
-        }
-    }
-
-    fn jump_to_end(&mut self) {
-        // Settles on the end as the list next lays out, however much it has grown.
-        self.list.scroll_to_end();
-        self.following = true;
-        self.placed = None;
-        self.velocity = 0.;
-    }
-
-    /// Run each frame before the list lays out: notices the user's scrolls, and while the
-    /// view follows, moves it toward the end the last layout measured on a critically
-    /// damped spring. An ease restarted at each new line would set off at full speed and
-    /// stop again before the next, a jolt per line; the spring keeps the speed it has, so
-    /// text that keeps coming is chased in one motion. For a replay, more than a screen
-    /// away, while the viewport changes size (its width rewraps the rows) or with Reduce
-    /// motion on, the view goes straight to the end as this frame lays it out.
-    fn follow(&mut self, reduce_motion: bool, window: &mut Window) {
-        let now = Instant::now();
-        let since = now.duration_since(self.ran).min(LONGEST_STEP);
-        self.ran = now;
-        let changed = std::mem::take(&mut self.unmeasured);
-        if changed && self.following {
-            window.request_animation_frame();
-        }
-        let size = self.list.viewport_bounds().size;
-        let resized = size != self.size;
-        self.size = size;
-        if size.height <= px(0.) {
-            // Not laid out yet: a session shown with its history starts at the end of it.
-            self.list.scroll_to_end();
-            return;
-        }
-        let top = -self.list.scroll_px_offset_for_scrollbar().y;
-        let end = self.list.max_offset_for_scrollbar().y;
-        if let Some(placed) = self.placed
-            && moved(placed, self.list.logical_scroll_top())
-        {
-            // The user scrolled, or rows shrank under the view; the latter leaves it at
-            // the end, which the next check picks up again.
-            self.following = false;
-        }
-        if top >= end - SETTLED {
-            self.following = true;
-        }
-        if !self.following {
-            self.velocity = 0.;
-        } else if !self.glide || reduce_motion || resized || end - top > size.height {
-            // Anchored at the end, the layout settles there itself, as the list's tail
-            // mode does: rows added or rewrapped this frame included.
-            self.list.scroll_to_end();
-            self.velocity = 0.;
-        } else {
-            let state = SpringState {
-                position: top.as_f32(),
-                velocity: self.velocity,
-            };
-            let next = follow_spring().step(state, end.as_f32(), since.as_secs_f32());
-            if end - px(next.position) > SETTLED {
-                self.list
-                    .set_offset_from_scrollbar(point(px(0.), -px(next.position)));
-                self.velocity = next.velocity;
-                window.request_animation_frame();
-            } else if !changed {
-                // Kept anchored at the end once there, so a layout that rewraps the rows
-                // (the sidebar sliding, the window resizing) still ends there.
-                self.list.scroll_to_end();
-                self.velocity = 0.;
-            }
-        }
-        self.placed = Some(self.list.logical_scroll_top());
-    }
-}
-
-/// The spring `FOLLOW_RESPONSE` describes, critically damped so the view never runs past
-/// the end, built as gpui-base's `Spring` builds one (whose own is private to it).
-fn follow_spring() -> SpringConfig {
-    let frequency = std::f32::consts::TAU / FOLLOW_RESPONSE.as_secs_f32();
-    SpringConfig::new(frequency * frequency, 2. * frequency, 1.)
-}
-
-/// Whether the top of the view is somewhere else than `before`. Compared as rows and
-/// offsets into them, so a row above the view changing height doesn't count.
-fn moved(before: ListOffset, now: ListOffset) -> bool {
-    before.item_ix != now.item_ix || (before.offset_in_item - now.offset_in_item).abs() > SETTLED
 }
 
 impl ChatView {
@@ -199,15 +71,11 @@ impl ChatView {
         let theme = cx.theme();
         let radius = theme.radius_full();
         let colors = theme.semantic_tokens().colors;
-        let reduce_motion = cx.reduce_motion();
         let session = &self.sessions[self.active];
         // Keyed per session, so a switch never reuses another session's element state.
         let id = ElementId::Name(format!("messages-{}", session.key.0).into());
-        let scroller = session.scroller.clone();
-        let (state, scrolled_up) = scroller.update(cx, |scroller, _| {
-            scroller.follow(reduce_motion, window);
-            (scroller.list.clone(), !scroller.following)
-        });
+        let state = session.scroller.read(cx).list.clone();
+        let scrolled_up = !state.is_following_tail();
         let jump_shown = transition(
             (id.clone(), "jump-button-shown"),
             if scrolled_up { 1. } else { 0. },
@@ -216,8 +84,7 @@ impl ChatView {
             cx,
         );
 
-        // The list's own padding would lie past what the wheel and the scrollbar reach,
-        // as they measure the rows alone, so the first and last rows carry it.
+        // The first and last rows carry the list's padding (see the module's doc).
         let count = state.item_count();
         let render_row =
             cx.processor(|this, ix: usize, window, cx| this.render_row(ix, window, cx));
@@ -277,9 +144,13 @@ impl ChatView {
                                 .border_color(colors.border)
                                 .bg(colors.background)
                                 .text_color(colors.foreground)
-                                .on_click(cx.listener(move |_, _: &ClickEvent, _, cx| {
-                                    scroller.update(cx, |scroller, _| scroller.jump_to_end());
-                                    cx.notify();
+                                .on_click(cx.listener({
+                                    let state = state.clone();
+                                    move |_, _: &ClickEvent, _, cx| {
+                                        // Follows again from the end, as the next layout puts it.
+                                        state.set_follow_mode(FollowMode::Tail);
+                                        cx.notify();
+                                    }
                                 }))
                                 .disabled(!scrolled_up),
                         ),

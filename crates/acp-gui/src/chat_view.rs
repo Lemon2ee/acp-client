@@ -528,9 +528,6 @@ impl ChatView {
         if ix != self.active {
             self.sessions[self.active].draft = self.input.read(cx).value();
             self.active = ix;
-            self.sessions[ix]
-                .scroller
-                .update(cx, |scroller, _| scroller.catch_up());
             let draft = std::mem::take(&mut self.sessions[ix].draft);
             self.input.update(cx, |input, cx| {
                 input.set_value(draft, window, cx);
