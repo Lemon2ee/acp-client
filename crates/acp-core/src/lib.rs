@@ -90,7 +90,10 @@ pub enum SessionEvent {
     /// `Mode` setting.
     ModeChanged(String),
     /// The agent refused a `ChangeSetting`; the setting keeps its value.
-    SettingFailed(String),
+    SettingFailed {
+        setting: String,
+        message: String,
+    },
 }
 
 /// Something the agent lets the user choose for one session, such as its model.
@@ -531,9 +534,10 @@ fn change_setting(
         .on_receiving_result(async move |result| {
             let event = match result {
                 Ok(response) => SessionEvent::Settings(settings_of(&response.config_options)),
-                Err(err) => {
-                    SessionEvent::SettingFailed(format!("couldn't change {setting}: {err}"))
-                }
+                Err(err) => SessionEvent::SettingFailed {
+                    message: format!("couldn't change {setting}: {err}"),
+                    setting,
+                },
             };
             emit(&events, Event::Session(key, event));
             let _ = answered.send(());

@@ -106,7 +106,7 @@ fn pump(events: &Receiver<Event>, lines: &mut impl Iterator<Item = io::Result<St
                 }
                 SessionEvent::ModeChanged(mode) => println!("\n[mode: {mode}]"),
                 // The CLI never changes the session's settings, so it doesn't list them.
-                SessionEvent::Settings(_) | SessionEvent::SettingFailed(_) => {}
+                SessionEvent::Settings(_) | SessionEvent::SettingFailed { .. } => {}
             },
             Event::Error(message) => eprintln!("\nerror: {message}"),
             Event::Closed => return false,

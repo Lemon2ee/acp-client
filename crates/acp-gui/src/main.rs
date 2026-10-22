@@ -163,10 +163,9 @@ impl Session {
                     }
                 }
             }
-            SessionEvent::SettingFailed(message) => {
-                // It doesn't say which change failed, so every switch goes back to
-                // showing the agent's value.
-                self.flipped.clear();
+            SessionEvent::SettingFailed { setting, message } => {
+                // A switch whose flip failed shows the agent's value again.
+                self.flipped.remove(&setting);
                 self.push(Row::Error(message), cx)
             }
         }
