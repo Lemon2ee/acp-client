@@ -13,10 +13,10 @@ use acp_core::{
 };
 use gpui_kit::base::Easing;
 use gpui_kit::component::ActiveTheme as _;
-use gpui_kit::component::message_scroller::MessageScrollerState;
 use gpui_kit::component::text::{TextViewMotion, TextViewState};
 use gpui_kit::*;
 
+use crate::chat_view::scroller::TranscriptScroll;
 use pacing::Pacer;
 
 /// How much later each word of a streamed piece starts fading in than the one before,
@@ -52,7 +52,7 @@ pub(crate) struct Session {
     /// The first line of the first prompt, shown on the session's card.
     pub(crate) title: Option<String>,
     pub(crate) rows: Vec<Row>,
-    pub(crate) scroller: Entity<MessageScrollerState>,
+    pub(crate) scroller: Entity<TranscriptScroll>,
     /// Not ready for a prompt: a spare still being created, a turn is running, or the
     /// agent is gone. A session the agent hasn't created yet takes a prompt, which has
     /// the agent create it.
@@ -74,7 +74,8 @@ pub(crate) struct Session {
     /// In the sidebar's Archived list, out of the way.
     pub(crate) archived: bool,
     /// A turn prompted here is running, so the agent's text arrives as it is written: it
-    /// fades in, and new rows come in with motion. A loaded session's replay shows at once.
+    /// fades in, new rows come in with motion, and the transcript glides down to them. A
+    /// loaded session's replay shows at once.
     live: bool,
     /// When each row added in a live turn came in, until its entrance has played. Kept
     /// here because the list drops a row's element state once it scrolls out of view.
@@ -113,7 +114,7 @@ impl Session {
             agent,
             title: None,
             rows: Vec::new(),
-            scroller: cx.new(|cx| MessageScrollerState::new(0, cx)),
+            scroller: cx.new(|_| TranscriptScroll::new()),
             busy: false,
             draft: SharedString::default(),
             settings: Vec::new(),
@@ -470,16 +471,15 @@ impl Session {
         }
         self.changed = now;
         self.rows.push(row);
-        self.scroller.update(cx, |scroller, cx| {
-            scroller.append(1, cx);
-        });
+        let live = self.live;
+        self.scroller.update(cx, |scroller, _| scroller.push(live));
     }
 
     fn remeasure(&mut self, ix: usize, cx: &mut App) {
         self.changed = Instant::now();
-        self.scroller.update(cx, |scroller, cx| {
-            scroller.remeasure_items(ix..ix + 1, cx);
-        });
+        let live = self.live;
+        self.scroller
+            .update(cx, |scroller, _| scroller.remeasure(ix, live));
     }
 }
 

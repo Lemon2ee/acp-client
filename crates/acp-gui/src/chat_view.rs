@@ -3,6 +3,7 @@
 //! modules below it, which can read its private fields.
 
 mod pickers;
+pub(crate) mod scroller;
 mod settings_page;
 mod sidebar;
 mod transcript;
@@ -21,7 +22,6 @@ use gpui_kit::component::input::{
     InputEvent, InputGroup, InputGroupAddon, InputGroupAddonAlignment, InputGroupButton, Textarea,
     TextareaState,
 };
-use gpui_kit::component::message_scroller::MessageScroller;
 use gpui_kit::component::{ActiveTheme as _, FocusableExt as _, Icon, IconName, Sizable as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -528,6 +528,9 @@ impl ChatView {
         if ix != self.active {
             self.sessions[self.active].draft = self.input.read(cx).value();
             self.active = ix;
+            self.sessions[ix]
+                .scroller
+                .update(cx, |scroller, _| scroller.catch_up());
             let draft = std::mem::take(&mut self.sessions[ix].draft);
             self.input.update(cx, |input, cx| {
                 input.set_value(draft, window, cx);
@@ -1029,6 +1032,7 @@ impl Render for ChatView {
             cx,
         );
         let sidebar_width = self.sidebar.width * (1. - hidden);
+        let transcript = self.render_transcript(window, cx);
         let session = &self.sessions[self.active];
         // The model, how hard it thinks, then the mode, each once the agent has said
         // what it can be, for this session or the last it created.
@@ -1094,17 +1098,7 @@ impl Render for ChatView {
                     .opacity(chat_shown)
                     .when(title_bar, as_title_bar),
             )
-            .child(
-                MessageScroller::new(
-                    // Keyed per session, so a switch never reuses another session's list state.
-                    ElementId::Name(format!("messages-{}", session.key.0).into()),
-                    session.scroller.clone(),
-                    cx.processor(|this, ix: usize, window, cx| this.render_row(ix, window, cx)),
-                )
-                .flex_1()
-                .min_h(px(0.))
-                .opacity(chat_shown),
-            )
+            .child(transcript.flex_1().min_h(px(0.)).opacity(chat_shown))
             .child(
                 // A row along the input box's bottom: the session's model and mode on the
                 // left, the send/stop button on the right.
