@@ -73,7 +73,9 @@ cargo fmt --all
 
 - Commit subject: `<crate>: <what it does now, in plain imperative words>`, lower-case,
   no trailing period, e.g. `acp-gui: keep the caret at the end of a restored draft`.
-  Cross-crate changes may drop the prefix.
+  A change outside a single crate (several crates, or workspace files such as
+  `Cargo.toml`, `.zed/`, `CLAUDE.md`) drops the prefix and starts with a capitalised
+  verb, e.g. `Add Zed and cargo project config`.
 - Commit body: one or two sentences on the observable behaviour and the reason, not a
   list of edits. Mention the numbers that matter (sizes, colours, versions).
 - Branches: `feat/...`, `fix/...`; work lands on `main` through a PR.
@@ -83,9 +85,10 @@ cargo fmt --all
 
 - **Title** follows the commit subject rule: `<crate>: <what the PR does, in plain words>`,
   lower-case after the prefix, no trailing period, e.g.
-  `acp-gui: follow the system's light or dark appearance`. A PR that touches several
-  crates drops the prefix and starts with a verb (`Fix the draft caret and stale
-  permission cards`). No ticket numbers or `feat:`/`fix:` tags in the title.
+  `acp-gui: follow the system's light or dark appearance`. A PR outside a single crate
+  drops the prefix and starts with a capitalised verb, as commits do (`Fix the draft
+  caret and stale permission cards`, `Add a CLAUDE.md for Claude Code`). No ticket
+  numbers or `feat:`/`fix:` tags in the title.
 - **Body**: what the user sees differently, why, and how it was checked. Short.
 - **Turn on Auto-fix for every PR you open.** Right after `gh pr create`, bind the PR in
   the desktop app (`get_status`, then `bind_pr` if it is not reported) and enable
