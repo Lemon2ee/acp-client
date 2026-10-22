@@ -119,6 +119,10 @@ impl Session {
                 self.cancel_open_permissions(cx);
                 self.push(Row::Error(message), cx);
             }
+            // The window doesn't show the session's settings yet, nor change them.
+            SessionEvent::Settings(_)
+            | SessionEvent::ModeChanged(_)
+            | SessionEvent::SettingFailed(_) => {}
         }
     }
 

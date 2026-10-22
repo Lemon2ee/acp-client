@@ -9,10 +9,13 @@ use std::thread;
 
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
-    AuthMethod, CancelNotification, ContentBlock, ErrorCode, Implementation, InitializeRequest,
+    AuthMethod, BooleanConfigOptionCapabilities, CancelNotification, ClientCapabilities,
+    ClientSessionCapabilities, ContentBlock, ErrorCode, Implementation, InitializeRequest,
     PermissionOption, PermissionOptionKind, PromptRequest, PromptResponse,
     RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
-    SelectedPermissionOutcome, SessionNotification, SessionUpdate, StopReason,
+    SelectedPermissionOutcome, SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory,
+    SessionConfigOptionValue, SessionConfigOptionsCapabilities, SessionConfigSelectOptions,
+    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest, StopReason,
 };
 use agent_client_protocol::util::{MatchDispatch, internal_error};
 pub use agent_client_protocol::{AcpAgent, Error};
@@ -37,6 +40,9 @@ pub enum Command {
     Prompt(SessionKey, String),
     /// Stop the session's turn in flight; ignored when idle.
     Cancel(SessionKey),
+    /// Sets one of the session's settings, by id, during a turn or not. Answered with
+    /// the session's `Settings`, or `SettingFailed`.
+    ChangeSetting(SessionKey, String, SettingValue),
 }
 
 /// What the agent reports, flattened for display.
@@ -76,6 +82,64 @@ pub enum SessionEvent {
     },
     /// The prompt failed; the session stays usable.
     TurnFailed(String),
+    /// Every setting the agent offers for the session, as they stand now. Comes once
+    /// the session exists, and again whenever they change.
+    Settings(Vec<Setting>),
+    /// The agent moved the session to another mode, by the id of its choice in the
+    /// `Mode` setting.
+    ModeChanged(String),
+    /// The agent refused a `ChangeSetting`; the setting keeps its value.
+    SettingFailed(String),
+}
+
+/// Something the agent lets the user choose for one session, such as its model.
+#[derive(Clone)]
+pub struct Setting {
+    pub id: String,
+    pub name: String,
+    pub kind: SettingKind,
+    pub value: SettingValue,
+    /// What a `Choice` setting can be set to; none for a `Switch`.
+    pub choices: Vec<SettingChoice>,
+}
+
+impl Setting {
+    /// The choice the setting is set to, when it is one of its choices.
+    pub fn chosen(&self) -> Option<&SettingChoice> {
+        match &self.value {
+            SettingValue::Choice(id) => self.choices.iter().find(|choice| choice.id == *id),
+            SettingValue::Switch(_) => None,
+        }
+    }
+}
+
+/// What a setting is for, where the agent says.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SettingKind {
+    Model,
+    Mode,
+    /// How hard the model thinks, such as its reasoning effort.
+    ThoughtLevel,
+    /// Some other setting of the model, such as a fast mode.
+    ModelConfig,
+    Other,
+}
+
+/// A setting's value.
+#[derive(Clone, PartialEq, Eq)]
+pub enum SettingValue {
+    /// The id of one of the setting's choices.
+    Choice(String),
+    /// Whether a setting that is on or off is on.
+    Switch(bool),
+}
+
+#[derive(Clone)]
+pub struct SettingChoice {
+    pub id: String,
+    pub name: String,
+    /// What the choice does, when the agent says.
+    pub description: Option<String>,
 }
 
 pub struct PermissionRequest {
@@ -111,6 +175,8 @@ pub struct AgentHandle {
 enum SessionCommand {
     Prompt(String),
     Cancel,
+    /// A setting's id and its new value.
+    ChangeSetting(String, SettingValue),
 }
 
 /// Pinned rather than `@latest`, so each adapter runs the CLI it bundles and was tested with
@@ -158,8 +224,18 @@ async fn run(
         .builder()
         .name("acp-gui")
         .connect_with(agent, async |cx: ConnectionTo<Agent>| {
+            // Lets agents offer a setting that is on or off, such as a fast mode, as a
+            // switch rather than a pick of two values.
+            let capabilities = ClientCapabilities::new().session(
+                ClientSessionCapabilities::new().config_options(
+                    SessionConfigOptionsCapabilities::new()
+                        .boolean(BooleanConfigOptionCapabilities::new()),
+                ),
+            );
             let init = cx
-                .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                .send_request(
+                    InitializeRequest::new(ProtocolVersion::V1).client_capabilities(capabilities),
+                )
                 .block_task()
                 .await?;
             login_options = init.auth_methods.iter().map(login_option).collect();
@@ -197,6 +273,9 @@ async fn run(
                             }
                             Command::Prompt(key, text) => (key, SessionCommand::Prompt(text)),
                             Command::Cancel(key) => (key, SessionCommand::Cancel),
+                            Command::ChangeSetting(key, setting, value) => {
+                                (key, SessionCommand::ChangeSetting(setting, value))
+                            }
                         };
                         if let Some(session) = sessions.get(&key) {
                             let _ = session.try_send(command);
@@ -250,6 +329,11 @@ async fn run_session(
             .build_session(&cwd)
             .block_task()
             .run_until(async |mut session| {
+                let settings = settings_of(session.config_options().unwrap_or_default());
+                emit(
+                    &events,
+                    Event::Session(key, SessionEvent::Settings(settings)),
+                );
                 let waiting: VecDeque<String> = retry.take().into_iter().collect();
                 if waiting.is_empty() {
                     emit(&events, Event::SessionReady(key));
@@ -277,8 +361,8 @@ async fn run_session(
         retry = loop {
             match commands.recv().await {
                 Ok(SessionCommand::Prompt(text)) => break Some(text),
-                // No session, so nothing is running to stop.
-                Ok(SessionCommand::Cancel) => {}
+                // No session, so nothing is running to stop, and no settings to change.
+                Ok(SessionCommand::Cancel | SessionCommand::ChangeSetting(..)) => {}
                 Err(_) => return,
             }
         };
@@ -302,6 +386,11 @@ async fn serve(
                 Ok(SessionCommand::Prompt(text)) => text,
                 // Nothing is running, so there is nothing to stop.
                 Ok(SessionCommand::Cancel) => continue,
+                Ok(SessionCommand::ChangeSetting(setting, value)) => {
+                    // Only a closed connection fails this, which ends the session anyway.
+                    let _ = change_setting(key, session, setting, value, events);
+                    continue;
+                }
                 Err(_) => return,
             },
         };
@@ -390,9 +479,43 @@ async fn run_turn(
                 }
             }
             Next::Command(Some(SessionCommand::Prompt(text))) => waiting.push_back(text),
+            Next::Command(Some(SessionCommand::ChangeSetting(setting, value))) => {
+                change_setting(key, session, setting, value, events)?
+            }
             Next::Command(None) => return Err(internal_error("the session was closed")),
         }
     }
+}
+
+/// Asks the agent to change one of the session's settings. Its answer, the settings
+/// as they now stand, goes to the front end whenever it comes.
+fn change_setting(
+    key: SessionKey,
+    session: &ActiveSession<'_, Agent>,
+    setting: String,
+    value: SettingValue,
+    events: &Sender<Event>,
+) -> Result<(), Error> {
+    let events = events.clone();
+    let value = match value {
+        SettingValue::Choice(id) => SessionConfigOptionValue::value_id(id),
+        SettingValue::Switch(on) => SessionConfigOptionValue::boolean(on),
+    };
+    let request =
+        SetSessionConfigOptionRequest::new(session.session_id().clone(), setting.clone(), value);
+    session
+        .connection()
+        .prepare_request(request)
+        .on_receiving_result(async move |result| {
+            let event = match result {
+                Ok(response) => SessionEvent::Settings(settings_of(&response.config_options)),
+                Err(err) => {
+                    SessionEvent::SettingFailed(format!("couldn't change {setting}: {err}"))
+                }
+            };
+            emit(&events, Event::Session(key, event));
+            Ok(())
+        })
 }
 
 async fn handle(
@@ -515,8 +638,65 @@ fn flatten(update: SessionUpdate) -> Option<SessionEvent> {
                 .map(|entry| format!("[{:?}] {}", entry.status, entry.content))
                 .collect(),
         ),
+        SessionUpdate::ConfigOptionUpdate(update) => {
+            SessionEvent::Settings(settings_of(&update.config_options))
+        }
+        SessionUpdate::CurrentModeUpdate(update) => {
+            SessionEvent::ModeChanged(update.current_mode_id.0.to_string())
+        }
         _ => return None,
     })
+}
+
+/// The agent's session config options of the kinds we know: a pick of one of several
+/// values, or on or off.
+fn settings_of(options: &[SessionConfigOption]) -> Vec<Setting> {
+    options
+        .iter()
+        .filter_map(|option| {
+            let (value, choices) = match &option.kind {
+                SessionConfigKind::Select(select) => {
+                    let choices = match &select.options {
+                        SessionConfigSelectOptions::Ungrouped(choices) => choices.iter().collect(),
+                        SessionConfigSelectOptions::Grouped(groups) => groups
+                            .iter()
+                            .flat_map(|group| &group.options)
+                            .collect::<Vec<_>>(),
+                        _ => Vec::new(),
+                    };
+                    let choices = choices
+                        .into_iter()
+                        .map(|choice| SettingChoice {
+                            id: choice.value.0.to_string(),
+                            name: choice.name.clone(),
+                            description: choice.description.clone(),
+                        })
+                        .collect();
+                    (
+                        SettingValue::Choice(select.current_value.0.to_string()),
+                        choices,
+                    )
+                }
+                SessionConfigKind::Boolean(boolean) => {
+                    (SettingValue::Switch(boolean.current_value), Vec::new())
+                }
+                _ => return None,
+            };
+            Some(Setting {
+                id: option.id.0.to_string(),
+                name: option.name.clone(),
+                kind: match option.category {
+                    Some(SessionConfigOptionCategory::Model) => SettingKind::Model,
+                    Some(SessionConfigOptionCategory::Mode) => SettingKind::Mode,
+                    Some(SessionConfigOptionCategory::ThoughtLevel) => SettingKind::ThoughtLevel,
+                    Some(SessionConfigOptionCategory::ModelConfig) => SettingKind::ModelConfig,
+                    _ => SettingKind::Other,
+                },
+                value,
+                choices,
+            })
+        })
+        .collect()
 }
 
 fn text_of(block: &ContentBlock) -> String {
