@@ -15,11 +15,11 @@ use gpui_kit::base::input::Copy;
 use gpui_kit::base::{HandleEdge, SelectableText, TextSelection, Transition, transition};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{
-    Input, InputEvent, InputGroup, InputGroupAddon, InputGroupAddonAlignment, InputGroupButton,
-    InputState, Textarea, TextareaState,
+    Escape, Input, InputEvent, InputGroup, InputGroupAddon, InputGroupAddonAlignment,
+    InputGroupButton, InputState, Textarea, TextareaState,
 };
 use gpui_kit::component::kbd::Kbd;
-use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
+use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::message_scroller::{MessageScroller, MessageScrollerState};
 use gpui_kit::component::popover::{Popover, PopoverState};
 use gpui_kit::component::switch::Switch;
@@ -338,6 +338,13 @@ struct AgentSlot {
     _events: Task<()>,
 }
 
+/// A field on a session's sidebar card for changing its name.
+struct Renaming {
+    key: SessionKey,
+    input: Entity<InputState>,
+    _events: Subscription,
+}
+
 struct ChatView {
     /// Never empty: the window starts with the sessions kept from earlier runs, oldest
     /// first, and one new session, which its first prompt has the agent create. At most
@@ -378,6 +385,8 @@ struct ChatView {
     /// Holds keyboard focus while the settings are open, so Esc and Cmd+, reach them:
     /// the prompt box, which has it otherwise, isn't drawn then.
     settings_focus: FocusHandle,
+    /// The session whose name is being changed on its sidebar card.
+    renaming: Option<Renaming>,
     _input_events: Subscription,
     _search_events: Subscription,
     _bounds_events: Subscription,
@@ -498,6 +507,7 @@ impl ChatView {
             settings_open: false,
             settings_page: SettingsPage::General,
             settings_focus: cx.focus_handle(),
+            renaming: None,
             _input_events: input_events,
             _search_events: search_events,
             _bounds_events: bounds_events,
@@ -791,6 +801,73 @@ impl ChatView {
         }
         self.input.update(cx, |input, cx| input.focus(window, cx));
         cx.notify();
+    }
+
+    /// Puts a field for the session's name on its sidebar card, with the name selected.
+    /// Enter, or focus going elsewhere, keeps what was typed; Escape drops it.
+    fn start_rename(&mut self, key: SessionKey, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(title) = self.session(key).and_then(|session| session.title.clone()) else {
+            return;
+        };
+        // Before the new field takes focus: the old one's blur would come after this
+        // returns, and close the new one instead.
+        self.finish_rename(true, cx);
+        let input = cx.new(|cx| InputState::new(window, cx).default_value(title));
+        let events = cx.subscribe_in(&input, window, |this, _, event, window, cx| match event {
+            InputEvent::PressEnter { .. } => {
+                this.finish_rename(true, cx);
+                this.input.update(cx, |input, cx| input.focus(window, cx));
+            }
+            InputEvent::Blur => this.finish_rename(true, cx),
+            _ => {}
+        });
+        input.update(cx, |input, cx| {
+            input.focus(window, cx);
+            input.select_all(window, cx);
+        });
+        self.renaming = Some(Renaming {
+            key,
+            input,
+            _events: events,
+        });
+        cx.notify();
+    }
+
+    /// Closes the name field. With `keep`, the session takes the name typed, unless it
+    /// is blank, and a session kept for later runs keeps it there too; one its agent
+    /// hasn't given an id yet is kept with it once the agent does.
+    fn finish_rename(&mut self, keep: bool, cx: &mut Context<Self>) {
+        let Some(renaming) = self.renaming.take() else {
+            return;
+        };
+        cx.notify();
+        let title = renaming.input.read(cx).value().trim().to_string();
+        let Some(session) = self.session_mut(renaming.key) else {
+            return;
+        };
+        if !keep || title.is_empty() || session.title.as_ref() == Some(&title) {
+            return;
+        }
+        session.title = Some(title.clone());
+        let (agent, id) = (session.agent, session.id.clone());
+        let (Some(id), Some(agent)) = (id, kept_name(&self.agents[agent].name)) else {
+            return;
+        };
+        let changed = config_folder()
+            .ok_or_else(|| std::io::Error::other("there is no config folder"))
+            .and_then(|folder| {
+                change_saved_sessions(&folder, |sessions| {
+                    let kept = sessions
+                        .iter_mut()
+                        .find(|saved| saved.agent == agent && saved.id == id);
+                    if let Some(saved) = kept {
+                        saved.title = title;
+                    }
+                })
+            });
+        if let Err(err) = changed {
+            eprintln!("couldn't keep the session's new name: {err}");
+        }
     }
 
     /// The session, shown or spare.
@@ -2148,6 +2225,8 @@ impl ChatView {
         let theme = cx.theme();
         let (foreground, hover) = (theme.sidebar_foreground, theme.secondary);
         let (accent, accent_foreground) = (theme.sidebar_accent, theme.sidebar_accent_foreground);
+        let ring = theme.ring;
+        let view = cx.entity().downgrade();
         // Newest first; the session on screen gets a filled card. The one with no prompt
         // yet has none: the agent hasn't created it, and it may give way to another.
         let cards = self
@@ -2157,18 +2236,14 @@ impl ChatView {
             .rev()
             .filter_map(|(ix, session)| Some((ix, session.key, session.title.clone()?)))
             .map(|(ix, key, title)| {
-                let title = SharedString::from(title);
-                div()
+                let card = div()
                     .id(ElementId::Name(format!("session-{}", key.0).into()))
-                    .role(Role::Button)
-                    .aria_label(title.clone())
                     .h(px(32.))
                     .px_3()
                     .flex()
                     .items_center()
                     .rounded_md()
                     .text_sm()
-                    .cursor_pointer()
                     .map(|card| {
                         if ix == self.active {
                             card.bg(accent)
@@ -2177,11 +2252,53 @@ impl ChatView {
                         } else {
                             card.hover(|style| style.bg(accent.opacity(0.5)))
                         }
-                    })
+                    });
+                if let Some(renaming) = self
+                    .renaming
+                    .as_ref()
+                    .filter(|renaming| renaming.key == key)
+                {
+                    // The name's own text, plain and in place, inside a ring drawn within
+                    // the card so nothing moves.
+                    return card
+                        .shadow(vec![
+                            BoxShadow::new(px(0.), px(0.), ring)
+                                .spread_radius(px(1.))
+                                .inset(),
+                        ])
+                        .child(Input::new(&renaming.input).appearance(false).small().p_0())
+                        .on_action(cx.listener(|this, _: &Escape, window, cx| {
+                            this.finish_rename(false, cx);
+                            this.input.update(cx, |input, cx| input.focus(window, cx));
+                        }))
+                        // A click on the chat takes no focus from the field, so it
+                        // wouldn't close it otherwise.
+                        .on_mouse_down_out(cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                            this.finish_rename(true, cx)
+                        }))
+                        .into_any_element();
+                }
+                let title = SharedString::from(title);
+                let view = view.clone();
+                card.role(Role::Button)
+                    .aria_label(title.clone())
+                    .cursor_pointer()
                     .child(div().flex_1().min_w(px(0.)).truncate().child(title))
-                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                        this.select(key, window, cx)
+                    .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                        // The first click of the two has shown the session already.
+                        if event.click_count() == 2 {
+                            this.start_rename(key, window, cx)
+                        } else {
+                            this.select(key, window, cx)
+                        }
                     }))
+                    .context_menu(move |menu, _, _| {
+                        let view = view.clone();
+                        menu.item(PopupMenuItem::new("Rename").on_click(move |_, window, cx| {
+                            let _ = view.update(cx, |this, cx| this.start_rename(key, window, cx));
+                        }))
+                    })
+                    .into_any_element()
             });
         div()
             .w(self.sidebar_width)
