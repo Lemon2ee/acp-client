@@ -6,12 +6,14 @@ publish.workspace = true
 
 [dependencies]
 acp-core.workspace = true
+# Finds the folder for the app's own files, such as the models added to the model list.
+dirs = "6"
 # Pins a gpui-pre snapshot of Zed's gpui and re-exports it with gpui-component.
 # (crates.io `gpui` itself stopped at 0.2.2 in 2025-10.)
 gpui-kit = "0.8"
 
-# Reads the traffic lights' size from AppKit. gpui's macOS layer already builds both
-# crates at these versions, with these features.
+# Reads the traffic lights' size and spacing from AppKit. gpui's macOS layer already
+# builds these crates at these versions, with these features.
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3.2", default-features = false, features = [
@@ -22,3 +24,4 @@ objc2-app-kit = { version = "0.3.2", default-features = false, features = [
     "NSWindow",
     "objc2-core-foundation",
 ] }
+raw-window-handle = "0.6"

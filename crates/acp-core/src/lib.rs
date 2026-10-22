@@ -5,14 +5,20 @@
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
+use std::time::Duration;
 
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
-    AuthMethod, CancelNotification, ContentBlock, ErrorCode, Implementation, InitializeRequest,
+    AuthMethod, BooleanConfigOptionCapabilities, CancelNotification, ClientCapabilities,
+    ClientSessionCapabilities, ContentBlock, ErrorCode, Implementation, InitializeRequest,
     PermissionOption, PermissionOptionKind, PromptRequest, PromptResponse,
     RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
-    SelectedPermissionOutcome, SessionNotification, SessionUpdate, StopReason,
+    SelectedPermissionOutcome, SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory,
+    SessionConfigOptionValue, SessionConfigOptionsCapabilities, SessionConfigSelectOptions,
+    SessionId, SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
+    SetSessionConfigOptionResponse, StopReason,
 };
 use agent_client_protocol::util::{MatchDispatch, internal_error};
 pub use agent_client_protocol::{AcpAgent, Error};
@@ -37,6 +43,9 @@ pub enum Command {
     Prompt(SessionKey, String),
     /// Stop the session's turn in flight; ignored when idle.
     Cancel(SessionKey),
+    /// Sets one of the session's settings, by id, during a turn or not. Answered with
+    /// `SettingChanged`, or `SettingFailed`; a prompt sent after it waits for the answer.
+    ChangeSetting(SessionKey, String, SettingValue),
 }
 
 /// What the agent reports, flattened for display.
@@ -76,6 +85,75 @@ pub enum SessionEvent {
     },
     /// The prompt failed; the session stays usable.
     TurnFailed(String),
+    /// Every setting the agent offers for the session, as they stand now. Comes once
+    /// the session exists, and again whenever the agent says they changed.
+    Settings(Vec<Setting>),
+    /// The agent answered a `ChangeSetting` of `setting`, with every setting as it now
+    /// stands. Each change gets one answer, this or `SettingFailed`, in the order the
+    /// changes were made.
+    SettingChanged {
+        setting: String,
+        settings: Vec<Setting>,
+    },
+    /// The agent moved the session to another mode, by the id of its choice in the
+    /// `Mode` setting.
+    ModeChanged(String),
+    /// The agent refused a `ChangeSetting`, or hadn't answered it by the time a prompt
+    /// stopped waiting; the setting keeps its value.
+    SettingFailed {
+        setting: String,
+        message: String,
+    },
+}
+
+/// Something the agent lets the user choose for one session, such as its model.
+#[derive(Clone)]
+pub struct Setting {
+    pub id: String,
+    pub name: String,
+    pub kind: SettingKind,
+    pub value: SettingValue,
+    /// What a `Choice` setting can be set to; none for a `Switch`.
+    pub choices: Vec<SettingChoice>,
+}
+
+impl Setting {
+    /// The choice the setting is set to, when it is one of its choices.
+    pub fn chosen(&self) -> Option<&SettingChoice> {
+        match &self.value {
+            SettingValue::Choice(id) => self.choices.iter().find(|choice| choice.id == *id),
+            SettingValue::Switch(_) => None,
+        }
+    }
+}
+
+/// What a setting is for, where the agent says.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SettingKind {
+    Model,
+    Mode,
+    /// How hard the model thinks, such as its reasoning effort.
+    ThoughtLevel,
+    /// Some other setting of the model, such as a fast mode.
+    ModelConfig,
+    Other,
+}
+
+/// A setting's value.
+#[derive(Clone, PartialEq, Eq)]
+pub enum SettingValue {
+    /// The id of one of the setting's choices.
+    Choice(String),
+    /// Whether a setting that is on or off is on.
+    Switch(bool),
+}
+
+#[derive(Clone)]
+pub struct SettingChoice {
+    pub id: String,
+    pub name: String,
+    /// What the choice does, when the agent says.
+    pub description: Option<String>,
 }
 
 pub struct PermissionRequest {
@@ -111,6 +189,8 @@ pub struct AgentHandle {
 enum SessionCommand {
     Prompt(String),
     Cancel,
+    /// A setting's id and its new value.
+    ChangeSetting(String, SettingValue),
 }
 
 /// Pinned rather than `@latest`, so each adapter runs the CLI it bundles and was tested with
@@ -158,8 +238,18 @@ async fn run(
         .builder()
         .name("acp-gui")
         .connect_with(agent, async |cx: ConnectionTo<Agent>| {
+            // Lets agents offer a setting that is on or off, such as a fast mode, as a
+            // switch rather than a pick of two values.
+            let capabilities = ClientCapabilities::new().session(
+                ClientSessionCapabilities::new().config_options(
+                    SessionConfigOptionsCapabilities::new()
+                        .boolean(BooleanConfigOptionCapabilities::new()),
+                ),
+            );
             let init = cx
-                .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                .send_request(
+                    InitializeRequest::new(ProtocolVersion::V1).client_capabilities(capabilities),
+                )
                 .block_task()
                 .await?;
             login_options = init.auth_methods.iter().map(login_option).collect();
@@ -197,6 +287,9 @@ async fn run(
                             }
                             Command::Prompt(key, text) => (key, SessionCommand::Prompt(text)),
                             Command::Cancel(key) => (key, SessionCommand::Cancel),
+                            Command::ChangeSetting(key, setting, value) => {
+                                (key, SessionCommand::ChangeSetting(setting, value))
+                            }
                         };
                         if let Some(session) = sessions.get(&key) {
                             let _ = session.try_send(command);
@@ -250,6 +343,11 @@ async fn run_session(
             .build_session(&cwd)
             .block_task()
             .run_until(async |mut session| {
+                let settings = settings_of(session.config_options().unwrap_or_default());
+                emit(
+                    &events,
+                    Event::Session(key, SessionEvent::Settings(settings)),
+                );
                 let waiting: VecDeque<String> = retry.take().into_iter().collect();
                 if waiting.is_empty() {
                     emit(&events, Event::SessionReady(key));
@@ -277,8 +375,8 @@ async fn run_session(
         retry = loop {
             match commands.recv().await {
                 Ok(SessionCommand::Prompt(text)) => break Some(text),
-                // No session, so nothing is running to stop.
-                Ok(SessionCommand::Cancel) => {}
+                // No session, so nothing is running to stop, and no settings to change.
+                Ok(SessionCommand::Cancel | SessionCommand::ChangeSetting(..)) => {}
                 Err(_) => return,
             }
         };
@@ -286,7 +384,8 @@ async fn run_session(
 }
 
 /// Runs the session's prompts one at a time, as they arrive, until the front end has gone.
-/// Prompts sent during a turn wait in `waiting` for their own.
+/// Prompts sent during a turn wait in `waiting` for their own, and every prompt waits
+/// for the agent to answer the setting changes sent before it.
 async fn serve(
     key: SessionKey,
     session: &mut ActiveSession<'_, Agent>,
@@ -295,6 +394,7 @@ async fn serve(
     events: &Sender<Event>,
     login_options: &[String],
 ) {
+    let mut changes = Changes::default();
     loop {
         let text = match waiting.pop_front() {
             Some(text) => text,
@@ -302,10 +402,42 @@ async fn serve(
                 Ok(SessionCommand::Prompt(text)) => text,
                 // Nothing is running, so there is nothing to stop.
                 Ok(SessionCommand::Cancel) => continue,
+                Ok(SessionCommand::ChangeSetting(setting, value)) => {
+                    // Only a closed connection fails this, which ends the session anyway.
+                    let _ = change_setting(key, session, setting, value, events, &mut changes);
+                    continue;
+                }
                 Err(_) => return,
             },
         };
-        let outcome = match run_turn(key, session, text, commands, &mut waiting, events).await {
+        // The agent may still be applying a change, and a prompt it took first would
+        // run with the setting as it was.
+        let waited =
+            wait_for_changes(key, session, &mut waiting, commands, events, &mut changes).await;
+        match waited {
+            Waited::Answered => {}
+            // Stopped before it was sent, so it never runs.
+            Waited::Stopped => {
+                let stop_reason = format!("{:?}", StopReason::Cancelled);
+                emit(
+                    events,
+                    Event::Session(key, SessionEvent::TurnEnded { stop_reason }),
+                );
+                continue;
+            }
+            Waited::Gone => return,
+        }
+        let outcome = match run_turn(
+            key,
+            session,
+            text,
+            commands,
+            &mut waiting,
+            &mut changes,
+            events,
+        )
+        .await
+        {
             Ok(reason) => SessionEvent::TurnEnded {
                 stop_reason: format!("{reason:?}"),
             },
@@ -324,6 +456,7 @@ async fn run_turn(
     text: String,
     commands: &Receiver<SessionCommand>,
     waiting: &mut VecDeque<String>,
+    changes: &mut Changes,
     events: &Sender<Event>,
 ) -> Result<StopReason, Error> {
     enum Next {
@@ -390,9 +523,220 @@ async fn run_turn(
                 }
             }
             Next::Command(Some(SessionCommand::Prompt(text))) => waiting.push_back(text),
+            Next::Command(Some(SessionCommand::ChangeSetting(setting, value))) => {
+                change_setting(key, session, setting, value, events, changes)?
+            }
             Next::Command(None) => return Err(internal_error("the session was closed")),
         }
     }
+}
+
+/// How long a prompt waits for the agent to answer the setting changes sent before it.
+/// An agent that hasn't answered by then gets the prompt anyway.
+const SETTING_ANSWER_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The session's setting changes the agent hasn't answered yet.
+#[derive(Default)]
+struct Changes {
+    queue: ChangeQueue,
+    /// Told once every change sent so far is answered, as they go one at a time.
+    last: Option<oneshot::Receiver<()>>,
+}
+
+/// The changes waiting for an answer, oldest first, shared with the callbacks that take
+/// the answers. Only the first is out at a time: each goes once the agent has answered
+/// the one before, so the agent applies them in the order they were made and the last
+/// answer is the newest.
+#[derive(Clone, Default)]
+struct ChangeQueue(Arc<Mutex<Queue>>);
+
+#[derive(Default)]
+struct Queue {
+    changes: VecDeque<Change>,
+    next_id: u64,
+}
+
+struct Change {
+    /// Tells this change's answer from a late one to a change given up on.
+    id: u64,
+    setting: String,
+    value: SettingValue,
+    /// Set by whoever sends it, so it goes out once.
+    sent: bool,
+    /// Told when the agent answers.
+    answered: oneshot::Sender<()>,
+}
+
+impl ChangeQueue {
+    fn lock(&self) -> MutexGuard<'_, Queue> {
+        // Nothing panics while holding it, so it is never poisoned.
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// How waiting for the setting changes before a prompt ended.
+enum Waited {
+    /// The agent answered them, or took too long and the front end was told so.
+    Answered,
+    /// The front end stopped the prompt.
+    Stopped,
+    /// The front end has gone.
+    Gone,
+}
+
+/// Waits for the agent to answer the setting changes sent so far, still taking
+/// commands meanwhile: a stop drops the prompt, and other prompts and changes queue up.
+/// After `SETTING_ANSWER_TIMEOUT`, the changes the agent still owes are given up on and
+/// reported failed.
+async fn wait_for_changes(
+    key: SessionKey,
+    session: &ActiveSession<'_, Agent>,
+    waiting: &mut VecDeque<String>,
+    commands: &Receiver<SessionCommand>,
+    events: &Sender<Event>,
+    changes: &mut Changes,
+) -> Waited {
+    enum Next {
+        Answered,
+        TimedOut,
+        Command(Option<SessionCommand>),
+    }
+    let mut deadline = smol::Timer::after(SETTING_ANSWER_TIMEOUT);
+    while let Some(answer) = changes.last.as_mut() {
+        let answered = async {
+            let _ = answer.await;
+            Next::Answered
+        };
+        let timed_out = async {
+            (&mut deadline).await;
+            Next::TimedOut
+        };
+        let command = async { Next::Command(commands.recv().await.ok()) };
+        match smol::future::or(answered, smol::future::or(timed_out, command)).await {
+            Next::Answered => changes.last = None,
+            Next::TimedOut => {
+                // None of them goes out from here on, and a late answer to the one out
+                // leaves the queue alone, so the next change goes at once.
+                let given_up: Vec<Change> = changes.queue.lock().changes.drain(..).collect();
+                for change in given_up {
+                    let message = format!(
+                        "couldn't change {}: the agent didn't answer within {} s",
+                        change.setting,
+                        SETTING_ANSWER_TIMEOUT.as_secs()
+                    );
+                    let setting = change.setting;
+                    let failed = SessionEvent::SettingFailed { setting, message };
+                    emit(events, Event::Session(key, failed));
+                }
+                changes.last = None;
+            }
+            Next::Command(Some(SessionCommand::Cancel)) => return Waited::Stopped,
+            Next::Command(Some(SessionCommand::Prompt(text))) => waiting.push_back(text),
+            Next::Command(Some(SessionCommand::ChangeSetting(setting, value))) => {
+                // Only a closed connection fails this, which ends the session anyway.
+                let _ = change_setting(key, session, setting, value, events, changes);
+            }
+            Next::Command(None) => return Waited::Gone,
+        }
+    }
+    Waited::Answered
+}
+
+/// Asks the agent to change one of the session's settings, once it has answered the
+/// changes asked before, for the next prompt to wait on. The answer, the settings as
+/// they then stand, goes to the front end.
+fn change_setting(
+    key: SessionKey,
+    session: &ActiveSession<'_, Agent>,
+    setting: String,
+    value: SettingValue,
+    events: &Sender<Event>,
+    changes: &mut Changes,
+) -> Result<(), Error> {
+    let (answered, answer) = oneshot::channel();
+    changes.last = Some(answer);
+    {
+        let mut queue = changes.queue.lock();
+        let id = queue.next_id;
+        queue.next_id += 1;
+        queue.changes.push_back(Change {
+            id,
+            setting,
+            value,
+            sent: false,
+            answered,
+        });
+    }
+    send_change(
+        key,
+        session.connection().clone(),
+        session.session_id().clone(),
+        events.clone(),
+        changes.queue.clone(),
+    )
+}
+
+/// Sends the first of the session's waiting setting changes unless it is out already,
+/// and once the agent answers it, the next.
+fn send_change(
+    key: SessionKey,
+    connection: ConnectionTo<Agent>,
+    session_id: SessionId,
+    events: Sender<Event>,
+    queue: ChangeQueue,
+) -> Result<(), Error> {
+    // Claimed under the lock, so a change that two callers reach goes out once.
+    let first = queue.lock().changes.front_mut().and_then(|change| {
+        (!change.sent).then(|| {
+            change.sent = true;
+            (change.id, change.setting.clone(), change.value.clone())
+        })
+    });
+    let Some((id, setting, value)) = first else {
+        return Ok(());
+    };
+    let value = match value {
+        SettingValue::Choice(id) => SessionConfigOptionValue::value_id(id),
+        SettingValue::Switch(on) => SessionConfigOptionValue::boolean(on),
+    };
+    let request = SetSessionConfigOptionRequest::new(session_id.clone(), setting.clone(), value);
+    let callback = {
+        let (connection, queue) = (connection.clone(), queue.clone());
+        async move |result: Result<SetSessionConfigOptionResponse, Error>| {
+            let event = match result {
+                Ok(response) => SessionEvent::SettingChanged {
+                    settings: settings_of(&response.config_options),
+                    setting,
+                },
+                Err(err) => SessionEvent::SettingFailed {
+                    message: format!("couldn't change {setting}: {err}"),
+                    setting,
+                },
+            };
+            emit(&events, Event::Session(key, event));
+            // A late answer to a change given up on leaves the queue to the changes
+            // after it, which went out without waiting.
+            let answered = {
+                let mut locked = queue.lock();
+                let ours = locked.changes.front().is_some_and(|change| change.id == id);
+                ours.then(|| locked.changes.pop_front()).flatten()
+            };
+            if let Some(change) = answered {
+                let _ = change.answered.send(());
+                // Only a closed connection fails this, and then no answer will come.
+                let _ = send_change(key, connection, session_id, events, queue);
+            }
+            Ok(())
+        }
+    };
+    let sent = connection
+        .prepare_request(request)
+        .on_receiving_result(callback);
+    if sent.is_err() {
+        // No answer will come to any of them.
+        queue.lock().changes.clear();
+    }
+    sent
 }
 
 async fn handle(
@@ -515,8 +859,65 @@ fn flatten(update: SessionUpdate) -> Option<SessionEvent> {
                 .map(|entry| format!("[{:?}] {}", entry.status, entry.content))
                 .collect(),
         ),
+        SessionUpdate::ConfigOptionUpdate(update) => {
+            SessionEvent::Settings(settings_of(&update.config_options))
+        }
+        SessionUpdate::CurrentModeUpdate(update) => {
+            SessionEvent::ModeChanged(update.current_mode_id.0.to_string())
+        }
         _ => return None,
     })
+}
+
+/// The agent's session config options of the kinds we know: a pick of one of several
+/// values, or on or off.
+fn settings_of(options: &[SessionConfigOption]) -> Vec<Setting> {
+    options
+        .iter()
+        .filter_map(|option| {
+            let (value, choices) = match &option.kind {
+                SessionConfigKind::Select(select) => {
+                    let choices = match &select.options {
+                        SessionConfigSelectOptions::Ungrouped(choices) => choices.iter().collect(),
+                        SessionConfigSelectOptions::Grouped(groups) => groups
+                            .iter()
+                            .flat_map(|group| &group.options)
+                            .collect::<Vec<_>>(),
+                        _ => Vec::new(),
+                    };
+                    let choices = choices
+                        .into_iter()
+                        .map(|choice| SettingChoice {
+                            id: choice.value.0.to_string(),
+                            name: choice.name.clone(),
+                            description: choice.description.clone(),
+                        })
+                        .collect();
+                    (
+                        SettingValue::Choice(select.current_value.0.to_string()),
+                        choices,
+                    )
+                }
+                SessionConfigKind::Boolean(boolean) => {
+                    (SettingValue::Switch(boolean.current_value), Vec::new())
+                }
+                _ => return None,
+            };
+            Some(Setting {
+                id: option.id.0.to_string(),
+                name: option.name.clone(),
+                kind: match option.category {
+                    Some(SessionConfigOptionCategory::Model) => SettingKind::Model,
+                    Some(SessionConfigOptionCategory::Mode) => SettingKind::Mode,
+                    Some(SessionConfigOptionCategory::ThoughtLevel) => SettingKind::ThoughtLevel,
+                    Some(SessionConfigOptionCategory::ModelConfig) => SettingKind::ModelConfig,
+                    _ => SettingKind::Other,
+                },
+                value,
+                choices,
+            })
+        })
+        .collect()
 }
 
 fn text_of(block: &ContentBlock) -> String {
