@@ -1,6 +1,7 @@
 //! A tool call as its row keeps it: what the agent sent, made ready to draw once rather
 //! than on every frame, and how long the call ran.
 
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -18,6 +19,10 @@ const DIFF_CONTEXT: usize = 3;
 const DIFF_TIMEOUT: Duration = Duration::from_millis(50);
 /// What a tab in a command's output or a file stands for; the line is drawn as text.
 const TAB: &str = "    ";
+/// How many characters of a line the number column and a diff's sign column take, for
+/// finding the line that draws widest: 36px and 12px beside 12px monospace text.
+const NUMBER_CHARS: usize = 5;
+const SIGN_CHARS: usize = 2;
 
 pub(crate) struct ToolCall {
     pub(crate) id: String,
@@ -27,13 +32,16 @@ pub(crate) struct ToolCall {
     /// The files it works on, as the agent names them.
     pub(crate) locations: Vec<ToolLocation>,
     pub(crate) content: Vec<Shown>,
+    /// A hash of the content as the agent last sent it, so an update repeating it, as a
+    /// permission request and the call's end both do, isn't worked out again.
+    sent: Option<u64>,
     /// Lines its edits add and remove, over all its diffs.
     pub(crate) added: usize,
     pub(crate) removed: usize,
-    /// When it came in, in a live turn. ACP sends no times, so a call a loaded session
-    /// replays has none and shows no duration.
+    /// When it came in, in a live turn, or when the user allowed it to run. ACP sends no
+    /// times, so a call a loaded session replays has none and shows no duration.
     pub(crate) started: Option<Instant>,
-    /// How long it ran, from coming in to first finishing.
+    /// How long it ran, from starting to first finishing.
     pub(crate) took: Option<Duration>,
     /// The user has opened it to show its content.
     pub(crate) open: bool,
@@ -48,9 +56,11 @@ pub(crate) struct Ask {
     pub(crate) request: PermissionRequest,
     /// One for each option, so the keys can move between them.
     pub(crate) focus: Vec<FocusHandle>,
-    /// The card has shown once, when it may take the keys.
-    pub(crate) shown: bool,
+    /// The option Enter answers with from the prompt, which Up and Down move.
+    pub(crate) lit: usize,
     pub(crate) answer: Answer,
+    /// The option picked holds for later calls like this one too.
+    pub(crate) always: bool,
     /// What the card shows of the call when its content doesn't: the command a shell
     /// call would run, which is its title, or the title of a call with nothing else.
     pub(crate) preview: Option<Code>,
@@ -94,6 +104,9 @@ pub(crate) struct Diff {
     pub(crate) path: PathBuf,
     pub(crate) lines: Rc<[DiffLine]>,
     pub(crate) widest: usize,
+    /// Its lines carry their numbers in the file, which only a hunk with its start or a
+    /// new file gives.
+    pub(crate) numbered: bool,
     pub(crate) added: usize,
     pub(crate) removed: usize,
     /// The lines as they show, marked with `+` and `-`.
@@ -129,6 +142,7 @@ impl ToolCall {
             status,
             locations: Vec::new(),
             content: Vec::new(),
+            sent: None,
             added: 0,
             removed: 0,
             // One that arrives finished ran before it was shown, for no time we know.
@@ -173,8 +187,9 @@ impl ToolCall {
         self.ask = Some(Box::new(Ask {
             request,
             focus,
-            shown: false,
+            lit: 0,
             answer: Answer::Open,
+            always: false,
             preview,
         }));
     }
@@ -202,31 +217,42 @@ impl ToolCall {
                 self.took = self.started.map(|started| started.elapsed());
             }
         }
-        if let Some(content) = content {
-            self.set_content(content, cx);
-        }
+        // First, as a diff's line numbers come from them.
+        let moved = locations
+            .as_ref()
+            .is_some_and(|locations| *locations != self.locations);
         if let Some(locations) = locations {
             self.locations = locations;
         }
-    }
-
-    /// How long it has been running, while it runs in a live turn.
-    pub(crate) fn running_for(&self) -> Option<Duration> {
-        match self.status {
-            ToolStatus::InProgress if self.took.is_none() => {
-                self.started.map(|started| started.elapsed())
+        if let Some(content) = content {
+            let hash = {
+                let mut hasher = DefaultHasher::new();
+                content.hash(&mut hasher);
+                hasher.finish()
+            };
+            if self.sent != Some(hash) || moved {
+                self.sent = Some(hash);
+                self.set_content(content, cx);
             }
-            _ => None,
         }
     }
 
+    /// How long it has been running, since it came in or was allowed, while it hasn't
+    /// finished. Whether it runs at all, the caller knows from the turn and the call's
+    /// permission request.
+    pub(crate) fn running_for(&self) -> Option<Duration> {
+        let started = self.started.filter(|_| self.took.is_none())?;
+        (!self.status.finished()).then(|| started.elapsed())
+    }
+
     fn set_content(&mut self, content: Vec<ToolContent>, cx: &mut App) {
+        let mut hunks = Hunks::new(&self.locations);
         self.content = content
             .into_iter()
             .filter_map(|content| match content {
                 ToolContent::Text(text) => shown_text(text, cx),
                 ToolContent::Diff { path, old, new } => {
-                    Some(Shown::Diff(diff(path, old.as_deref().unwrap_or(""), &new)))
+                    Some(Shown::Diff(hunks.diff(path, old.as_deref(), &new)))
                 }
             })
             .collect();
@@ -237,6 +263,54 @@ impl ToolCall {
                     Shown::Diff(diff) => (a + diff.added, r + diff.removed),
                     _ => (a, r),
                 });
+    }
+}
+
+/// A call's diffs, worked out in the order they come. Claude's adapter sends an edit as
+/// the snippet it changes, with no line, and once done as one diff for each hunk, with the
+/// hunk's first line in the new file as the location at the same place. The lines earlier
+/// hunks added or removed put the old file's numbers that far off the new one's.
+struct Hunks<'a> {
+    locations: &'a [ToolLocation],
+    seen: usize,
+    /// The file the last diff was to, and how many lines its diffs so far added, less the
+    /// ones they removed.
+    shift: Option<(PathBuf, isize)>,
+}
+
+impl<'a> Hunks<'a> {
+    fn new(locations: &'a [ToolLocation]) -> Self {
+        Self {
+            locations,
+            seen: 0,
+            shift: None,
+        }
+    }
+
+    fn diff(&mut self, path: PathBuf, old: Option<&str>, new: &str) -> Diff {
+        let line = self
+            .locations
+            .get(self.seen)
+            .filter(|location| location.path == path)
+            .and_then(|location| location.line);
+        self.seen += 1;
+        let earlier = match &self.shift {
+            Some((file, lines)) if *file == path => *lines,
+            _ => 0,
+        };
+        let start = match (old, line) {
+            // A new file is all there is of it.
+            (None, _) => Some((1, 1)),
+            (Some(_), Some(line)) => {
+                let line = line as usize;
+                Some((line.saturating_add_signed(-earlier).max(1), line))
+            }
+            (Some(_), None) => None,
+        };
+        let diff = diff(path.clone(), old.unwrap_or(""), new, start);
+        let lines = earlier + diff.added as isize - diff.removed as isize;
+        self.shift = Some((path, lines));
+        diff
     }
 }
 
@@ -268,8 +342,11 @@ fn code(lines: Vec<CodeLine>) -> Code {
         .map(|line| line.text.as_ref())
         .collect::<Vec<_>>()
         .join("\n");
+    let weights = lines
+        .iter()
+        .map(|line| line.text.chars().count() + line.number.as_ref().map_or(0, |_| NUMBER_CHARS));
     Code {
-        widest: widest(lines.iter().map(|line| line.text.as_ref())),
+        widest: widest(weights),
         lines: lines.into(),
         copy: copy.into(),
     }
@@ -333,10 +410,21 @@ fn numbered_line(line: &str) -> Option<CodeLine> {
 
 /// The change from `old` to `new` as unified diff lines: each change with a few unchanged
 /// lines around it, the longer unchanged runs between changes folded into one line.
-fn diff(path: PathBuf, old: &str, new: &str) -> Diff {
+/// `start` is where the two texts begin in the file, as line numbers of the old and the
+/// new one; without it the lines go unnumbered, as a snippet's numbers would be wrong.
+fn diff(path: PathBuf, old: &str, new: &str, start: Option<(usize, usize)>) -> Diff {
+    // A last line with no line break would differ from the same line with one.
+    let ended = |text: &str| {
+        if text.is_empty() || text.ends_with('\n') {
+            text.to_string()
+        } else {
+            format!("{text}\n")
+        }
+    };
+    let (old, new) = (ended(old), ended(new));
     let text_diff = TextDiff::configure()
         .timeout(DIFF_TIMEOUT)
-        .diff_lines(old, new);
+        .diff_lines(&old, &new);
     let mut lines = Vec::new();
     let (mut added, mut removed) = (0, 0);
     let mut last_old_end = None;
@@ -353,10 +441,10 @@ fn diff(path: PathBuf, old: &str, new: &str) -> Diff {
         last_old_end = Some(last.old_range().end);
         for op in &group {
             for change in text_diff.iter_changes(op) {
-                let number = match change.tag() {
-                    ChangeTag::Delete => change.old_index(),
-                    _ => change.new_index(),
-                };
+                let number = start.and_then(|(old_start, new_start)| match change.tag() {
+                    ChangeTag::Delete => change.old_index().map(|n| n + old_start),
+                    _ => change.new_index().map(|n| n + new_start),
+                });
                 match change.tag() {
                     ChangeTag::Insert => added += 1,
                     ChangeTag::Delete => removed += 1,
@@ -365,9 +453,7 @@ fn diff(path: PathBuf, old: &str, new: &str) -> Diff {
                 let text = change.value().trim_end_matches(['\n', '\r']);
                 lines.push(DiffLine::Line {
                     change: change.tag(),
-                    number: number
-                        .map_or_else(String::new, |n| (n + 1).to_string())
-                        .into(),
+                    number: number.map_or_else(String::new, |n| n.to_string()).into(),
                     text: text.replace('\t', TAB).into(),
                 });
             }
@@ -377,38 +463,45 @@ fn diff(path: PathBuf, old: &str, new: &str) -> Diff {
         .iter()
         .map(|line| match line {
             DiffLine::Line { change, text, .. } => format!("{}{text}", change),
-            DiffLine::Folded(count) => format!("⋯ {count} unchanged lines"),
+            DiffLine::Folded(count) => folded_text(*count),
         })
         .collect::<Vec<_>>()
         .join("\n");
+    let columns = SIGN_CHARS + if start.is_some() { NUMBER_CHARS } else { 0 };
     let widest = widest(lines.iter().map(|line| match line {
-        DiffLine::Line { text, .. } => text.as_ref(),
-        DiffLine::Folded(_) => "",
+        DiffLine::Line { text, .. } => text.chars().count() + columns,
+        DiffLine::Folded(count) => folded_text(*count).chars().count(),
     }));
     Diff {
         path,
         lines: lines.into(),
         widest,
+        numbered: start.is_some(),
         added,
         removed,
         copy: copy.into(),
     }
 }
 
-/// The index of the line with the most characters. The text is drawn in a monospace
-/// font, so that line draws widest, give or take wide characters.
-fn widest<'a>(lines: impl Iterator<Item = &'a str>) -> usize {
-    lines
-        .map(|line| line.chars().count())
+/// How a diff shows `count` unchanged lines folded away.
+pub(crate) fn folded_text(count: usize) -> String {
+    format!("⋯ {count} unchanged lines")
+}
+
+/// The index of the line with the most characters, counting the columns drawn beside
+/// its text. The text is drawn in a monospace font, so that line draws widest, give or
+/// take wide characters.
+fn widest(weights: impl Iterator<Item = usize>) -> usize {
+    weights
         .enumerate()
-        .max_by_key(|(_, len)| *len)
+        .max_by_key(|(_, weight)| *weight)
         .map_or(0, |(ix, _)| ix)
 }
 
 #[cfg(test)]
 mod tests {
     // Not a glob: gpui's own `test` attribute would shadow the standard one.
-    use super::{DiffLine, code_lines, diff, fenced};
+    use super::{Diff, DiffLine, Hunks, ToolLocation, code_lines, diff, fenced};
     use similar::ChangeTag;
 
     #[test]
@@ -448,7 +541,7 @@ mod tests {
         let new = old
             .replace("line 2\n", "line two\n")
             .replace("line 18\n", "line 18\nline 18b\n");
-        let diff = diff("a.rs".into(), &old, &new);
+        let diff = diff("a.rs".into(), &old, &new, Some((1, 1)));
         assert_eq!((diff.added, diff.removed), (2, 1));
         let folded: Vec<_> = diff
             .lines
@@ -468,8 +561,44 @@ mod tests {
 
     #[test]
     fn a_new_file_is_all_added() {
-        let diff = diff("new.rs".into(), "", "a\nb\n");
+        let diff = diff("new.rs".into(), "", "a\nb\n", Some((1, 1)));
         assert_eq!((diff.added, diff.removed), (2, 0));
         assert_eq!(diff.copy.as_ref(), "+a\n+b");
+    }
+
+    #[test]
+    fn a_last_line_without_a_break_is_no_change() {
+        let diff = diff("a.rs".into(), "a\nb", "a\nb\nc", None);
+        assert_eq!((diff.added, diff.removed), (1, 0));
+        assert_eq!(diff.copy.as_ref(), " a\n b\n+c");
+        assert!(!diff.numbered);
+    }
+
+    fn numbers(diff: &Diff) -> Vec<&str> {
+        diff.lines
+            .iter()
+            .filter_map(|line| match line {
+                DiffLine::Line { number, .. } => Some(number.as_ref()),
+                DiffLine::Folded(_) => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn hunks_are_numbered_from_where_they_start() {
+        let at = |line| ToolLocation {
+            path: "a.rs".into(),
+            line: Some(line),
+        };
+        let locations = [at(10), at(41)];
+        let mut hunks = Hunks::new(&locations);
+        let first = hunks.diff("a.rs".into(), Some("x\ny\n"), "x\n1\n2\ny\n");
+        // The two lines added at 11 put the second hunk's old line 39 at 41.
+        let second = hunks.diff("a.rs".into(), Some("p\nq\n"), "p\nr\n");
+        assert_eq!(numbers(&first), ["10", "11", "12", "13"]);
+        assert_eq!(numbers(&second), ["41", "40", "42"]);
+        // A snippet with no line to start from goes unnumbered.
+        let snippet = Hunks::new(&[]).diff("a.rs".into(), Some("x\n"), "y\n");
+        assert!(!snippet.numbered && numbers(&snippet).iter().all(|n| n.is_empty()));
     }
 }

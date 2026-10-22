@@ -80,7 +80,7 @@ impl TranscriptScroll {
     }
 
     /// Whether the newest text is out of view, which brings up the button back to it.
-    fn scrolled_up(&self) -> bool {
+    pub(crate) fn scrolled_up(&self) -> bool {
         if switches().follow {
             !self.list.is_following_tail()
         } else {
