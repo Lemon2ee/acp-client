@@ -581,16 +581,17 @@ impl ChatView {
                 .text_color(color)
                 .child(text)
         };
-        let shown = if let Some((keystroke, _)) = refused {
-            text(Kbd::format(keystroke), refused_color)
-                .font_weight(FontWeight::MEDIUM)
-                .into_any_element()
-        } else if recording && recorder.held.modified() {
+        // The modifiers of the next try, once any are down, over the keys turned down.
+        let shown = if recording && recorder.held.modified() {
             let held = Keystroke {
                 modifiers: recorder.held,
                 ..Default::default()
             };
             text(format!("{}…", Kbd::format(&held)), theme.foreground)
+                .font_weight(FontWeight::MEDIUM)
+                .into_any_element()
+        } else if let Some((keystroke, _)) = refused {
+            text(Kbd::format(keystroke), refused_color)
                 .font_weight(FontWeight::MEDIUM)
                 .into_any_element()
         } else if recording {
@@ -891,6 +892,7 @@ impl ChatView {
             Err(refusal) => {
                 let recorder = &mut self.settings_page.recorder;
                 recorder.refused = Some((keystroke, refusal));
+                // Still down, but the keys turned down show until the modifiers change.
                 recorder.held = Modifiers::default();
             }
         }
