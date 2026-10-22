@@ -37,6 +37,7 @@ use crate::config::{
     AppSettings, SavedSession, change_saved_sessions, config_folder, kept_name, load_last_settings,
     load_saved_sessions, save_last_settings,
 };
+use crate::hotkey::{self, GlobalShortcut};
 use crate::session::{Origin, Row, Session};
 
 /// One agent the window drives, and what it keeps ready on it.
@@ -92,9 +93,16 @@ pub(crate) struct ChatView {
     sidebar: SidebarState,
     model_panel: ModelPanelState,
     settings_page: SettingsPageState,
+    /// The system-wide shortcut the settings name, as macOS holds it for the app.
+    global_shortcut: GlobalShortcut,
     _input_events: Subscription,
     _bounds_events: Subscription,
     _settings_events: Subscription,
+    _activation_events: Subscription,
+    _recorder_keys: Subscription,
+    _layout_events: Subscription,
+    /// None where there is no system-wide shortcut.
+    _shortcut_presses: Option<Task<()>>,
 }
 
 impl ChatView {
@@ -132,6 +140,47 @@ impl ChatView {
         });
         let settings_events = cx.observe_global_in::<AppSettings>(window, |this, window, cx| {
             this.apply_settings(window, cx)
+        });
+        // The recorder lets go of the shortcut while it records, so it stops when the
+        // window goes to the back rather than leave the shortcut let go of.
+        let activation_events = cx.observe_window_activation(window, |this, window, cx| {
+            if !window.is_window_active() {
+                this.stop_recording(cx);
+            }
+        });
+        // Before the window's own shortcuts, so that a key being recorded does nothing
+        // else, even Cmd+Q.
+        let view = cx.entity().downgrade();
+        let recorder_keys = cx.intercept_keystrokes(move |event, _, cx| {
+            let taken = view
+                .update(cx, |this, cx| this.record_keystroke(&event.keystroke, cx))
+                .unwrap_or_default();
+            if taken {
+                cx.stop_propagation();
+            }
+        });
+        // macOS holds the shortcut by the key that types it, which another layout may
+        // put elsewhere.
+        let view = cx.entity().downgrade();
+        let layout_events = cx.on_keyboard_layout_change(move |cx| {
+            let _ = view.update(cx, |this, cx| {
+                this.global_shortcut.sync(true, cx);
+                cx.notify();
+            });
+        });
+        // Listened for before the shortcut is first held, so that no press is missed.
+        let shortcut_presses = hotkey::presses().map(|presses| {
+            cx.spawn_in(window, async move |this, cx| {
+                while presses.recv().await.is_ok() {
+                    let pressed = this.update_in(cx, |_, window, cx| {
+                        let hide = cx.global::<AppSettings>().hide_when_in_front;
+                        hotkey::bring_to_front(hide, window, cx);
+                    });
+                    if pressed.is_err() {
+                        break;
+                    }
+                }
+            })
         });
         // The app menu's Settings… and Cmd+, come here from wherever the focus is, or from
         // nowhere, as nothing in the window handles them. That is inside the window's own
@@ -198,10 +247,16 @@ impl ChatView {
             sidebar: SidebarState::default(),
             model_panel: ModelPanelState::new(window, cx),
             settings_page: SettingsPageState::new(cx),
+            global_shortcut: GlobalShortcut::default(),
             _input_events: input_events,
             _bounds_events: bounds_events,
             _settings_events: settings_events,
+            _activation_events: activation_events,
+            _recorder_keys: recorder_keys,
+            _layout_events: layout_events,
+            _shortcut_presses: shortcut_presses,
         };
+        view.global_shortcut.sync(false, cx);
         view.restore_sessions(cx);
         // On the first agent, whatever agent the oldest kept session is on, and even if
         // that agent is already gone, so there is always a session to show.
@@ -286,6 +341,7 @@ impl ChatView {
         apply_appearance(window, cx);
         let blur = cx.global::<AppSettings>().window_blur;
         self.set_window_blur(blur, window, cx);
+        self.global_shortcut.sync(false, cx);
         cx.notify();
     }
 

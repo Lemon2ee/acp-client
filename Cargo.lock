@@ -113,6 +113,7 @@ dependencies = [
  "raw-window-handle",
  "serde",
  "serde_json",
+ "smol",
  "tracing-subscriber",
  "tracing-tracy",
 ]

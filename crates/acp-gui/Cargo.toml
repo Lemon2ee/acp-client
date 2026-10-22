@@ -26,6 +26,8 @@ gpui-kit = "0.8"
 # settings between runs.
 serde.workspace = true
 serde_json.workspace = true
+# Hands the system-wide shortcut's presses from Carbon's callback to the window.
+smol.workspace = true
 
 # Only for `profile`. Not used here directly: turning on Tracy in `profiling` makes the
 # zones gpui already marks (each window draw, present and input dispatch, and a frame
@@ -45,11 +47,13 @@ tracing-tracy = { version = "0.11", features = [
     "only-localhost",
 ], optional = true }
 
-# Reads the traffic lights' size and spacing from AppKit. gpui's macOS layer already
-# builds these crates at these versions, with these features.
+# Reads the traffic lights' size and spacing from AppKit, and shows the hidden app and
+# the minimized window for the system-wide shortcut. gpui's macOS layer already builds
+# these crates at these versions, with these features.
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3.2", default-features = false, features = [
+    "NSApplication",
     "NSButton",
     "NSControl",
     "NSResponder",

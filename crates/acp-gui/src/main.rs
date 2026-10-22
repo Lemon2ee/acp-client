@@ -5,6 +5,7 @@
 mod chat_view;
 mod chrome;
 mod config;
+mod hotkey;
 mod session;
 
 use std::borrow::Cow;
