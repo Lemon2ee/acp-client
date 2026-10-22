@@ -25,6 +25,7 @@ clearly needs splitting. acp-gui is split by what each part keeps or draws:
 | `config.rs` | What is kept on disk between runs: `AppSettings`, the starred models, each agent's last settings, the kept sessions. |
 | `hotkey.rs` | The system-wide shortcut that brings the window to the front: what it can't be, holding it with macOS through Carbon, and what a press does. |
 | `session.rs` | `Session`: one conversation's transcript rows and settings, and how each `SessionEvent` lands on it. |
+| `session/pacing.rs` | The agent's text in a live turn, held back and shown at an even pace, and where it may stop so half-arrived markdown never shows. |
 | `chrome.rs` | The window around the content: the macOS title bar row, the traffic lights, the blur, the light or dark theme. |
 | `chat_view.rs` | `ChatView`: the agents, the sessions and what happens to them, and the window's layout (`Render`). |
 | `chat_view/transcript.rs` | How each row of a transcript is drawn. |
@@ -44,6 +45,7 @@ cargo run -p acp-gui                # Claude and Codex, picked between from the 
 cargo run -p acp-gui -- claude     # or: codex, or "<any shell-style agent command>"
 cargo run -p acp-cli -- claude
 cargo run --release -p acp-gui --features profile   # see "Profiling" below
+cargo test -p acp-gui
 cargo clippy --workspace --all-targets
 cargo fmt --all
 ```
@@ -52,8 +54,9 @@ cargo fmt --all
   Bump those pins deliberately; they tie the adapter to the agent CLI it was tested with.
 - Build output goes to `target.nosync/` (see `.cargo/config.toml`): `~/Documents` syncs to
   iCloud, which skips `.nosync` names. Do not change the target dir.
-- There are no tests yet. "Verified" means `cargo build`, `cargo clippy` and `cargo fmt`
-  are clean, plus a run of the affected front end when the change is user-visible.
+- Tests are few: only acp-gui's pacing rules have unit tests, as plain functions need no
+  window. "Verified" means `cargo build`, `cargo test`, `cargo clippy` and `cargo fmt` are
+  clean, plus a run of the affected front end when the change is user-visible.
 - `profile` is off by default, so clippy also needs a run with `-p acp-gui --features profile`
   when a change touches it.
 - Do not start `ACPClient.app` or run `.claude/hooks/run-latest-app.sh` unless the user asks.

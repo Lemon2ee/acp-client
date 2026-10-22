@@ -30,6 +30,11 @@
     "args": ["run", "-p", "acp-cli", "--", "codex"]
   },
   {
+    "label": "test: acp-gui",
+    "command": "cargo",
+    "args": ["test", "-p", "acp-gui"]
+  },
+  {
     "label": "clippy: workspace",
     "command": "cargo",
     "args": ["clippy", "--workspace", "--all-targets"]
