@@ -1559,7 +1559,15 @@ impl Render for ChatView {
                         .focus_ring(false)
                         // With the 44px row below it, the box is 129px tall until the
                         // text needs more room, with the text at the top.
-                        .input(Textarea::new(&self.input).min_h(px(85.)))
+                        .input(
+                            Textarea::new(&self.input)
+                                .min_h(px(85.))
+                                // On top of the textarea's own 10px and 8px, so the
+                                // text starts 17px in from the left, level with the
+                                // model button's label, and its capitals 17px down.
+                                .px(px(6.))
+                                .pt(px(4.)),
+                        )
                         .addon(
                             InputGroupAddon::new("prompt-actions")
                                 .align(InputGroupAddonAlignment::BlockEnd)
