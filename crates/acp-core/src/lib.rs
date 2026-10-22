@@ -46,8 +46,9 @@ pub enum Command {
     /// Sets one of the session's settings, by id, during a turn or not. Answered with
     /// `SettingChanged`, or `SettingFailed`; a prompt sent after it waits for the answer.
     ChangeSetting(SessionKey, String, SettingValue),
-    /// Drops the session: no more of its commands are taken, and no more of its events
-    /// come once its task has ended. A turn in flight is left to the agent.
+    /// Drops the session: its task is cancelled, whether it is still creating the
+    /// session or running a turn, so no more of its events come. The agent is left
+    /// to finish whatever it was doing for it.
     CloseSession(SessionKey),
 }
 
@@ -294,7 +295,9 @@ async fn run(
             // Each session runs as a task on this thread: turns in different sessions
             // overlap, and a slow `session/new` never holds up other sessions' commands.
             let tasks = smol::LocalExecutor::new();
-            let mut sessions: HashMap<SessionKey, Sender<SessionCommand>> = HashMap::new();
+            // Each session's queue and its task, which dropping cancels.
+            let mut sessions: HashMap<SessionKey, (Sender<SessionCommand>, smol::Task<()>)> =
+                HashMap::new();
             tasks
                 .run(async {
                     while let Some(command) = next_command(commands, &cx).await? {
@@ -302,17 +305,15 @@ async fn run(
                             Command::NewSession(key) => {
                                 if let Entry::Vacant(entry) = sessions.entry(key) {
                                     let (command_tx, command_rx) = smol::channel::unbounded();
-                                    entry.insert(command_tx);
-                                    tasks
-                                        .spawn(run_session(
-                                            key,
-                                            cx.clone(),
-                                            cwd.to_path_buf(),
-                                            command_rx,
-                                            events.clone(),
-                                            login_options.clone(),
-                                        ))
-                                        .detach();
+                                    let task = tasks.spawn(run_session(
+                                        key,
+                                        cx.clone(),
+                                        cwd.to_path_buf(),
+                                        command_rx,
+                                        events.clone(),
+                                        login_options.clone(),
+                                    ));
+                                    entry.insert((command_tx, task));
                                 }
                                 continue;
                             }
@@ -322,12 +323,13 @@ async fn run(
                                 (key, SessionCommand::ChangeSetting(setting, value))
                             }
                             Command::CloseSession(key) => {
-                                // Its task ends once it finds its queue closed.
+                                // Dropping the task cancels it where it is, so neither
+                                // a `session/new` still out nor a queued prompt goes on.
                                 sessions.remove(&key);
                                 continue;
                             }
                         };
-                        if let Some(session) = sessions.get(&key) {
+                        if let Some((session, _)) = sessions.get(&key) {
                             let _ = session.try_send(command);
                         }
                     }

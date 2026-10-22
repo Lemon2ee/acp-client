@@ -405,6 +405,10 @@ impl ChatView {
         if self.agents[agent].commands.is_closed() && !self.sessions.is_empty() {
             return;
         }
+        // Another go for any agent whose spare failed to be created.
+        for ix in 0..self.agents.len() {
+            self.make_spare(ix, cx);
+        }
         let session = self.take_session(agent, cx);
         self.sessions.push(session);
         self.show(self.sessions.len() - 1, window, cx);
@@ -651,7 +655,15 @@ impl ChatView {
                 }
             }
             AgentEvent::SessionFailed(key, message) => {
-                if let Some(session) = self.session_mut(key) {
+                let spare = &mut self.agents[agent].spare;
+                if spare.as_ref().is_some_and(|spare| spare.key == key) {
+                    // Nobody would prompt the spare to have it created again, so it goes,
+                    // and the next session added makes another. Its error shows where
+                    // the user is.
+                    *spare = None;
+                    let message = format!("{}: {message}", self.agents[agent].name);
+                    self.sessions[self.active].push(Row::Error(message), cx);
+                } else if let Some(session) = self.session_mut(key) {
                     // Open for a prompt, which asks the agent to create the session again.
                     session.busy = false;
                     session.push(Row::Error(message), cx);
