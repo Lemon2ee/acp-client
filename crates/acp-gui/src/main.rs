@@ -1280,26 +1280,10 @@ fn mode_icon(id: &str) -> gpui_kit::assets::IconName {
 
 impl ChatView {
     /// The button for the model and how hard it thinks, named like "Opus 5.5 High",
-    /// once the agent offers either. Its menu opens upward: a switch for each of the
-    /// model's settings that are on or off, then a row for each of its others, whose
-    /// choices open beside it.
+    /// once the agent offers any of the model's settings. Its menu opens upward: a
+    /// switch for each of them that is on or off, then a row for each of the others,
+    /// whose choices open beside it.
     fn render_model_picker(&self, session: &Session, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let names: Vec<&str> = [SettingKind::Model, SettingKind::ThoughtLevel]
-            .into_iter()
-            .filter_map(|kind| {
-                shown_choice(
-                    session
-                        .settings
-                        .iter()
-                        .find(|setting| setting.kind == kind)?,
-                )
-            })
-            .map(|choice| choice.name.as_str())
-            .collect();
-        if names.is_empty() {
-            return None;
-        }
-        let label = names.join(" ");
         let settings: Vec<Setting> = [
             SettingKind::ModelConfig,
             SettingKind::ThoughtLevel,
@@ -1314,6 +1298,28 @@ impl ChatView {
         })
         .map(|setting| session.shown(setting))
         .collect();
+        if settings.is_empty() {
+            return None;
+        }
+        let names: Vec<&str> = [SettingKind::Model, SettingKind::ThoughtLevel]
+            .into_iter()
+            .filter_map(|kind| {
+                shown_choice(
+                    session
+                        .settings
+                        .iter()
+                        .find(|setting| setting.kind == kind)?,
+                )
+            })
+            .map(|choice| choice.name.as_str())
+            .collect();
+        // An agent that offers neither the model nor how hard it thinks still gets the
+        // button, for its other settings of the model.
+        let label = if names.is_empty() {
+            "Model".to_string()
+        } else {
+            names.join(" ")
+        };
         let view = cx.entity().downgrade();
         let key = session.key;
         let open_list = self.model_menu.list.clone();
