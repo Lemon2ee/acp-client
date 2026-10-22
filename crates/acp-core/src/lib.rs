@@ -538,21 +538,31 @@ struct Changes {
 }
 
 /// The changes waiting for an answer, oldest first, shared with the callbacks that take
-/// the answers. Only the first has been sent: each goes once the agent has answered the
-/// one before, so the agent applies them in the order they were made and the last
+/// the answers. Only the first is out at a time: each goes once the agent has answered
+/// the one before, so the agent applies them in the order they were made and the last
 /// answer is the newest.
 #[derive(Clone, Default)]
-struct ChangeQueue(Arc<Mutex<VecDeque<Change>>>);
+struct ChangeQueue(Arc<Mutex<Queue>>);
+
+#[derive(Default)]
+struct Queue {
+    changes: VecDeque<Change>,
+    next_id: u64,
+}
 
 struct Change {
+    /// Tells this change's answer from a late one to a change given up on.
+    id: u64,
     setting: String,
     value: SettingValue,
+    /// Set by whoever sends it, so it goes out once.
+    sent: bool,
     /// Told when the agent answers.
     answered: oneshot::Sender<()>,
 }
 
 impl ChangeQueue {
-    fn lock(&self) -> MutexGuard<'_, VecDeque<Change>> {
+    fn lock(&self) -> MutexGuard<'_, Queue> {
         // Nothing panics while holding it, so it is never poisoned.
         self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -570,7 +580,8 @@ enum Waited {
 
 /// Waits for the agent to answer the setting changes sent so far, still taking
 /// commands meanwhile: a stop drops the prompt, and other prompts and changes queue up.
-/// After `SETTING_ANSWER_TIMEOUT`, each change the agent still owes is reported failed.
+/// After `SETTING_ANSWER_TIMEOUT`, the changes the agent still owes are given up on and
+/// reported failed.
 async fn wait_for_changes(
     key: SessionKey,
     session: &ActiveSession<'_, Agent>,
@@ -598,13 +609,16 @@ async fn wait_for_changes(
         match smol::future::or(answered, smol::future::or(timed_out, command)).await {
             Next::Answered => changes.last = None,
             Next::TimedOut => {
-                for change in changes.queue.lock().iter() {
+                // None of them goes out from here on, and a late answer to the one out
+                // leaves the queue alone, so the next change goes at once.
+                let given_up: Vec<Change> = changes.queue.lock().changes.drain(..).collect();
+                for change in given_up {
                     let message = format!(
                         "couldn't change {}: the agent didn't answer within {} s",
                         change.setting,
                         SETTING_ANSWER_TIMEOUT.as_secs()
                     );
-                    let setting = change.setting.clone();
+                    let setting = change.setting;
                     let failed = SessionEvent::SettingFailed { setting, message };
                     emit(events, Event::Session(key, failed));
                 }
@@ -635,17 +649,17 @@ fn change_setting(
 ) -> Result<(), Error> {
     let (answered, answer) = oneshot::channel();
     changes.last = Some(answer);
-    let first = {
+    {
         let mut queue = changes.queue.lock();
-        queue.push_back(Change {
+        let id = queue.next_id;
+        queue.next_id += 1;
+        queue.changes.push_back(Change {
+            id,
             setting,
             value,
+            sent: false,
             answered,
         });
-        queue.len() == 1
-    };
-    if !first {
-        return Ok(());
     }
     send_change(
         key,
@@ -656,8 +670,8 @@ fn change_setting(
     )
 }
 
-/// Sends the first of the session's waiting setting changes, and once the agent
-/// answers it, the next.
+/// Sends the first of the session's waiting setting changes unless it is out already,
+/// and once the agent answers it, the next.
 fn send_change(
     key: SessionKey,
     connection: ConnectionTo<Agent>,
@@ -665,11 +679,14 @@ fn send_change(
     events: Sender<Event>,
     queue: ChangeQueue,
 ) -> Result<(), Error> {
-    let first = queue
-        .lock()
-        .front()
-        .map(|change| (change.setting.clone(), change.value.clone()));
-    let Some((setting, value)) = first else {
+    // Claimed under the lock, so a change that two callers reach goes out once.
+    let first = queue.lock().changes.front_mut().and_then(|change| {
+        (!change.sent).then(|| {
+            change.sent = true;
+            (change.id, change.setting.clone(), change.value.clone())
+        })
+    });
+    let Some((id, setting, value)) = first else {
         return Ok(());
     };
     let value = match value {
@@ -688,11 +705,18 @@ fn send_change(
                 },
             };
             emit(&events, Event::Session(key, event));
-            if let Some(change) = queue.lock().pop_front() {
+            // A late answer to a change given up on leaves the queue to the changes
+            // after it, which went out without waiting.
+            let answered = {
+                let mut locked = queue.lock();
+                let ours = locked.changes.front().is_some_and(|change| change.id == id);
+                ours.then(|| locked.changes.pop_front()).flatten()
+            };
+            if let Some(change) = answered {
                 let _ = change.answered.send(());
+                // Only a closed connection fails this, and then no answer will come.
+                let _ = send_change(key, connection, session_id, events, queue);
             }
-            // Only a closed connection fails this, and then no answer will come.
-            let _ = send_change(key, connection, session_id, events, queue);
             Ok(())
         }
     };
@@ -701,7 +725,7 @@ fn send_change(
         .on_receiving_result(callback);
     if sent.is_err() {
         // No answer will come to any of them.
-        queue.lock().clear();
+        queue.lock().changes.clear();
     }
     sent
 }
