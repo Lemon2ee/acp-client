@@ -1061,6 +1061,8 @@ const MENU_ROW_GAP: Pixels = px(2.);
 const LIST_ROW_HEIGHT: Pixels = px(32.);
 /// How tall the line naming an agent above its models is, in the model list.
 const LIST_HEADER_HEIGHT: Pixels = px(24.);
+/// The gap between a list and what it opens beside, the menu or another list.
+const LIST_GAP: Pixels = px(4.);
 /// How long a change to the model menu's open lists waits, while the pointer heads for
 /// a list the change would close, before looking again at where the pointer went.
 const MENU_HOVER_DELAY: Duration = Duration::from_millis(300);
@@ -1397,7 +1399,7 @@ impl ModelMenu<'_> {
             .id(id)
             .absolute()
             .left(relative(1.))
-            .ml_1()
+            .ml(LIST_GAP)
             .bottom(bottom)
             .min_w(px(160.))
             .popover_style(cx)
@@ -1425,6 +1427,27 @@ impl ModelMenu<'_> {
     }
 }
 
+/// `surface`, a panel with the popover style, fading in on `animation` as it moves the
+/// last of the way into place: `place` puts it `rest` of the way back, from 1 down to 0.
+/// GPUI has no transform for a whole panel, so it moves by its offsets, and fades each
+/// thing it paints alone rather than the panel as one, so a half-faded panel would show
+/// its own shadow through it. The shadow comes in by the cube of the fade instead, out
+/// of sight until the panel covers it, as the component library's dropdowns do. With
+/// reduced motion on, GPUI draws the panel in place at once.
+fn come_in<E: Styled + IntoElement + 'static>(
+    surface: E,
+    id: impl Into<ElementId>,
+    animation: Animation,
+    place: impl Fn(E, f32) -> E + 'static,
+) -> AnimationElement<E> {
+    surface.with_animation(id, animation, move |mut surface, delta| {
+        for shadow in surface.style().box_shadow.iter_mut().flatten() {
+            shadow.color.a *= delta.powi(3);
+        }
+        place(surface, 1. - delta).opacity(delta)
+    })
+}
+
 /// The model menu: a row for each setting, and beside the row whose list is open, a
 /// list of that setting's choices. Claude's older models are a level further down.
 /// Each list's bottom is level with the row it opens from, so it opens upward like
@@ -1438,9 +1461,28 @@ fn model_menu(
     added: &[String],
     window: &Window,
     cx: &App,
-) -> Div {
+) -> AnimationElement<Div> {
     let (accent, accent_foreground, muted) = (menu.accent, menu.accent_foreground, menu.muted);
     let border = cx.theme().border;
+    // The menu rises out of its button as it fades in, and a list comes out of what it
+    // is beside. A list takes the theme's fast time rather than its normal one, as the
+    // pointer opens several on its way to a pick. No row fades its highlight: the
+    // pointer sweeps across them, and the system's own menus light theirs at once.
+    let motion = cx.theme().motion_tokens();
+    let travel = motion.distance_short.to_pixels(window.rem_size());
+    let enter = |duration| {
+        let easing = motion.easing_enter.clone();
+        Animation::new(duration).with_easing(move |t| easing.sample(t))
+    };
+    // Keyed by `id`, so a list opened in place of another comes in afresh.
+    let list_in = |frame: Stateful<Div>, id: String| {
+        come_in(
+            frame,
+            ElementId::Name(id.into()),
+            enter(motion.duration_fast),
+            move |frame, rest| frame.ml(LIST_GAP - travel * rest),
+        )
+    };
     // Where the open lists are drawn, so a press in them leaves the menu open, and the
     // pointer's way to them can be told. Set as they are drawn; a closed list has none.
     let (list_bounds, older_bounds) = (menu.list_bounds.clone(), menu.older_bounds.clone());
@@ -1580,7 +1622,7 @@ fn model_menu(
                 cx,
             );
             let older = claude.filter(|models| !models.older.is_empty());
-            frame
+            let frame = frame
                 .when_some(older, |frame, models| {
                     let older_list = older_open.then(|| {
                         let rows = models
@@ -1598,14 +1640,15 @@ fn model_menu(
                             })
                             .collect();
                         // Level with the row that opens it, above the other agents' groups.
-                        menu.list(
+                        let older = menu.list(
                             "model-menu-older",
                             rows,
                             others_height,
                             older_bounds.clone(),
                             window,
                             cx,
-                        )
+                        );
+                        list_in(older, "model-menu-older-in".into())
                     });
                     frame
                         .child(
@@ -1632,11 +1675,12 @@ fn model_menu(
                         )
                         .children(older_list)
                 })
-                .children(other_groups)
+                .children(other_groups);
+            list_in(frame, format!("model-menu-in-{}", setting.id))
         });
 
     let popover = menu.popover.clone();
-    div()
+    let surface = div()
         .relative()
         .min_w(px(250.))
         .popover_style(cx)
@@ -1661,7 +1705,15 @@ fn model_menu(
             }
         })
         .children(rows)
-        .children(list)
+        .children(list);
+    // It opens upward, so it starts nearer the button below it. The popover is drawn
+    // only while open, so each open plays this afresh.
+    come_in(
+        surface,
+        "model-menu-in",
+        enter(motion.duration_normal),
+        move |surface, rest| surface.top(travel * rest),
+    )
 }
 
 /// A row of the mode menu: the mode's icon and name, what it does below the name, and
