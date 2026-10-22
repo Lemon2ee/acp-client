@@ -26,6 +26,7 @@ use agent_client_protocol::{
     ActiveSession, Agent, Client, ConnectionTo, Dispatch, Responder, SessionMessage,
 };
 use futures::channel::oneshot;
+use serde::{Deserialize, Serialize};
 pub use smol::channel::{Receiver, Sender};
 
 /// Names a session on the connection. The front end picks it, so it can show the
@@ -112,7 +113,9 @@ pub enum SessionEvent {
 }
 
 /// Something the agent lets the user choose for one session, such as its model.
-#[derive(Clone)]
+/// Serializable so a front end can show the settings from its last run while the
+/// agent creates a session.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Setting {
     pub id: String,
     pub name: String,
@@ -133,7 +136,7 @@ impl Setting {
 }
 
 /// What a setting is for, where the agent says.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SettingKind {
     Model,
     Mode,
@@ -145,7 +148,7 @@ pub enum SettingKind {
 }
 
 /// A setting's value.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SettingValue {
     /// The id of one of the setting's choices.
     Choice(String),
@@ -153,7 +156,7 @@ pub enum SettingValue {
     Switch(bool),
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SettingChoice {
     pub id: String,
     pub name: String,
