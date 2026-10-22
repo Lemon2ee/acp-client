@@ -28,6 +28,14 @@ pub(crate) struct AppSettings {
     pub(crate) appearance: Appearance,
     /// Whether the window blurs what is behind it, where `WINDOW_BLUR` says it can.
     pub(crate) window_blur: bool,
+    /// Whether the system-wide shortcut brings the window to the front, where
+    /// `GLOBAL_SHORTCUT` says there can be one.
+    pub(crate) bring_to_front: bool,
+    /// That shortcut, as gpui writes a keystroke (`ctrl-alt-a`). None until one is
+    /// recorded, and kept while the shortcut is off.
+    pub(crate) bring_to_front_shortcut: Option<String>,
+    /// Whether pressing it with the window in front already hides the app.
+    pub(crate) hide_when_in_front: bool,
 }
 
 impl Global for AppSettings {}
@@ -38,6 +46,10 @@ impl Default for AppSettings {
             appearance: Appearance::System,
             // The translucent window is the app's own look; the switch turns it off.
             window_blur: true,
+            // Nothing is taken from other apps until the user asks.
+            bring_to_front: false,
+            bring_to_front_shortcut: None,
+            hide_when_in_front: false,
         }
     }
 }
