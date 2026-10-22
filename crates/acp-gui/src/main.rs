@@ -14,7 +14,9 @@ use acp_core::{
     Setting, SettingChoice, SettingKind, SettingValue,
 };
 use gpui_kit::base::input::Copy;
-use gpui_kit::base::{ElementExt as _, SelectableText, TextSelection, Transition, transition};
+use gpui_kit::base::{
+    ElementExt as _, HandleEdge, SelectableText, TextSelection, Transition, transition,
+};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{
     InputEvent, InputGroup, InputGroupAddon, InputGroupAddonAlignment, InputGroupButton, Textarea,
@@ -27,7 +29,7 @@ use gpui_kit::component::switch::Switch;
 use gpui_kit::component::text::{TextView, TextViewState};
 use gpui_kit::component::{
     ActiveTheme as _, FocusableExt as _, Icon, IconName, Sizable as _, Theme, ThemeConfig,
-    ThemeStyled as _, h_flex, v_flex,
+    ThemeStyled as _, h_flex, resize_handle, v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -272,6 +274,8 @@ struct ChatView {
     /// Where the traffic lights end, from the window's left edge.
     traffic_lights_end: Pixels,
     sidebar_open: bool,
+    /// How wide the sidebar is while shown. Dragged at its right edge.
+    sidebar_width: Pixels,
     model_menu: ModelMenuState,
     /// Older Claude models the user added to the model list, by id. Kept on disk.
     added_models: Vec<String>,
@@ -323,6 +327,7 @@ impl ChatView {
             title_bar_height,
             traffic_lights_end,
             sidebar_open: true,
+            sidebar_width: SIDEBAR_WIDTH,
             model_menu: ModelMenuState::default(),
             added_models: load_added_models(),
             _events: events_task,
@@ -698,7 +703,22 @@ fn row_id(kind: &str, key: SessionKey, ix: usize) -> ElementId {
     ElementId::Name(format!("{kind}-{}-{ix}", key.0).into())
 }
 
-const SIDEBAR_WIDTH: f32 = 240.;
+/// How wide the sidebar starts, and how narrow or wide a drag can make it. The minimum
+/// keeps the sidebar button and the "New session" row whole.
+const SIDEBAR_WIDTH: Pixels = px(240.);
+const SIDEBAR_MIN_WIDTH: Pixels = px(180.);
+const SIDEBAR_MAX_WIDTH: Pixels = px(480.);
+
+/// What a drag of the sidebar's edge carries. gpui tells drags apart by this type, and
+/// draws it under the pointer: nothing, since the sidebar itself follows the pointer.
+#[derive(Clone)]
+struct ResizeSidebar;
+
+impl Render for ResizeSidebar {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        Empty
+    }
+}
 
 /// The sidebar button's icon: a window outline with a short bar near its right side.
 const SIDEBAR_ICON: &[u8] = include_bytes!("../assets/sidebar.svg");
@@ -1491,11 +1511,7 @@ impl ChatView {
 
     fn render_sidebar(&self, title_bar: bool, cx: &mut Context<Self>) -> Div {
         let theme = cx.theme();
-        let (foreground, hover, divider) = (
-            theme.sidebar_foreground,
-            theme.secondary,
-            theme.sidebar_border,
-        );
+        let (foreground, hover) = (theme.sidebar_foreground, theme.secondary);
         let (accent, accent_foreground) = (theme.sidebar_accent, theme.sidebar_accent_foreground);
         // Newest first; the session on screen gets a filled card.
         let cards =
@@ -1529,15 +1545,27 @@ impl ChatView {
                     }))
             });
         div()
-            .w(px(SIDEBAR_WIDTH))
+            .w(self.sidebar_width)
             .flex_none()
             .h_full()
+            .relative()
             .flex()
             .flex_col()
-            // The line between the sidebar and the chat, which goes with the sidebar.
-            .border_r_1()
-            .border_color(divider)
             .text_color(foreground)
+            .child(
+                // The line between the sidebar and the chat, which goes with the sidebar,
+                // and the band over it that drags the sidebar's width: the root follows
+                // the drag. A double-click puts the width back.
+                resize_handle("sidebar-edge", Axis::Horizontal)
+                    .inside(HandleEdge::Trailing)
+                    .on_drag(ResizeSidebar, |_, _, _, cx| cx.new(|_| ResizeSidebar))
+                    .on_click(cx.listener(|this, event: &ClickEvent, _, cx| {
+                        if event.click_count() == 2 {
+                            this.sidebar_width = SIDEBAR_WIDTH;
+                            cx.notify();
+                        }
+                    })),
+            )
             .child(
                 // Nothing goes here: the traffic lights and the sidebar button are drawn
                 // over this row.
@@ -1619,7 +1647,7 @@ impl Render for ChatView {
             window,
             cx,
         );
-        let sidebar_width = SIDEBAR_WIDTH * (1. - hidden);
+        let sidebar_width = self.sidebar_width * (1. - hidden);
         let session = &self.sessions[self.active];
         // The model and how hard it thinks, then the mode, each once the agent has said
         // what it can be.
@@ -1760,6 +1788,21 @@ impl Render for ChatView {
             .flex()
             .bg(sidebar)
             .text_color(foreground)
+            // A drag of the sidebar's edge can leave the edge's own band within a pixel,
+            // so the whole window follows it: the sidebar ends where the pointer is.
+            // While the sidebar slides in its edge is short of its width, so a drag
+            // caught mid-slide waits for the slide to end; this listener is made anew
+            // on every frame of it.
+            .on_drag_move(
+                cx.listener(move |this, event: &DragMoveEvent<ResizeSidebar>, _, cx| {
+                    if hidden > 0. {
+                        return;
+                    }
+                    let width = event.event.position.x - event.bounds.left();
+                    this.sidebar_width = width.clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH);
+                    cx.notify();
+                }),
+            )
             // The prompt box keeps keyboard focus while text in the chat is selected, and
             // its own Copy handler would swallow cmd-c, so copy the chat's selection first.
             .capture_action(|_: &Copy, window, cx| {
@@ -1775,11 +1818,11 @@ impl Render for ChatView {
                 div()
                     .flex_none()
                     .h_full()
-                    .w(px(sidebar_width))
+                    .w(sidebar_width)
                     .overflow_hidden()
                     .child(
                         self.render_sidebar(title_bar, cx)
-                            .ml(px(sidebar_width - SIDEBAR_WIDTH)),
+                            .ml(sidebar_width - self.sidebar_width),
                     ),
             )
             .child(chat)
