@@ -22,6 +22,7 @@ Keep it that way until a file clearly needs splitting.
 ## Running and checking
 
 ```bash
+cargo run -p acp-gui                # Claude and Codex, picked between from the model menu
 cargo run -p acp-gui -- claude     # or: codex, or "<any shell-style agent command>"
 cargo run -p acp-cli -- claude
 cargo clippy --workspace --all-targets
@@ -42,7 +43,8 @@ cargo fmt --all
 
 - **Core owns the protocol; front ends own display.** Anything that talks to
   `agent_client_protocol` lives in `acp-core`. The CLI and GUI see only `Command`,
-  `Event`, `SessionEvent`, `Setting` and `PermissionRequest`.
+  `Event`, `SessionEvent`, `Setting`, `PermissionRequest` and `Harness` (the agents
+  the client can start by name).
 - **One connection, many sessions.** `SessionKey` is chosen by the front end so it can show
   a session before the agent has created it. Each session reads its commands from one
   queue in order, so a cancel never overtakes the prompt it is meant to stop.

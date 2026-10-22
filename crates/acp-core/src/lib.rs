@@ -46,6 +46,11 @@ pub enum Command {
     /// Sets one of the session's settings, by id, during a turn or not. Answered with
     /// `SettingChanged`, or `SettingFailed`; a prompt sent after it waits for the answer.
     ChangeSetting(SessionKey, String, SettingValue),
+    /// Drops the session: its task is cancelled, whether it is still creating the
+    /// session or running a turn, so no more of its events come. A permission request
+    /// the turn was waiting on is answered as cancelled; the agent is left to finish
+    /// the turn by itself.
+    CloseSession(SessionKey),
 }
 
 /// What the agent reports, flattened for display.
@@ -198,6 +203,34 @@ enum SessionCommand {
 const CLAUDE_ADAPTER: &str = "npx -y @agentclientprotocol/claude-agent-acp@0.94.0";
 const CODEX_ADAPTER: &str = "npx -y @agentclientprotocol/codex-acp@2.2.2";
 
+/// An agent the client knows how to start: Claude Code or Codex, through its official
+/// ACP adapter. A front end can run one of each and let the user pick between them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Harness {
+    Claude,
+    Codex,
+}
+
+impl Harness {
+    pub const ALL: [Harness; 2] = [Harness::Claude, Harness::Codex];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Harness::Claude => "Claude",
+            Harness::Codex => "Codex",
+        }
+    }
+
+    pub fn agent(self) -> AcpAgent {
+        match self {
+            Harness::Claude => CLAUDE_ADAPTER,
+            Harness::Codex => CODEX_ADAPTER,
+        }
+        .parse()
+        .expect("the adapter commands are well-formed")
+    }
+}
+
 /// `claude` and `codex` map to the official ACP adapters; anything else is run as a shell-style command.
 pub fn agent_for(name: &str) -> Result<AcpAgent, Error> {
     match name {
@@ -218,6 +251,9 @@ pub fn spawn(agent: AcpAgent, cwd: PathBuf) -> AgentHandle {
             if let Err(message) = smol::block_on(run(agent, &cwd, &command_rx, &event_tx)) {
                 emit(&event_tx, Event::Error(message));
             }
+            // Closed first, so by the time the front end hears `Closed` a command it
+            // sends is refused rather than lost.
+            drop(command_rx);
             emit(&event_tx, Event::Closed);
         })
         .expect("failed to spawn the ACP thread");
@@ -263,7 +299,9 @@ async fn run(
             // Each session runs as a task on this thread: turns in different sessions
             // overlap, and a slow `session/new` never holds up other sessions' commands.
             let tasks = smol::LocalExecutor::new();
-            let mut sessions: HashMap<SessionKey, Sender<SessionCommand>> = HashMap::new();
+            // Each session's queue and its task, which dropping cancels.
+            let mut sessions: HashMap<SessionKey, (Sender<SessionCommand>, smol::Task<()>)> =
+                HashMap::new();
             tasks
                 .run(async {
                     while let Some(command) = next_command(commands, &cx).await? {
@@ -271,17 +309,15 @@ async fn run(
                             Command::NewSession(key) => {
                                 if let Entry::Vacant(entry) = sessions.entry(key) {
                                     let (command_tx, command_rx) = smol::channel::unbounded();
-                                    entry.insert(command_tx);
-                                    tasks
-                                        .spawn(run_session(
-                                            key,
-                                            cx.clone(),
-                                            cwd.to_path_buf(),
-                                            command_rx,
-                                            events.clone(),
-                                            login_options.clone(),
-                                        ))
-                                        .detach();
+                                    let task = tasks.spawn(run_session(
+                                        key,
+                                        cx.clone(),
+                                        cwd.to_path_buf(),
+                                        command_rx,
+                                        events.clone(),
+                                        login_options.clone(),
+                                    ));
+                                    entry.insert((command_tx, task));
                                 }
                                 continue;
                             }
@@ -290,8 +326,14 @@ async fn run(
                             Command::ChangeSetting(key, setting, value) => {
                                 (key, SessionCommand::ChangeSetting(setting, value))
                             }
+                            Command::CloseSession(key) => {
+                                // Dropping the task cancels it where it is, so neither
+                                // a `session/new` still out nor a queued prompt goes on.
+                                sessions.remove(&key);
+                                continue;
+                            }
                         };
-                        if let Some(session) = sessions.get(&key) {
+                        if let Some((session, _)) = sessions.get(&key) {
                             let _ = session.try_send(command);
                         }
                     }
@@ -335,6 +377,9 @@ async fn run_session(
 ) {
     // The prompt to run once the session exists, when a prompt is creating it again.
     let mut retry = None;
+    // Setting changes made while there was no session to make them to, which the
+    // session gets before the prompt that created it again.
+    let mut changes_waiting = Vec::new();
     loop {
         // `run_until` sends `session/new` from this task, so a refusal comes back here;
         // `start_session` sends it from a connection task, where an error ends the
@@ -356,6 +401,7 @@ async fn run_session(
                     key,
                     &mut session,
                     waiting,
+                    std::mem::take(&mut changes_waiting),
                     &commands,
                     &events,
                     &login_options,
@@ -375,8 +421,11 @@ async fn run_session(
         retry = loop {
             match commands.recv().await {
                 Ok(SessionCommand::Prompt(text)) => break Some(text),
-                // No session, so nothing is running to stop, and no settings to change.
-                Ok(SessionCommand::Cancel | SessionCommand::ChangeSetting(..)) => {}
+                // No session, so nothing is running to stop.
+                Ok(SessionCommand::Cancel) => {}
+                Ok(SessionCommand::ChangeSetting(setting, value)) => {
+                    changes_waiting.push((setting, value))
+                }
                 Err(_) => return,
             }
         };
@@ -385,16 +434,21 @@ async fn run_session(
 
 /// Runs the session's prompts one at a time, as they arrive, until the front end has gone.
 /// Prompts sent during a turn wait in `waiting` for their own, and every prompt waits
-/// for the agent to answer the setting changes sent before it.
+/// for the agent to answer the setting changes sent before it, `first` included.
 async fn serve(
     key: SessionKey,
     session: &mut ActiveSession<'_, Agent>,
     mut waiting: VecDeque<String>,
+    first: Vec<(String, SettingValue)>,
     commands: &Receiver<SessionCommand>,
     events: &Sender<Event>,
     login_options: &[String],
 ) {
     let mut changes = Changes::default();
+    for (setting, value) in first {
+        // Only a closed connection fails this, which ends the session anyway.
+        let _ = change_setting(key, session, setting, value, events, &mut changes);
+    }
     loop {
         let text = match waiting.pop_front() {
             Some(text) => text,
@@ -768,28 +822,41 @@ async fn handle(
         .await
 }
 
-/// A permission request the user has not answered yet.
+/// A permission request the user has not answered yet. Dropped unanswered, as when
+/// its session is closed, it answers the agent with a cancellation.
 struct PendingPermission {
     options: Vec<PermissionOption>,
-    responder: Responder<RequestPermissionResponse>,
+    /// Taken by the answer.
+    responder: Option<Responder<RequestPermissionResponse>>,
     choice: oneshot::Receiver<Option<String>>,
 }
 
 impl PendingPermission {
     /// Answers the agent with the chosen option; `None`, or an id it did not offer, cancels.
-    fn answer(self, chosen: Option<String>) -> Result<(), Error> {
+    fn answer(mut self, chosen: Option<String>) -> Result<(), Error> {
         let outcome = match self
             .options
-            .into_iter()
+            .iter()
             .find(|option| Some(option.option_id.0.as_ref()) == chosen.as_deref())
         {
-            Some(option) => {
-                RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(option.option_id))
-            }
+            Some(option) => RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(
+                option.option_id.clone(),
+            )),
             None => RequestPermissionOutcome::Cancelled,
         };
-        self.responder
-            .respond(RequestPermissionResponse::new(outcome))
+        match self.responder.take() {
+            Some(responder) => responder.respond(RequestPermissionResponse::new(outcome)),
+            None => Ok(()),
+        }
+    }
+}
+
+impl Drop for PendingPermission {
+    fn drop(&mut self) {
+        if let Some(responder) = self.responder.take() {
+            let cancelled = RequestPermissionOutcome::Cancelled;
+            let _ = responder.respond(RequestPermissionResponse::new(cancelled));
+        }
     }
 }
 
@@ -832,7 +899,7 @@ fn ask_permission(
     );
     PendingPermission {
         options: request.options,
-        responder,
+        responder: Some(responder),
         choice,
     }
 }
