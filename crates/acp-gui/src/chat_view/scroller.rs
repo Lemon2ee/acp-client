@@ -21,6 +21,10 @@ const OVERDRAW: Pixels = px(400.);
 /// How long the button back to the newest text takes to come and go, as in
 /// `MessageScroller`.
 const JUMP_BUTTON_FADE: Duration = Duration::from_millis(200);
+/// How far above the transcript's bottom that button starts as it comes in, and how far
+/// it rises from there, in rems, as in `MessageScroller`.
+const JUMP_BUTTON_FROM: f32 = 0.5;
+const JUMP_BUTTON_RISE: f32 = 0.5;
 /// Closer to the end than this counts as there.
 const SETTLED: Pixels = px(0.5);
 /// One frame at 60Hz. The first step of a glide after the view has kept still covers
@@ -40,8 +44,8 @@ pub(crate) struct TranscriptScroll {
     placed: Option<ListOffset>,
     /// When `follow` last ran.
     ran: Instant,
-    /// The viewport's height then, as the list last laid out.
-    height: Pixels,
+    /// The viewport's size then, as the list last laid out.
+    size: Size<Pixels>,
     /// Rows changed since then. The list measures them as it lays out, after `follow`, so
     /// the end they move is only known a frame later.
     unmeasured: bool,
@@ -57,7 +61,7 @@ impl TranscriptScroll {
             following: true,
             placed: None,
             ran: Instant::now(),
-            height: px(0.),
+            size: Size::default(),
             unmeasured: false,
             glide: false,
         }
@@ -100,19 +104,21 @@ impl TranscriptScroll {
     /// Run each frame before the list lays out: notices the user's scrolls, and while the
     /// view follows, moves it toward the end the last layout measured. Each step takes
     /// the share of the way left that a curve settling over `duration` covers in a
-    /// frame, so text that keeps coming is chased smoothly. More than a screen away, after
-    /// the window resizes, or with Reduce motion on, the view goes straight there.
+    /// frame, so text that keeps coming is chased smoothly. For a replay, more than a
+    /// screen away, while the viewport changes size (its width rewraps the rows) or with
+    /// Reduce motion on, the view goes straight to the end as this frame lays it out.
     fn follow(&mut self, duration: Duration, reduce_motion: bool, window: &mut Window) {
         let now = Instant::now();
         let since = now.duration_since(self.ran).min(LONGEST_STEP);
         self.ran = now;
-        if std::mem::take(&mut self.unmeasured) && self.following {
+        let changed = std::mem::take(&mut self.unmeasured);
+        if changed && self.following {
             window.request_animation_frame();
         }
-        let height = self.list.viewport_bounds().size.height;
-        let resized = height != self.height;
-        self.height = height;
-        if height <= px(0.) {
+        let size = self.list.viewport_bounds().size;
+        let resized = size != self.size;
+        self.size = size;
+        if size.height <= px(0.) {
             // Not laid out yet: a session shown with its history starts at the end of it.
             self.list.scroll_to_end();
             return;
@@ -130,17 +136,21 @@ impl TranscriptScroll {
             self.following = true;
         }
         let gap = end - top;
-        if self.following && gap > SETTLED {
-            let left = if !self.glide || reduce_motion || resized || gap > height {
-                px(0.)
-            } else {
-                // An exponential ease-out: within 2% of the end after `duration`.
-                gap * (-4. * since.as_secs_f32() / duration.as_secs_f32()).exp()
-            };
-            let next = if left > SETTLED { end - left } else { end };
-            self.list.set_offset_from_scrollbar(point(px(0.), -next));
-            if next < end {
+        if self.following {
+            // An exponential ease-out: within 2% of the end after `duration`.
+            let left = gap * (-4. * since.as_secs_f32() / duration.as_secs_f32()).exp();
+            if !self.glide || reduce_motion || resized || gap > size.height {
+                // Anchored at the end, the layout settles there itself, as the list's
+                // tail mode does: rows added or rewrapped this frame included.
+                self.list.scroll_to_end();
+            } else if left > SETTLED {
+                self.list
+                    .set_offset_from_scrollbar(point(px(0.), -(end - left)));
                 window.request_animation_frame();
+            } else if !changed {
+                // Kept anchored at the end once there, so a layout that rewraps the rows
+                // (the sidebar sliding, the window resizing) still ends there.
+                self.list.scroll_to_end();
             }
         }
         self.placed = Some(self.list.logical_scroll_top());
@@ -228,7 +238,7 @@ impl ChatView {
                         .absolute()
                         .left_0()
                         .right_0()
-                        .bottom(rems(0.5 + jump_shown * 0.5))
+                        .bottom(rems(JUMP_BUTTON_FROM + jump_shown * JUMP_BUTTON_RISE))
                         .flex()
                         .justify_center()
                         .opacity(jump_shown)
