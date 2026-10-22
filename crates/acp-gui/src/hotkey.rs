@@ -37,12 +37,29 @@ pub(crate) enum Refusal {
     NoKey,
 }
 
-/// Whether a press goes to the shortcut rather than to a menu of the app in front, as
-/// most apps' menu items are ⌘ and one key, with ⇧ or without. It is allowed, with a
-/// warning.
-pub(crate) fn shadows_menus(keystroke: &Keystroke) -> bool {
+/// What a shortcut takes from other apps that it is still allowed to, with a warning.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Shadows {
+    /// ⌘ and one key, with ⇧ or without, as most apps' menu items are.
+    Menus,
+    /// ⌥ and one key that types, with ⇧ or without, which most layouts type a character
+    /// with: ⌥L is @ on a German one.
+    Typing,
+}
+
+pub(crate) fn shadows(keystroke: &Keystroke) -> Option<Shadows> {
     let modifiers = keystroke.modifiers;
-    modifiers.platform && !modifiers.control && !modifiers.alt && !is_function_key(&keystroke.key)
+    if modifiers.control || is_function_key(&keystroke.key) {
+        return None;
+    }
+    // gpui names the keys that don't type, such as "left", and gives the rest as what
+    // they type.
+    let types = keystroke.key.chars().count() == 1 || keystroke.key == "space";
+    match (modifiers.platform, modifiers.alt) {
+        (true, false) => Some(Shadows::Menus),
+        (false, true) if types => Some(Shadows::Typing),
+        _ => None,
+    }
 }
 
 fn is_function_key(key: &str) -> bool {
@@ -60,36 +77,30 @@ pub(crate) fn parse_shortcut(text: &str) -> Option<Keystroke> {
     Some(keystroke)
 }
 
-/// Whether `keystroke` can be the shortcut, short of asking macOS for it.
-fn check(keystroke: &Keystroke, cx: &App) -> Result<(), Refusal> {
+/// Holds `keystroke` with macOS as the shortcut, if it can be one.
+fn hold(keystroke: &Keystroke, cx: &App) -> Result<Registration, Refusal> {
     let modifiers = keystroke.modifiers;
     if !(modifiers.platform || modifiers.control || modifiers.alt)
         && !is_function_key(&keystroke.key)
     {
         return Err(Refusal::NoModifier);
     }
-    // In any context, as the shortcut would take the keys from all of them.
+    // In any context, and as the first keys of a longer binding too, as the shortcut
+    // would take the keys from all of them.
     let keymap = cx.key_bindings();
-    if !keymap
-        .borrow()
-        .all_bindings_for_input(std::slice::from_ref(keystroke))
-        .is_empty()
-    {
+    if keymap.borrow().bindings().any(|binding| {
+        binding
+            .match_keystrokes(std::slice::from_ref(keystroke))
+            .is_some()
+    }) {
         return Err(Refusal::InApp);
     }
     #[cfg(target_os = "macos")]
-    carbon::check_system(keystroke)?;
-    Ok(())
-}
-
-fn register(keystroke: &Keystroke) -> Result<Registration, Refusal> {
-    #[cfg(target_os = "macos")]
     {
-        carbon::register(keystroke)
+        carbon::hold(keystroke)
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = keystroke;
         Err(Refusal::Refused(0))
     }
 }
@@ -138,7 +149,7 @@ impl GlobalShortcut {
         let Some(keystroke) = wanted else {
             return;
         };
-        match check(&keystroke, cx).and_then(|()| register(&keystroke)) {
+        match hold(&keystroke, cx) {
             Ok(registration) => self.held = Some((keystroke, registration)),
             Err(refusal) => self.failed = Some((keystroke, refusal)),
         }
@@ -159,8 +170,7 @@ impl GlobalShortcut {
     /// name it.
     pub(crate) fn take(&mut self, keystroke: Keystroke, cx: &App) -> Result<(), Refusal> {
         self.held = None;
-        check(&keystroke, cx)?;
-        let registration = register(&keystroke)?;
+        let registration = hold(&keystroke, cx)?;
         self.held = Some((keystroke, registration));
         self.failed = None;
         self.paused = false;
@@ -388,8 +398,15 @@ mod carbon {
         }
     }
 
-    pub(super) fn register(keystroke: &Keystroke) -> Result<Registration, Refusal> {
+    /// Holds the key that presses `keystroke` on the current layout, unless macOS has a
+    /// shortcut of its own there or another app holds it.
+    pub(super) fn hold(keystroke: &Keystroke) -> Result<Registration, Refusal> {
         let (key_code, modifiers) = key_code(keystroke).ok_or(Refusal::NoKey)?;
+        check_system(key_code, modifiers)?;
+        register(key_code, modifiers)
+    }
+
+    fn register(key_code: u32, modifiers: u32) -> Result<Registration, Refusal> {
         let id = EventHotKeyID {
             signature: SIGNATURE,
             id: 1,
@@ -451,10 +468,7 @@ mod carbon {
         (53, CMD | OPTION, "Force Quit Applications"),
     ];
 
-    pub(super) fn check_system(keystroke: &Keystroke) -> Result<(), Refusal> {
-        let Some((key_code, modifiers)) = key_code(keystroke) else {
-            return Err(Refusal::NoKey);
-        };
+    fn check_system(key_code: u32, modifiers: u32) -> Result<(), Refusal> {
         let named = |list: &[(u32, u32, &'static str)]| {
             list.iter()
                 .find(|(code, mods, _)| *code == key_code && *mods == modifiers)
@@ -619,6 +633,13 @@ mod carbon {
         ("f20", 90),
     ];
 
+    /// The keypad's keys, which type what keys on the main keyboard type too. A shortcut
+    /// goes on the main keyboard's, which every Mac has, and on the keypad's only if no
+    /// other key types it.
+    const KEYPAD: [u16; 18] = [
+        65, 67, 69, 71, 75, 76, 78, 81, 82, 83, 84, 85, 86, 87, 88, 89, 91, 92,
+    ];
+
     fn named_key_code(key: &str) -> Option<u16> {
         NAMED_KEYS
             .iter()
@@ -705,9 +726,15 @@ mod carbon {
         /// and layouts that type no ASCII included.
         fn typing(&self, keystroke: &Keystroke) -> Option<(u16, bool)> {
             let command_layout = keystroke.modifiers.platform || self.always_command();
-            let mut shifted_key = None;
+            let (mut shifted_key, mut keypad_key) = (None, None);
             for code in 0..128 {
                 if NAMED_KEYS.iter().any(|(_, named)| *named == code) {
+                    continue;
+                }
+                if KEYPAD.contains(&code) {
+                    if keypad_key.is_none() && self.chars(code, NO_MOD) == keystroke.key {
+                        keypad_key = Some(code);
+                    }
                     continue;
                 }
                 let (mut base, mut shifted) =
@@ -735,7 +762,9 @@ mod carbon {
                     shifted_key = Some(code);
                 }
             }
-            shifted_key.map(|code| (code, true))
+            shifted_key
+                .map(|code| (code, true))
+                .or(keypad_key.map(|code| (code, false)))
         }
 
         /// A layout that types no ASCII, such as Russian, is read through its ⌘ layer, as

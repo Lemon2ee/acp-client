@@ -20,7 +20,7 @@ use crate::chat_view::pickers::agent_logo;
 use crate::chat_view::sidebar::ResizeSidebar;
 use crate::chrome::{WINDOW_BLUR, as_title_bar};
 use crate::config::{AppSettings, Appearance, SETTINGS, config_folder};
-use crate::hotkey::{GLOBAL_SHORTCUT, Refusal, parse_shortcut, shadows_menus};
+use crate::hotkey::{GLOBAL_SHORTCUT, Refusal, Shadows, parse_shortcut, shadows};
 
 /// The widest the settings' column gets: 560 for the settings, and 32 either side.
 const SETTINGS_COLUMN_WIDTH: Pixels = px(624.);
@@ -36,10 +36,14 @@ const SHORTCUT_ROW_HEIGHT: Pixels = px(44.);
 const SETTING_ROW_INSET: Pixels = px(16.);
 /// The rounded tile behind an agent's mark in the settings' list of agents.
 const AGENT_TILE_SIZE: Pixels = px(28.);
-/// The box the system-wide shortcut is recorded in, and the button in it that clears it.
+/// The box the system-wide shortcut is recorded in, the space either side of what it
+/// shows, and the button in it that clears it, as far in from the box's right as from
+/// its top, which centers it inside the box's 1px border.
 const RECORDER_WIDTH: Pixels = px(168.);
 const RECORDER_HEIGHT: Pixels = px(28.);
+const RECORDER_PADDING: Pixels = px(8.);
 const CLEAR_BUTTON_SIZE: Pixels = px(18.);
+const CLEAR_BUTTON_INSET: Pixels = px(4.);
 /// The colors of what is said under a shortcut that was turned down or only half works.
 /// The theme's danger and warning are too light on the light theme's white for 12px text.
 const REFUSED_DARK: u32 = 0xf87171;
@@ -581,10 +585,15 @@ impl ChatView {
                 .text_color(color)
                 .child(text)
         };
+        // fn plays no part in a shortcut, so holding it alone shows nothing.
+        let held = Modifiers {
+            function: false,
+            ..recorder.held
+        };
         // The modifiers of the next try, once any are down, over the keys turned down.
-        let shown = if recording && recorder.held.modified() {
+        let shown = if recording && held.modified() {
             let held = Keystroke {
-                modifiers: recorder.held,
+                modifiers: held,
                 ..Default::default()
             };
             text(format!("{}…", Kbd::format(&held)), theme.foreground)
@@ -621,12 +630,12 @@ impl ChatView {
             .flex()
             .items_center()
             .justify_center()
-            .pl_2()
+            .pl(RECORDER_PADDING)
             // Clear of the button that clears it.
             .pr(if clearable {
-                CLEAR_BUTTON_SIZE + px(8.)
+                CLEAR_BUTTON_SIZE + CLEAR_BUTTON_INSET + RECORDER_PADDING / 2.
             } else {
-                px(8.)
+                RECORDER_PADDING
             })
             .rounded(px(6.))
             .border_1()
@@ -655,8 +664,8 @@ impl ChatView {
                         .role(Role::Button)
                         .aria_label("Clear shortcut")
                         .absolute()
-                        .top(px(4.))
-                        .right(px(4.))
+                        .top(CLEAR_BUTTON_INSET)
+                        .right(CLEAR_BUTTON_INSET)
                         .size(CLEAR_BUTTON_SIZE)
                         .flex()
                         .items_center()
@@ -717,16 +726,22 @@ impl ChatView {
                 Some(retry),
             ))
         } else {
-            saved
+            let shadowed = saved
                 .as_ref()
-                .filter(|saved| on && !recording && shadows_menus(saved))
-                .map(|saved| {
-                    let message = format!(
-                        "Most apps use ⌘ with one key for their own commands. While this is on, {} brings ACP client forward instead.",
-                        Kbd::format(saved)
-                    );
-                    (IconName::TriangleAlert, warned_color, message, None, None)
-                })
+                .filter(|_| on && !recording)
+                .and_then(|saved| Some((saved, shadows(saved)?)));
+            shadowed.map(|(saved, shadows)| {
+                let keys = Kbd::format(saved);
+                let message = match shadows {
+                    Shadows::Menus => format!(
+                        "Most apps use ⌘ with one key for their own commands. While this is on, {keys} brings ACP client forward instead."
+                    ),
+                    Shadows::Typing => format!(
+                        "Most keyboard layouts type a character with ⌥ and one key. While this is on, {keys} brings ACP client forward instead of typing it."
+                    ),
+                };
+                (IconName::TriangleAlert, warned_color, message, None, None)
+            })
         };
         let problem = problem.map(|(icon, color, message, kept, action)| {
             h_flex()
@@ -859,8 +874,13 @@ impl ChatView {
         }
         let modifiers = keystroke.modifiers;
         match keystroke.key.as_str() {
-            // A modifier pressed and let go on its own.
-            "shift" | "control" | "alt" | "platform" | "function" => return true,
+            // A modifier pressed and let go on its own. Taking it keeps the release from
+            // `on_modifiers_changed`, so nothing is held from here.
+            "shift" | "control" | "alt" | "platform" | "function" => {
+                self.settings_page.recorder.held = Modifiers::default();
+                cx.notify();
+                return true;
+            }
             "escape" if !modifiers.modified() => {
                 self.stop_recording(cx);
                 return true;
