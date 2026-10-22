@@ -82,8 +82,8 @@ In debug builds, gpui-component already binds Cmd+Option+I to gpui's element ins
 
 - **Core owns the protocol; front ends own display.** Anything that talks to
   `agent_client_protocol` lives in `acp-core`. The CLI and GUI see only `Command`,
-  `Event`, `SessionEvent`, `Setting`, `PermissionRequest` and `Harness` (the agents
-  the client can start by name).
+  `Event`, `SessionEvent`, `Setting`, `PermissionRequest`, `ToolStatus` and `Harness`
+  (the agents the client can start by name).
 - **One connection, many sessions.** `SessionKey` is chosen by the front end so it can show
   a session before the agent has created it. Each session reads its commands from one
   queue in order, so a cancel never overtakes the prompt it is meant to stop.

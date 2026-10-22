@@ -6,7 +6,9 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use acp_core::{PermissionRequest, SessionEvent, SessionKey, Setting, SettingKind, SettingValue};
+use acp_core::{
+    PermissionRequest, SessionEvent, SessionKey, Setting, SettingKind, SettingValue, ToolStatus,
+};
 use gpui_kit::base::Easing;
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::message_scroller::MessageScrollerState;
@@ -25,7 +27,7 @@ pub(crate) enum Row {
     Tool {
         id: String,
         title: String,
-        status: String,
+        status: ToolStatus,
     },
     Permission {
         request: PermissionRequest,
@@ -69,7 +71,7 @@ pub(crate) struct Session {
     pub(crate) archived: bool,
     /// A turn prompted here is running, so the agent's text arrives as it is written: it
     /// fades in, and new rows come in with motion. A loaded session's replay shows at once.
-    pub(crate) live: bool,
+    live: bool,
     /// When each row added in a live turn came in, until its entrance has played. Kept
     /// here because the list drops a row's element state once it scrolls out of view.
     pub(crate) entering: HashMap<usize, Instant>,
@@ -138,8 +140,7 @@ impl Session {
         self.live
             && match self.rows.last() {
                 Some(Row::User(_)) => true,
-                // acp-core names a tool call's status as ACP's `ToolCallStatus` does.
-                Some(Row::Tool { status, .. }) => status == "Completed" || status == "Failed",
+                Some(Row::Tool { status, .. }) => status.finished(),
                 _ => false,
             }
     }
@@ -202,7 +203,7 @@ impl Session {
                                 if let Some(title) = title.clone() {
                                     *row_title = title;
                                 }
-                                if let Some(status) = status.clone() {
+                                if let Some(status) = status {
                                     *row_status = status;
                                 }
                                 Some(ix)

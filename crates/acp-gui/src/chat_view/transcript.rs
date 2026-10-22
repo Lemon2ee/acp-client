@@ -194,8 +194,8 @@ fn waiting_line(
     let waited = session.changed.elapsed().checked_sub(WAIT_DELAY);
     let fade = match waited {
         Some(waited) => enter.at(waited, window).unwrap_or(1.),
-        // Nothing would draw the line once the delay is over while motion is reduced.
-        None if enter.still => 1.,
+        // Drawn again each frame until the delay is over, Reduce motion or not, so the
+        // line appears then: nothing else may draw the window.
         None => {
             window.request_animation_frame();
             0.
