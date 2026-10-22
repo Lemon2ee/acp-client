@@ -29,8 +29,8 @@ use gpui_kit::component::popover::{Popover, PopoverState};
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::text::{TextView, TextViewState};
 use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, FocusableExt as _, Icon, IconName, Sizable as _, Theme,
-    ThemeConfig, ThemeStyled as _, h_flex, resize_handle, v_flex,
+    ActiveTheme as _, FocusableExt as _, Icon, IconName, Sizable as _, Theme, ThemeConfig,
+    ThemeStyled as _, h_flex, resize_handle, v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -65,7 +65,9 @@ struct Session {
     title: Option<String>,
     rows: Vec<Row>,
     scroller: Entity<MessageScrollerState>,
-    /// Not ready for a prompt: still starting, a turn is running, or the agent is gone.
+    /// Not ready for a prompt: a spare still being created, a turn is running, or the
+    /// agent is gone. A session the agent hasn't created yet takes a prompt, which has
+    /// the agent create it.
     busy: bool,
     /// Text typed here but not sent, kept while another session is on screen.
     draft: SharedString,
@@ -74,14 +76,16 @@ struct Session {
     settings: Vec<Setting>,
     /// The agent has created it and given its settings, if any.
     created: bool,
-    /// Switches flipped here whose changes the agent hasn't all answered, by setting id.
-    flipped: HashMap<String, Flip>,
+    /// Settings changed here whose changes the agent hasn't all answered, by setting id:
+    /// switches, and every setting of a session the agent hasn't created yet, as no
+    /// answer comes until it has.
+    asked: HashMap<String, Asked>,
 }
 
-/// A switch flipped here, until the agent has answered every change it was asked for.
-struct Flip {
-    /// The value last asked for, which the switch shows meanwhile.
-    on: bool,
+/// A setting changed here, until the agent has answered every change it was asked for.
+struct Asked {
+    /// The value last asked for, which the setting shows meanwhile.
+    value: SettingValue,
     /// How many of its changes have no answer yet.
     out: u32,
 }
@@ -94,33 +98,44 @@ impl Session {
             title: None,
             rows: Vec::new(),
             scroller: cx.new(|cx| MessageScrollerState::new(0, cx)),
-            busy: true,
+            busy: false,
             draft: SharedString::default(),
             settings: Vec::new(),
             created: false,
-            flipped: HashMap::new(),
+            asked: HashMap::new(),
         }
     }
 
-    /// A setting as it shows: a switch flipped here shows the value last asked for until
-    /// the agent has answered all its changes.
+    /// A setting as it shows: one changed here shows the value last asked for until the
+    /// agent has answered all its changes.
     fn shown(&self, setting: &Setting) -> Setting {
         let mut setting = setting.clone();
-        if let Some(flip) = self.flipped.get(&setting.id) {
-            setting.value = SettingValue::Switch(flip.on);
+        if let Some(asked) = self.asked.get(&setting.id) {
+            setting.value = asked.value.clone();
         }
         setting
     }
 
-    /// One of a setting's changes has its answer. A switch shows the agent's value
-    /// again once all of its have, as an answer to an earlier flip can arrive while a
+    /// The setting is to show `value` until the agent has answered the change just asked
+    /// for, and any others still out.
+    fn ask(&mut self, setting: String, value: SettingValue) {
+        let asked = self.asked.entry(setting).or_insert(Asked {
+            value: value.clone(),
+            out: 0,
+        });
+        asked.value = value;
+        asked.out += 1;
+    }
+
+    /// One of a setting's changes has its answer. The setting shows the agent's value
+    /// again once all of its have, as an answer to an earlier change can arrive while a
     /// later one is still out.
     fn answered(&mut self, setting: &str) {
-        if let Some(flip) = self.flipped.get_mut(setting) {
+        if let Some(asked) = self.asked.get_mut(setting) {
             // A late answer to a change already given up on finds nothing to count.
-            flip.out = flip.out.saturating_sub(1);
-            if flip.out == 0 {
-                self.flipped.remove(setting);
+            asked.out = asked.out.saturating_sub(1);
+            if asked.out == 0 {
+                self.asked.remove(setting);
             }
         }
     }
@@ -277,23 +292,25 @@ struct AgentSlot {
     /// was started with.
     name: String,
     commands: Sender<Command>,
-    /// A session created ahead of its use while the agent has no session on show, so
-    /// its models can be listed from sessions on other agents, and so the first
-    /// session on it is shown with its settings at once. Taken by that session.
+    /// A session created ahead of its use, so the model menu can list the models of an
+    /// agent that has no session on show and no settings kept from before. Taken by
+    /// the next session on it.
     spare: Option<Session>,
     /// The spare couldn't be created, and the user has been told; said once, as each
     /// session added tries the spare again.
     spare_failed: bool,
     /// The settings the agent last created a session with, in this run or, for Claude
-    /// and Codex, one before, which a session on it shows while the agent creates it.
-    /// Creating one takes the agent seconds: Claude's adapter starts the Claude Code
-    /// CLI for it.
+    /// and Codex, one before, which a session on it shows until the agent has created
+    /// it: no session is created before its first prompt, and creating one takes the
+    /// agent seconds, as Claude's adapter starts the Claude Code CLI for it.
     last_settings: Vec<Setting>,
     _events: Task<()>,
 }
 
 struct ChatView {
-    /// Never empty: the window starts with one session and none are removed.
+    /// Never empty: the window starts with one session, which its first prompt has the
+    /// agent create. At most one has no prompt yet; the sidebar leaves it out, and a new
+    /// one on another agent takes its place.
     sessions: Vec<Session>,
     /// Index into `sessions` of the one on screen.
     active: usize,
@@ -317,7 +334,8 @@ struct ChatView {
 }
 
 impl ChatView {
-    /// Starts every agent in `agents`, each by name, and opens a session on the first.
+    /// Starts every agent in `agents`, each by name, and shows a session on the first
+    /// that no agent creates until its first prompt.
     fn new(
         agents: Vec<(String, AcpAgent)>,
         cwd: PathBuf,
@@ -390,44 +408,50 @@ impl ChatView {
         view
     }
 
-    /// Asks the agent to create a session, and returns it as it waits to be created.
-    /// With the agent gone, the session says so and stays closed to prompts.
+    /// A session on the agent that the agent hasn't created yet: acp-core has it created
+    /// by its first prompt. With the agent gone, the session says so and stays closed
+    /// to prompts.
     fn create_session(&mut self, agent: usize, cx: &mut App) -> Session {
         let key = SessionKey(self.next_key);
         self.next_key += 1;
         let mut session = Session::new(key, agent, cx);
-        let asked = self.agents[agent]
-            .commands
-            .try_send(Command::NewSession(key));
-        if asked.is_err() {
-            let name = &self.agents[agent].name;
-            session.push(
-                Row::Error(format!("{name} has gone; restart to use it")),
-                cx,
-            );
+        let slot = &self.agents[agent];
+        if slot.commands.is_closed() {
+            session.busy = true;
+            let message = format!("{} has gone; restart to use it", slot.name);
+            session.push(Row::Error(message), cx);
         }
         session
     }
 
-    /// Makes a spare session for each agent that has no session on show and no spare,
-    /// and is still there to create it. A session on show lists the agent's models
-    /// just as well, so an agent with one keeps no spare.
+    /// Makes a spare session for each agent whose models the model menu could list no
+    /// other way: it has no spare, no session on show, and no settings kept from before.
+    /// None is made before the window's first prompt, so starting the window has no
+    /// agent create a session.
     fn make_spares(&mut self, cx: &mut App) {
+        if self.sessions.iter().all(|session| session.title.is_none()) {
+            return;
+        }
         for agent in 0..self.agents.len() {
             let slot = &self.agents[agent];
             if slot.spare.is_some()
+                || !slot.last_settings.is_empty()
                 || slot.commands.is_closed()
                 || self.sessions.iter().any(|session| session.agent == agent)
             {
                 continue;
             }
-            let spare = self.create_session(agent, cx);
-            self.agents[agent].spare = Some(spare);
+            let mut spare = self.create_session(agent, cx);
+            // Created now rather than by a prompt, so its models are there to list.
+            spare.busy = true;
+            let slot = &mut self.agents[agent];
+            let _ = slot.commands.try_send(Command::NewSession(spare.key));
+            slot.spare = Some(spare);
         }
     }
 
-    /// A session on the agent, to show: its spare, ready with its settings, or a new one
-    /// when it has none.
+    /// A session on the agent, to show: its spare, created with its settings, or one the
+    /// agent will create on its first prompt.
     fn take_session(&mut self, agent: usize, cx: &mut App) -> Session {
         match self.agents[agent].spare.take() {
             Some(spare) => spare,
@@ -451,9 +475,40 @@ impl ChatView {
             .find(|session| !session.settings.is_empty())
     }
 
-    /// Adds a session on the agent of the one on screen, and shows it. The window's
-    /// first session is added even if the agent is already gone, so there is always
-    /// one to show.
+    /// The index of the window's session with no prompt yet on `agent`, made if there is
+    /// none. One with no prompt on another agent gives way to it, so there is never more
+    /// than one.
+    fn untitled_on(&mut self, agent: usize, cx: &mut App) -> usize {
+        let found = self
+            .sessions
+            .iter()
+            .position(|session| session.title.is_none());
+        if let Some(ix) = found.filter(|&ix| self.sessions[ix].agent == agent) {
+            return ix;
+        }
+        let mut session = self.take_session(agent, cx);
+        match found {
+            Some(ix) => {
+                // ACP can't move a session to another agent, so it goes. Text typed in
+                // it while another session was on screen goes with the one taking its
+                // place; on screen, that text is still in the input.
+                session.draft = std::mem::take(&mut self.sessions[ix].draft);
+                let old = std::mem::replace(&mut self.sessions[ix], session);
+                let _ = self.agents[old.agent]
+                    .commands
+                    .try_send(Command::CloseSession(old.key));
+                ix
+            }
+            None => {
+                self.sessions.push(session);
+                self.sessions.len() - 1
+            }
+        }
+    }
+
+    /// Shows a session with no prompt yet on the agent of the one on screen. The
+    /// window's first session is added even if the agent is already gone, so there is
+    /// always one to show.
     fn new_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let agent = self
             .sessions
@@ -462,17 +517,17 @@ impl ChatView {
         if self.agents[agent].commands.is_closed() && !self.sessions.is_empty() {
             return;
         }
-        let session = self.take_session(agent, cx);
-        self.sessions.push(session);
-        // Also another go for any agent whose spare failed to be created.
+        let ix = self.untitled_on(agent, cx);
+        // The agent of a session with no prompt that gave way may have none on show
+        // now, and an agent whose spare failed gets another go.
         self.make_spares(cx);
-        self.show(self.sessions.len() - 1, window, cx);
+        self.show(ix, window, cx);
     }
 
-    /// Picks a model of another agent's from the model menu of the session `from`. A
-    /// session with no prompt yet is replaced by one on that agent, as ACP can't move
-    /// it there; one with prompts keeps its agent, and a new session on the other
-    /// agent is shown instead. Nothing happens for an agent that is gone.
+    /// Picks a model of another agent's from the model menu of the session `from`, for
+    /// the session with no prompt yet on that agent: as ACP can't move a session to
+    /// another agent, one with no prompt on `from`'s agent gives way to it, and one with
+    /// prompts keeps its agent. Nothing happens for an agent that is gone.
     fn pick_model(
         &mut self,
         from: SessionKey,
@@ -482,30 +537,16 @@ impl ChatView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(ix) = self.sessions.iter().position(|session| session.key == from) else {
-            return;
-        };
-        if self.agents[agent].commands.is_closed() {
+        if self.sessions.iter().all(|session| session.key != from)
+            || self.agents[agent].commands.is_closed()
+        {
             return;
         }
-        let session = self.take_session(agent, cx);
-        // acp-core holds the change until the session exists, and a prompt waits for it.
-        let value = SettingValue::Choice(model);
-        let change = Command::ChangeSetting(session.key, setting, value);
-        let _ = self.agents[agent].commands.try_send(change);
-        let shown = if self.sessions[ix].title.is_none() {
-            let old = std::mem::replace(&mut self.sessions[ix], session);
-            let _ = self.agents[old.agent]
-                .commands
-                .try_send(Command::CloseSession(old.key));
-            ix
-        } else {
-            self.sessions.push(session);
-            self.sessions.len() - 1
-        };
-        // The agent left behind may have no session on show now.
+        let ix = self.untitled_on(agent, cx);
+        let key = self.sessions[ix].key;
+        self.change_setting(key, setting, SettingValue::Choice(model), cx);
         self.make_spares(cx);
-        self.show(shown, window, cx);
+        self.show(ix, window, cx);
     }
 
     /// Shows the session in the chat.
@@ -535,6 +576,15 @@ impl ChatView {
     }
 
     /// The session, shown or spare.
+    fn session(&self, key: SessionKey) -> Option<&Session> {
+        let spares = self.agents.iter().filter_map(|agent| agent.spare.as_ref());
+        self.sessions
+            .iter()
+            .chain(spares)
+            .find(|session| session.key == key)
+    }
+
+    /// The session, shown or spare.
     fn session_mut(&mut self, key: SessionKey) -> Option<&mut Session> {
         let spares = self
             .agents
@@ -544,6 +594,22 @@ impl ChatView {
             .iter_mut()
             .chain(spares)
             .find(|session| session.key == key)
+    }
+
+    /// The session's settings as they show: the agent's for it once the agent has
+    /// created it, and until then those it last created a session with. Either way a
+    /// setting changed here shows the value asked for until the agent answers.
+    fn shown_settings(&self, session: &Session) -> Vec<Setting> {
+        let slot = &self.agents[session.agent];
+        let settings = if session.created || slot.commands.is_closed() {
+            &session.settings
+        } else {
+            &slot.last_settings
+        };
+        settings
+            .iter()
+            .map(|setting| session.shown(setting))
+            .collect()
     }
 
     fn send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -558,8 +624,11 @@ impl ChatView {
             .get_or_insert_with(|| text.lines().next().unwrap_or_default().to_string());
         session.busy = true;
         session.push(Row::User(text.clone()), cx);
+        // Has the agent create the session first, if it hasn't yet.
         let prompt = Command::Prompt(session.key, text);
         let _ = self.agents[session.agent].commands.try_send(prompt);
+        // The window's first prompt lets the agents that need one make a spare.
+        self.make_spares(cx);
         cx.notify();
     }
 
@@ -573,43 +642,55 @@ impl ChatView {
         cx.notify();
     }
 
-    /// The setting shows its old value until the agent confirms the change.
-    fn change_setting(&mut self, key: SessionKey, setting: String, value: SettingValue) {
-        let Some(agent) = self.session_mut(key).map(|session| session.agent) else {
+    /// Picks one of a setting's choices. The setting shows its old value until the agent
+    /// confirms the change, except in a session the agent hasn't created yet: acp-core
+    /// holds the change until its first prompt has it created, so the pick shows until then.
+    fn change_setting(
+        &mut self,
+        key: SessionKey,
+        setting: String,
+        value: SettingValue,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(session) = self.session_mut(key) else {
             return;
         };
-        let change = Command::ChangeSetting(key, setting, value);
-        let _ = self.agents[agent].commands.try_send(change);
+        let (agent, created) = (session.agent, session.created);
+        let change = Command::ChangeSetting(key, setting.clone(), value.clone());
+        // With the agent gone, no answer would ever put the setting right.
+        if self.agents[agent].commands.try_send(change).is_err() || created {
+            return;
+        }
+        if let Some(session) = self.session_mut(key) {
+            session.ask(setting, value);
+        }
+        cx.notify();
     }
 
     /// Flips one of the session's switches from the value it shows, which is the value
     /// last asked for until the agent answers, so a second flip before then turns it
     /// back. Unlike a pick from a list, the switch shows its new value at once.
     fn flip_switch(&mut self, key: SessionKey, setting: String, cx: &mut Context<Self>) {
-        let Some(session) = self.session_mut(key) else {
+        let Some(session) = self.session(key) else {
             return;
         };
         let agent = session.agent;
-        let shown = session
-            .settings
-            .iter()
+        let shown = self
+            .shown_settings(session)
+            .into_iter()
             .find(|shown| shown.id == setting)
-            .map(|shown| session.shown(shown).value);
+            .map(|shown| shown.value);
         let Some(SettingValue::Switch(on)) = shown else {
             return;
         };
-        let change = Command::ChangeSetting(key, setting.clone(), SettingValue::Switch(!on));
+        let value = SettingValue::Switch(!on);
+        let change = Command::ChangeSetting(key, setting.clone(), value.clone());
         // With the agent gone, no answer would ever put the switch right.
         if self.agents[agent].commands.try_send(change).is_err() {
             return;
         }
         if let Some(session) = self.session_mut(key) {
-            let flip = session
-                .flipped
-                .entry(setting)
-                .or_insert(Flip { on, out: 0 });
-            flip.on = !on;
-            flip.out += 1;
+            session.ask(setting, value);
         }
         cx.notify();
     }
@@ -731,7 +812,6 @@ impl ChatView {
                 if let Some(session) = self.session_mut(key) {
                     session.busy = false;
                 }
-                self.agents[agent].spare_failed = false;
             }
             AgentEvent::SessionFailed(key, message) => {
                 let several = self.agents.len() > 1;
@@ -760,6 +840,10 @@ impl ChatView {
             AgentEvent::Session(key, event) => {
                 if let SessionEvent::Settings(settings) = &event {
                     self.remember_settings(agent, key, settings);
+                    // Every session the agent creates, by a prompt or as a spare, gets
+                    // its settings, so the agent creates sessions again and a spare
+                    // failing after this is news.
+                    self.agents[agent].spare_failed = false;
                 }
                 if let Some(session) = self.session_mut(key) {
                     session.apply(event, cx);
@@ -796,7 +880,7 @@ impl ChatView {
                     // A turn cut off with the connection may never report its end, nor
                     // a setting change its answer.
                     session.cancel_open_permissions(cx);
-                    session.flipped.clear();
+                    session.asked.clear();
                 }
             }
         }
@@ -1302,8 +1386,8 @@ impl ModelMenu<'_> {
                 row.child(Icon::new(IconName::Check).xsmall())
             })
             .on_click(move |_, window, cx| {
-                let _ = view.update(cx, |this, _| {
-                    this.change_setting(key, id.clone(), SettingValue::Choice(value.clone()))
+                let _ = view.update(cx, |this, cx| {
+                    this.change_setting(key, id.clone(), SettingValue::Choice(value.clone()), cx)
                 });
                 popover.update(cx, |state, cx| state.dismiss(window, cx));
             })
@@ -1811,40 +1895,25 @@ fn mode_button(setting: &Setting) -> InputGroupButton {
         .small()
 }
 
-/// The model's and the mode's buttons as `settings` have them, dimmed and without
-/// menus, for a session the agent is still creating: until it has, there is nothing to
-/// change. They stand where the session's own buttons will, so nothing moves when
-/// those come.
-fn starting_pickers(settings: &[Setting]) -> [Option<AnyElement>; 2] {
-    let model = settings
-        .iter()
-        .any(|setting| MODEL_KINDS.contains(&setting.kind))
-        .then(|| model_button(settings).disabled(true).into_any_element());
-    let mode = settings
-        .iter()
-        .find(|setting| setting.kind == SettingKind::Mode)
-        .map(|setting| mode_button(setting).disabled(true).into_any_element());
-    [model, mode]
-}
-
 impl ChatView {
     /// The button for the model and how hard it thinks, named like "Opus 5.5 High",
-    /// once the agent offers any of the model's settings. Its menu opens upward: a
-    /// switch for each of them that is on or off, then a row for each of the others,
-    /// whose choices open beside it.
-    fn render_model_picker(&self, session: &Session, cx: &mut Context<Self>) -> Option<AnyElement> {
+    /// once the session's settings, `shown`, hold any of the model's. Its menu opens
+    /// upward: a switch for each of them that is on or off, then a row for each of the
+    /// others, whose choices open beside it.
+    fn render_model_picker(
+        &self,
+        session: &Session,
+        shown: &[Setting],
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
         let settings: Vec<Setting> = MODEL_KINDS
             .into_iter()
-            .flat_map(|kind| {
-                session
-                    .settings
-                    .iter()
-                    .filter(move |setting| setting.kind == kind)
-            })
-            .map(|setting| session.shown(setting))
+            .flat_map(|kind| shown.iter().filter(move |setting| setting.kind == kind))
+            .cloned()
             .collect();
-        // The other agents' models, once a session on each has its settings. An agent
-        // that is gone can't take a session, so its models aren't offered.
+        // The other agents' models: as a session on each has them, else as the agent
+        // last created a session with them. An agent that is gone can't take a
+        // session, so its models aren't offered.
         let others: Vec<OtherModels> = self
             .agents
             .iter()
@@ -1852,8 +1921,8 @@ impl ChatView {
             .filter(|&(ix, slot)| ix != session.agent && !slot.commands.is_closed())
             .filter_map(|(ix, slot)| {
                 let setting = self
-                    .model_source(ix)?
-                    .settings
+                    .model_source(ix)
+                    .map_or(&slot.last_settings, |source| &source.settings)
                     .iter()
                     .find(|setting| setting.kind == SettingKind::Model)?;
                 Some(OtherModels {
@@ -1873,8 +1942,8 @@ impl ChatView {
                     return None;
                 }
             } else {
-                // A session with no model to pick, as its agent failed to create it or
-                // offers none, still gets to the other agents' models from a model row.
+                // A session with no model to pick, as its agent offers none or hasn't
+                // said yet which, still gets to the other agents' models from a model row.
                 settings.push(Setting {
                     id: "model".into(),
                     name: "Model".into(),
@@ -1892,7 +1961,7 @@ impl ChatView {
         let list_bounds = self.model_menu.list_bounds.clone();
         let older_bounds = self.model_menu.older_bounds.clone();
         let added = self.added_models.clone();
-        let trigger = model_button(&session.settings).cursor_pointer();
+        let trigger = model_button(shown).cursor_pointer();
         let picker = Popover::new("model-menu")
             .appearance(false)
             // The menu closes itself on a press outside it and its open lists.
@@ -1957,11 +2026,12 @@ impl ChatView {
                     let current = setting.value == SettingValue::Choice(choice.id.clone());
                     let (view, id, value) = (view.clone(), setting.id.clone(), choice.id.clone());
                     menu.item(mode_item(choice, current).on_click(move |_, _, cx| {
-                        let _ = view.update(cx, |this, _| {
+                        let _ = view.update(cx, |this, cx| {
                             this.change_setting(
                                 key,
                                 id.clone(),
                                 SettingValue::Choice(value.clone()),
+                                cx,
                             )
                         });
                     }))
@@ -1974,12 +2044,16 @@ impl ChatView {
         let theme = cx.theme();
         let (foreground, hover) = (theme.sidebar_foreground, theme.secondary);
         let (accent, accent_foreground) = (theme.sidebar_accent, theme.sidebar_accent_foreground);
-        // Newest first; the session on screen gets a filled card.
-        let cards =
-            self.sessions.iter().enumerate().rev().map(|(ix, session)| {
-                let key = session.key;
-                let title =
-                    SharedString::from(session.title.clone().unwrap_or_else(|| "Untitled".into()));
+        // Newest first; the session on screen gets a filled card. The one with no prompt
+        // yet has none: the agent hasn't created it, and it may give way to another.
+        let cards = self
+            .sessions
+            .iter()
+            .enumerate()
+            .rev()
+            .filter_map(|(ix, session)| Some((ix, session.key, session.title.clone()?)))
+            .map(|(ix, key, title)| {
+                let title = SharedString::from(title);
                 div()
                     .id(ElementId::Name(format!("session-{}", key.0).into()))
                     .role(Role::Button)
@@ -2110,22 +2184,16 @@ impl Render for ChatView {
         );
         let sidebar_width = self.sidebar_width * (1. - hidden);
         let session = &self.sessions[self.active];
-        let slot = &self.agents[session.agent];
         // The model and how hard it thinks, then the mode, each once the agent has said
-        // what it can be. Until then, as the agent's last new session had them.
-        let starting = !session.created && session.busy && !slot.commands.is_closed();
-        let pickers = if starting && !slot.last_settings.is_empty() {
-            starting_pickers(&slot.last_settings)
-        } else {
-            [
-                self.render_model_picker(session, cx),
-                session
-                    .settings
-                    .iter()
-                    .find(|setting| setting.kind == SettingKind::Mode)
-                    .map(|setting| self.render_mode_picker(session.key, setting, cx)),
-            ]
-        };
+        // what it can be, for this session or the last it created.
+        let shown = self.shown_settings(session);
+        let pickers = [
+            self.render_model_picker(session, &shown, cx),
+            shown
+                .iter()
+                .find(|setting| setting.kind == SettingKind::Mode)
+                .map(|setting| self.render_mode_picker(session.key, setting, cx)),
+        ];
         let action = if session.busy {
             InputGroupButton::new("stop")
                 .icon(IconName::Square)
