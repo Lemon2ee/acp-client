@@ -1,5 +1,6 @@
 //! The rows of the chat's transcript: the user's prompts, the agent's text and thoughts,
-//! its tool calls, permission requests with their answers, notices and errors.
+//! its tool calls (drawn in `tool_call`), permission requests with their answers, notices
+//! and errors.
 
 use std::time::Duration;
 
@@ -27,7 +28,7 @@ impl ChatView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let row = self.row_content(ix, cx);
+        let row = self.row_content(ix, window, cx);
         let motion = cx.theme().motion_tokens();
         let enter = Enter {
             duration: motion.duration_normal,
@@ -64,7 +65,22 @@ impl ChatView {
             .into_any_element()
     }
 
-    fn row_content(&mut self, ix: usize, cx: &mut Context<Self>) -> AnyElement {
+    /// The row at `ix` and the one after it are both tool calls, which sit close together
+    /// rather than a paragraph apart.
+    pub(crate) fn joins_next(&self, ix: usize) -> bool {
+        let rows = &self.sessions[self.active].rows;
+        matches!(
+            (rows.get(ix), rows.get(ix + 1)),
+            (Some(Row::Tool(_)), Some(Row::Tool(_)))
+        )
+    }
+
+    fn row_content(
+        &mut self,
+        ix: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let theme = cx.theme();
         let (muted, border, bubble, danger, selection) = (
             theme.muted_foreground,
@@ -102,17 +118,7 @@ impl ChatView {
                 .text_color(muted)
                 .child(TextView::new(view).selectable(true))
                 .into_any_element(),
-            Row::Tool { title, status, .. } => row
-                .text_sm()
-                .text_color(muted)
-                .child(
-                    SelectableText::new(
-                        row_id("tool", key, ix),
-                        format!("tool: {title} ({status})"),
-                    )
-                    .selection_color(selection),
-                )
-                .into_any_element(),
+            Row::Tool(_) => self.render_tool_call(ix, window, cx),
             Row::Permission { request, decided } => {
                 let card = div()
                     .mx_4()

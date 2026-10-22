@@ -22,8 +22,8 @@ use crate::chrome::{
 };
 use crate::config::{AppSettings, load_settings};
 
-// The icons `mode_icon` and the settings use beyond those in the component library's
-// own bundle.
+// The icons `mode_icon`, the settings and the tool calls' kinds use beyond those in the
+// component library's own bundle.
 gpui_kit::assets::icon_assets!(
     ExtraIcons,
     [
@@ -36,7 +36,14 @@ gpui_kit::assets::icon_assets!(
         Shield,
         SlidersHorizontal,
         Keyboard,
-        Monitor
+        Monitor,
+        Pencil,
+        Trash,
+        ArrowRightLeft,
+        Terminal,
+        Lightbulb,
+        ToggleRight,
+        Wrench
     ]
 );
 

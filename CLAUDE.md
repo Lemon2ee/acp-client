@@ -26,9 +26,11 @@ clearly needs splitting. acp-gui is split by what each part keeps or draws:
 | `hotkey.rs` | The system-wide shortcut that brings the window to the front: what it can't be, holding it with macOS through Carbon, and what a press does. |
 | `session.rs` | `Session`: one conversation's transcript rows and settings, and how each `SessionEvent` lands on it. |
 | `session/pacing.rs` | The agent's text in a live turn, held back and shown at an even pace, and where it may stop so half-arrived markdown never shows. |
+| `session/tool_call.rs` | A tool call as its row keeps it: its content made ready to draw once (a command's lines, a file's numbered lines, a diff), and how long it ran. |
 | `chrome.rs` | The window around the content: the macOS title bar row, the traffic lights, the blur, the light or dark theme. |
 | `chat_view.rs` | `ChatView`: the agents, the sessions and what happens to them, and the window's layout (`Render`). |
 | `chat_view/transcript.rs` | How each row of a transcript is drawn. |
+| `chat_view/tool_call.rs` | A tool call's row (icon, title, state, time) and the box it opens to. |
 | `chat_view/scroller.rs` | The transcript's list: following its newest text, and the button back to the newest. |
 | `chat_view/sidebar.rs` | The session cards, renaming, the delete prompt, the Archived list, the draggable edge. |
 | `chat_view/settings_page.rs` | The settings, which take the window while open. |

@@ -6,6 +6,7 @@ mod pickers;
 pub(crate) mod scroller;
 mod settings_page;
 mod sidebar;
+mod tool_call;
 mod transcript;
 
 use std::path::PathBuf;
@@ -104,6 +105,8 @@ pub(crate) struct ChatView {
     global_shortcut: GlobalShortcut,
     /// Shows the text held back in live turns a piece at a time, while any is held.
     pacing: Option<Task<()>>,
+    /// Draws the window again each second while a tool call on screen counts its seconds.
+    tool_clock: Option<Task<()>>,
     _input_events: Subscription,
     _bounds_events: Subscription,
     _settings_events: Subscription,
@@ -259,6 +262,7 @@ impl ChatView {
             settings_page: SettingsPageState::new(cx),
             global_shortcut: GlobalShortcut::default(),
             pacing: None,
+            tool_clock: None,
             _input_events: input_events,
             _bounds_events: bounds_events,
             _settings_events: settings_events,

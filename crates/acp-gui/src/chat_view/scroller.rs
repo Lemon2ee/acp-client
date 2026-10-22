@@ -84,28 +84,29 @@ impl ChatView {
             cx,
         );
 
-        // The first and last rows carry the list's padding (see the module's doc).
+        // The first and last rows carry the list's padding (see the module's doc). Tool
+        // calls in a row sit close together.
         let count = state.item_count();
-        let render_row =
-            cx.processor(|this, ix: usize, window, cx| this.render_row(ix, window, cx));
-        let rows = list(state.clone(), move |ix, window, cx| {
+        let render_row = cx.processor(move |this, ix: usize, window, cx| {
+            let joined = this.joins_next(ix);
             div()
                 .w_full()
                 .min_w_0()
                 .px_3()
                 .when(ix == 0, |row| row.pt_2())
                 .map(|row| {
-                    if ix + 1 < count {
-                        row.pb_8()
-                    } else {
+                    if ix + 1 == count {
                         row.pb_2()
+                    } else if joined {
+                        row
+                    } else {
+                        row.pb_8()
                     }
                 })
-                .child(render_row(ix, window, cx))
+                .child(this.render_row(ix, window, cx))
                 .into_any_element()
-        })
-        .size_full()
-        .min_h_0();
+        });
+        let rows = list(state.clone(), render_row).size_full().min_h_0();
 
         div()
             .id(id.clone())
