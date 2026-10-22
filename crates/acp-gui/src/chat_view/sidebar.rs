@@ -50,6 +50,11 @@ pub(crate) struct Renaming {
 const SIDEBAR_WIDTH: Pixels = px(240.);
 const SIDEBAR_MIN_WIDTH: Pixels = px(180.);
 const SIDEBAR_MAX_WIDTH: Pixels = px(480.);
+/// The filled square behind the "New session" plus. A bare plus is two thin lines in a
+/// mostly empty box, and looked lighter than the gear at the sidebar's foot.
+const NEW_SESSION_CHIP_SIZE: Pixels = px(20.);
+/// The "New session" row, which the square watches to change its fill on hover.
+const NEW_SESSION_GROUP: &str = "new-session";
 
 /// What a drag of the sidebar's edge carries. gpui tells drags apart by this type, and
 /// draws it under the pointer: nothing, since the sidebar itself follows the pointer.
@@ -231,6 +236,8 @@ impl ChatView {
             theme.secondary,
             theme.muted_foreground,
         );
+        // #343434 in the dark theme and #d7d7d7 in the light one.
+        let chip_hover = hover.blend(foreground.opacity(0.07));
         // Newest first. The session with no prompt yet has no card: the agent hasn't
         // created it, and it may give way to another.
         let (mut cards, mut archived) = (Vec::new(), Vec::new());
@@ -312,22 +319,36 @@ impl ChatView {
                         // A plain div: the component Button always centers its label.
                         div()
                             .id("new-session")
+                            .group(NEW_SESSION_GROUP)
                             .role(Role::Button)
                             .aria_label("New session")
                             .h(px(32.))
-                            // The plus starts 1.5px further into its icon than a title's
-                            // first letter does into its text, so the left padding is
-                            // 1.5px short of the cards' to line the plus up with them.
-                            .pl(px(10.5))
+                            // Centers the square over the gear at the foot, which puts
+                            // its left edge 3.5px out from the cards' titles.
+                            .pl(px(8.5))
                             .pr_3()
                             .flex()
                             .items_center()
-                            .gap_2()
+                            .gap_1p5()
                             .rounded_md()
                             .text_sm()
                             .cursor_pointer()
                             .hover(|style| style.bg(hover))
-                            .child(Icon::new(IconName::Plus).small())
+                            .child(
+                                div()
+                                    .size(NEW_SESSION_CHIP_SIZE)
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded_md()
+                                    .bg(hover)
+                                    // The row's hover fill is the square's own color, so
+                                    // the square steps toward the text color to stay visible.
+                                    .group_hover(NEW_SESSION_GROUP, move |style| {
+                                        style.bg(chip_hover)
+                                    })
+                                    .child(Icon::new(IconName::Plus).small()),
+                            )
                             .child("New session")
                             .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
                                 this.new_session(window, cx)
@@ -354,8 +375,8 @@ impl ChatView {
                             .aria_label("Settings")
                             .h(px(32.))
                             .flex_none()
-                            // The gear reaches about 1px further out than the plus above
-                            // it, so it starts 1px further in, and 1px closer to its label.
+                            // The gear nearly fills its 14px box, so the padding is 0.5px
+                            // short of the cards' to line its outline up with their titles.
                             .pl(px(11.5))
                             .pr_3()
                             .flex()
