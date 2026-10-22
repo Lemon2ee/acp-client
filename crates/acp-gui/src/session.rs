@@ -74,8 +74,7 @@ pub(crate) struct Session {
     /// In the sidebar's Archived list, out of the way.
     pub(crate) archived: bool,
     /// A turn prompted here is running, so the agent's text arrives as it is written: it
-    /// fades in, new rows come in with motion, and the transcript glides down to them. A
-    /// loaded session's replay shows at once.
+    /// fades in and new rows come in with motion. A loaded session's replay shows at once.
     live: bool,
     /// When each row added in a live turn came in, until its entrance has played. Kept
     /// here because the list drops a row's element state once it scrolls out of view.
@@ -471,15 +470,13 @@ impl Session {
         }
         self.changed = now;
         self.rows.push(row);
-        let live = self.live;
-        self.scroller.update(cx, |scroller, _| scroller.push(live));
+        self.scroller.update(cx, |scroller, _| scroller.push());
     }
 
     fn remeasure(&mut self, ix: usize, cx: &mut App) {
         self.changed = Instant::now();
-        let live = self.live;
         self.scroller
-            .update(cx, |scroller, _| scroller.remeasure(ix, live));
+            .update(cx, |scroller, _| scroller.remeasure(ix));
     }
 }
 
