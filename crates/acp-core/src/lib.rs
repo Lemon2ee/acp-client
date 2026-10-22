@@ -23,7 +23,8 @@ use agent_client_protocol::schema::v1::{
     SelectedPermissionOutcome, SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory,
     SessionConfigOptionValue, SessionConfigOptionsCapabilities, SessionConfigSelectOptions,
     SessionId, SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
-    SetSessionConfigOptionResponse, StopReason, ToolCallStatus,
+    SetSessionConfigOptionResponse, StopReason, ToolCallContent, ToolCallLocation, ToolCallStatus,
+    ToolKind as ProtocolToolKind,
 };
 use agent_client_protocol::schema::{MaybeUndefined, ProtocolVersion};
 use agent_client_protocol::util::{MatchDispatch, internal_error};
@@ -102,12 +103,20 @@ pub enum SessionEvent {
     ToolCall {
         id: String,
         title: String,
+        kind: ToolKind,
         status: ToolStatus,
+        content: Vec<ToolContent>,
+        locations: Vec<ToolLocation>,
     },
+    /// What changed in a tool call: each field the agent sent replaces the one before,
+    /// the content and the locations as a whole.
     ToolCallUpdate {
         id: String,
         title: Option<String>,
+        kind: Option<ToolKind>,
         status: Option<ToolStatus>,
+        content: Option<Vec<ToolContent>>,
+        locations: Option<Vec<ToolLocation>>,
     },
     Plan(Vec<String>),
     Permission(PermissionRequest),
@@ -177,6 +186,61 @@ impl From<ToolCallStatus> for ToolStatus {
     }
 }
 
+/// What a tool call does, as the agent sorts it, for a front end to pick its icon and
+/// how to show it. Named as ACP names them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToolKind {
+    Read,
+    Edit,
+    Delete,
+    Move,
+    Search,
+    Execute,
+    Think,
+    Fetch,
+    SwitchMode,
+    Other,
+}
+
+impl From<ProtocolToolKind> for ToolKind {
+    fn from(kind: ProtocolToolKind) -> Self {
+        match kind {
+            ProtocolToolKind::Read => ToolKind::Read,
+            ProtocolToolKind::Edit => ToolKind::Edit,
+            ProtocolToolKind::Delete => ToolKind::Delete,
+            ProtocolToolKind::Move => ToolKind::Move,
+            ProtocolToolKind::Search => ToolKind::Search,
+            ProtocolToolKind::Execute => ToolKind::Execute,
+            ProtocolToolKind::Think => ToolKind::Think,
+            ProtocolToolKind::Fetch => ToolKind::Fetch,
+            ProtocolToolKind::SwitchMode => ToolKind::SwitchMode,
+            // ACP may add kinds; one this version doesn't know is shown as any other tool.
+            _ => ToolKind::Other,
+        }
+    }
+}
+
+/// Something a tool call shows: what it produced, or the change it makes to a file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ToolContent {
+    /// Markdown. Claude's adapter sends a command's output and a file it read as a fenced
+    /// code block, the file's lines numbered.
+    Text(String),
+    /// A change to one file: its whole text before, none for a new file, and after.
+    Diff {
+        path: PathBuf,
+        old: Option<String>,
+        new: String,
+    },
+}
+
+/// A file a tool call works on, and the line it works at where the agent says.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ToolLocation {
+    pub path: PathBuf,
+    pub line: Option<u32>,
+}
+
 /// Something the agent lets the user choose for one session, such as its model.
 /// Serializable so a front end can show the settings from its last run while the
 /// agent creates a session.
@@ -230,6 +294,10 @@ pub struct SettingChoice {
 }
 
 pub struct PermissionRequest {
+    /// The id of the tool call it asks about. The call's fields as the request shows them
+    /// come just before it, as a `ToolCallUpdate`: the agent may show more there, such as
+    /// the change an edit would make, and may never have sent the call as a `ToolCall`.
+    pub tool_call: String,
     pub title: String,
     pub options: Vec<PermissionChoice>,
     respond: Option<oneshot::Sender<Option<String>>>,
@@ -1375,13 +1443,19 @@ fn ask_permission(
             ),
         })
         .collect();
-    let title = request
-        .tool_call
-        .fields
-        .title
-        .clone()
-        .unwrap_or_else(|| "tool call".into());
+    let tool_call = request.tool_call.tool_call_id.0.to_string();
+    let fields = request.tool_call.fields.clone();
+    let title = fields.title.clone().unwrap_or_else(|| "tool call".into());
+    events.emit(SessionEvent::ToolCallUpdate {
+        id: tool_call.clone(),
+        title: fields.title,
+        kind: fields.kind.map(ToolKind::from),
+        status: fields.status.map(ToolStatus::from),
+        content: fields.content.map(tool_content),
+        locations: fields.locations.map(tool_locations),
+    });
     events.emit(SessionEvent::Permission(PermissionRequest {
+        tool_call,
         title,
         options,
         respond: Some(respond),
@@ -1408,12 +1482,18 @@ fn flatten(update: SessionUpdate, replaying: bool) -> Option<SessionEvent> {
         SessionUpdate::ToolCall(call) => SessionEvent::ToolCall {
             id: call.tool_call_id.0.to_string(),
             title: call.title,
+            kind: call.kind.into(),
             status: call.status.into(),
+            content: tool_content(call.content),
+            locations: tool_locations(call.locations),
         },
         SessionUpdate::ToolCallUpdate(update) => SessionEvent::ToolCallUpdate {
             id: update.tool_call_id.0.to_string(),
             title: update.fields.title,
+            kind: update.fields.kind.map(ToolKind::from),
             status: update.fields.status.map(ToolStatus::from),
+            content: update.fields.content.map(tool_content),
+            locations: update.fields.locations.map(tool_locations),
         },
         SessionUpdate::Plan(plan) => SessionEvent::Plan(
             plan.entries
@@ -1504,6 +1584,33 @@ fn settings_of(options: &[SessionConfigOption]) -> Vec<Setting> {
                 value,
                 choices,
             })
+        })
+        .collect()
+}
+
+/// A tool call's content as front ends show it. Terminals are left out: the client
+/// doesn't offer them, so agents send a command's output as text instead.
+fn tool_content(content: Vec<ToolCallContent>) -> Vec<ToolContent> {
+    content
+        .into_iter()
+        .filter_map(|content| match content {
+            ToolCallContent::Content(content) => Some(ToolContent::Text(text_of(&content.content))),
+            ToolCallContent::Diff(diff) => Some(ToolContent::Diff {
+                path: diff.path,
+                old: diff.old_text,
+                new: diff.new_text,
+            }),
+            _ => None,
+        })
+        .collect()
+}
+
+fn tool_locations(locations: Vec<ToolCallLocation>) -> Vec<ToolLocation> {
+    locations
+        .into_iter()
+        .map(|location| ToolLocation {
+            path: location.path,
+            line: location.line,
         })
         .collect()
 }

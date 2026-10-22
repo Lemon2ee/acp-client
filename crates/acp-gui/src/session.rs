@@ -317,10 +317,12 @@ impl Session {
             SessionEvent::UserText(text) => self.append_user_text(&text, cx),
             SessionEvent::AgentText(text) => self.append_text(false, &text, cx),
             SessionEvent::AgentThought(text) => self.append_text(true, &text, cx),
-            SessionEvent::ToolCall { id, title, status } => {
-                self.push(Row::Tool { id, title, status }, cx)
-            }
-            SessionEvent::ToolCallUpdate { id, title, status } => {
+            SessionEvent::ToolCall {
+                id, title, status, ..
+            } => self.push(Row::Tool { id, title, status }, cx),
+            SessionEvent::ToolCallUpdate {
+                id, title, status, ..
+            } => {
                 let found =
                     self.rows
                         .iter_mut()

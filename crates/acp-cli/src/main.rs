@@ -64,7 +64,7 @@ fn main() -> ExitCode {
 
 /// Prints events until the agent is ready for the next prompt. `false` means it is gone.
 fn pump(events: &Receiver<Event>, lines: &mut impl Iterator<Item = io::Result<String>>) -> bool {
-    let mut tool_titles = HashMap::new();
+    let mut tools = HashMap::new();
     while let Ok(event) = events.recv_blocking() {
         match event {
             Event::Connected { agent } => println!("connected: {agent}"),
@@ -76,17 +76,26 @@ fn pump(events: &Receiver<Event>, lines: &mut impl Iterator<Item = io::Result<St
             Event::Session(_, update) => match update {
                 SessionEvent::AgentText(text) => print!("{text}"),
                 SessionEvent::AgentThought(text) => print!("\x1b[2m{text}\x1b[0m"),
-                SessionEvent::ToolCall { id, title, status } => {
+                SessionEvent::ToolCall {
+                    id, title, status, ..
+                } => {
                     println!("\n[tool] {title} ({status})");
-                    tool_titles.insert(id, title);
+                    tools.insert(id, (title, Some(status)));
                 }
-                SessionEvent::ToolCallUpdate { id, title, status } => {
+                SessionEvent::ToolCallUpdate {
+                    id, title, status, ..
+                } => {
+                    let tool = tools
+                        .entry(id)
+                        .or_insert_with(|| ("tool".to_string(), None));
                     if let Some(title) = title {
-                        tool_titles.insert(id.clone(), title);
+                        tool.0 = title;
                     }
-                    if let Some(status) = status {
-                        let title = tool_titles.get(&id).map_or("tool", String::as_str);
-                        println!("[tool] {title} ({status})");
+                    // A permission request repeats the call as it stands, so only a change
+                    // of status is printed.
+                    if let Some(status) = status.filter(|status| tool.1 != Some(*status)) {
+                        tool.1 = Some(status);
+                        println!("[tool] {} ({status})", tool.0);
                     }
                 }
                 SessionEvent::Plan(entries) => {
