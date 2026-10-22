@@ -4,7 +4,7 @@
 use std::borrow::Cow;
 use std::cell::Cell;
 use std::cmp::Reverse;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::Duration;
@@ -63,6 +63,9 @@ struct Session {
     /// What the agent lets the user choose for this session, such as its model; none
     /// until the agent has created it.
     settings: Vec<Setting>,
+    /// Switches flipped here whose change the agent hasn't answered yet, by setting id,
+    /// with the value asked for. They show that value meanwhile.
+    flipped: HashMap<String, bool>,
 }
 
 impl Session {
@@ -75,7 +78,18 @@ impl Session {
             busy: true,
             draft: SharedString::default(),
             settings: Vec::new(),
+            flipped: HashMap::new(),
         }
+    }
+
+    /// A setting as it shows: a switch flipped here shows the value asked for until the
+    /// agent answers.
+    fn shown(&self, setting: &Setting) -> Setting {
+        let mut setting = setting.clone();
+        if let Some(&on) = self.flipped.get(&setting.id) {
+            setting.value = SettingValue::Switch(on);
+        }
+        setting
     }
 
     fn apply(&mut self, event: SessionEvent, cx: &mut App) {
@@ -133,7 +147,15 @@ impl Session {
                 self.cancel_open_permissions(cx);
                 self.push(Row::Error(message), cx);
             }
-            SessionEvent::Settings(settings) => self.settings = settings,
+            SessionEvent::Settings(settings) => {
+                // A flip is done once the agent's settings show it.
+                self.flipped.retain(|id, on| {
+                    !settings.iter().any(|setting| {
+                        setting.id == *id && setting.value == SettingValue::Switch(*on)
+                    })
+                });
+                self.settings = settings;
+            }
             SessionEvent::ModeChanged(mode) => {
                 for setting in &mut self.settings {
                     if setting.kind == SettingKind::Mode {
@@ -141,7 +163,12 @@ impl Session {
                     }
                 }
             }
-            SessionEvent::SettingFailed(message) => self.push(Row::Error(message), cx),
+            SessionEvent::SettingFailed(message) => {
+                // It doesn't say which change failed, so every switch goes back to
+                // showing the agent's value.
+                self.flipped.clear();
+                self.push(Row::Error(message), cx)
+            }
         }
     }
 
@@ -355,6 +382,30 @@ impl ChatView {
         let _ = self
             .commands
             .try_send(Command::ChangeSetting(key, setting, value));
+    }
+
+    /// Flips one of the session's switches from the value it shows, which is the value
+    /// last asked for until the agent answers, so a second flip before then turns it
+    /// back. Unlike a pick from a list, the switch shows its new value at once.
+    fn flip_switch(&mut self, key: SessionKey, setting: String, cx: &mut Context<Self>) {
+        let Some(session) = self.session_mut(key) else {
+            return;
+        };
+        let shown = session
+            .settings
+            .iter()
+            .find(|shown| shown.id == setting)
+            .map(|shown| session.shown(shown).value);
+        let Some(SettingValue::Switch(on)) = shown else {
+            return;
+        };
+        session.flipped.insert(setting.clone(), !on);
+        let _ = self.commands.try_send(Command::ChangeSetting(
+            key,
+            setting,
+            SettingValue::Switch(!on),
+        ));
+        cx.notify();
     }
 
     /// The pointer came, at `position`, to a row of the model menu that wants `list` open
@@ -1023,19 +1074,17 @@ fn model_menu(
             .on_hover(menu.wants(list, false));
         match &setting.value {
             SettingValue::Switch(on) => {
-                let (view, key, id, on) = (menu.view.clone(), menu.key, setting.id.clone(), *on);
+                let (view, key, id) = (menu.view.clone(), menu.key, setting.id.clone());
                 row.child(
                     // Only shows the value: a press anywhere on the row flips it.
                     Switch::new(ElementId::Name(
                         format!("model-menu-switch-{}", setting.id).into(),
                     ))
-                    .checked(on)
+                    .checked(*on)
                     .tab_stop(false),
                 )
                 .on_click(move |_, _, cx| {
-                    let _ = view.update(cx, |this, _| {
-                        this.change_setting(key, id.clone(), SettingValue::Switch(!on))
-                    });
+                    let _ = view.update(cx, |this, cx| this.flip_switch(key, id.clone(), cx));
                 })
             }
             SettingValue::Choice(_) => row
@@ -1263,7 +1312,7 @@ impl ChatView {
                 .iter()
                 .filter(move |setting| setting.kind == kind)
         })
-        .cloned()
+        .map(|setting| session.shown(setting))
         .collect();
         let view = cx.entity().downgrade();
         let key = session.key;
