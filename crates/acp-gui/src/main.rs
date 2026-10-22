@@ -1633,6 +1633,11 @@ fn model_panel(
     })
 }
 
+/// How wide a mode's name and description run before they wrap. Most descriptions fit
+/// on one line; with the icon, the check and the menu's padding, the menu is at most
+/// about 390px wide.
+const MODE_TEXT_MAX_WIDTH: Pixels = px(320.);
+
 /// A row of the mode menu: the mode's icon and name, what it does below the name, and
 /// a check after the current mode. The icon and the check sit level with the name.
 fn mode_item(choice: &SettingChoice, current: bool) -> PopupMenuItem {
@@ -1653,6 +1658,10 @@ fn mode_item(choice: &SettingChoice, current: bool) -> PopupMenuItem {
                 v_flex()
                     .flex_1()
                     .min_w(px(0.))
+                    // The cap has to be here, not on the menu: asked for its narrowest
+                    // width, gpui's text answers with its whole line, so a row under a
+                    // narrower menu keeps that width and runs past the menu's edge.
+                    .max_w(MODE_TEXT_MAX_WIDTH)
                     .child(div().line_height(px(20.)).child(name.clone()))
                     .children(
                         description.clone().map(|description| {
@@ -1873,8 +1882,8 @@ impl ChatView {
         mode_button(&setting)
             .cursor_pointer()
             .dropdown_menu_with_anchor(Anchor::BottomLeft, move |menu, _, _| {
-                // Wide enough for most descriptions on one line; longer ones wrap.
-                let menu = menu.min_w(px(260.)).max_w(px(360.));
+                // As wide as its widest row; `mode_item` caps how wide a row gets.
+                let menu = menu.min_w(px(260.));
                 setting.choices.iter().fold(menu, |menu, choice| {
                     let current = setting.value == SettingValue::Choice(choice.id.clone());
                     let (view, id, value) = (view.clone(), setting.id.clone(), choice.id.clone());
