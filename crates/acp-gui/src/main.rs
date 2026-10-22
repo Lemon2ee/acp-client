@@ -302,8 +302,8 @@ struct ChatView {
     /// Never empty. New sessions go on the agent of the session on screen, until the
     /// user picks another agent's model.
     agents: Vec<AgentSlot>,
-    /// The window's top row, which holds the traffic lights on macOS and the sidebar
-    /// button: across the sidebar, or across the chat while the sidebar is hidden.
+    /// The window's top row, across the sidebar and the chat. It holds the traffic lights
+    /// on macOS, the sidebar button, and the name of the session on screen.
     title_bar_height: Pixels,
     /// Where the traffic lights end, from the window's left edge.
     traffic_lights_end: Pixels,
@@ -962,6 +962,8 @@ impl Render for ResizeSidebar {
 
 /// The sidebar button's icon: a window outline with a short bar near its right side.
 const SIDEBAR_ICON: &[u8] = include_bytes!("../assets/sidebar.svg");
+/// The sidebar button's width and height.
+const SIDEBAR_BUTTON_SIZE: Pixels = px(28.);
 
 /// On macOS the window has no title bar row: the sidebar and the chat both start at the
 /// top edge, with the traffic lights in the window's top row. Elsewhere the system
@@ -2135,6 +2137,18 @@ impl Render for ChatView {
                 .accessibility_label("Send")
                 .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.send(window, cx)))
         };
+        // 6px past the zoom button leaves about 12px before the sidebar button's outline.
+        // Without the traffic lights, the outline lines up with the sidebar's rows.
+        let toggle_left = if title_bar {
+            self.traffic_lights_end + px(6.)
+        } else {
+            px(14.25)
+        };
+        // A session has no name until its first prompt, and the row stays empty till then.
+        let name = session.title.clone();
+        // Level with the transcript's text, until the sidebar sliding away brings the
+        // name up to the sidebar button; from there it stays 6px past the button.
+        let name_left = (toggle_left + SIDEBAR_BUTTON_SIZE + px(6.) - sidebar_width).max(px(16.));
 
         // The chat fills the window right of the sidebar.
         let chat = div()
@@ -2145,11 +2159,18 @@ impl Render for ChatView {
             .overflow_hidden()
             .bg(background)
             .child(
-                // Opens up as the sidebar goes, for the traffic lights and the sidebar
-                // button to sit in.
+                // The session's name, in the window's top row. While the sidebar is
+                // hidden the traffic lights and the sidebar button sit here too.
                 div()
                     .flex_none()
-                    .h(self.title_bar_height * hidden)
+                    .h(self.title_bar_height)
+                    .pl(name_left)
+                    .pr_4()
+                    .flex()
+                    .items_center()
+                    .text_sm()
+                    .font_weight(FontWeight::MEDIUM)
+                    .children(name.map(|name| div().flex_1().min_w(px(0.)).truncate().child(name)))
                     .when(title_bar, as_title_bar),
             )
             .child(
@@ -2216,15 +2237,9 @@ impl Render for ChatView {
                 "Show sidebar"
             })
             .absolute()
-            .top((self.title_bar_height - px(28.)) / 2.)
-            // 6px past the zoom button leaves about 12px before the icon's outline.
-            // Without the traffic lights, the outline lines up with the sidebar's rows.
-            .left(if title_bar {
-                self.traffic_lights_end + px(6.)
-            } else {
-                px(14.25)
-            })
-            .size(px(28.))
+            .top((self.title_bar_height - SIDEBAR_BUTTON_SIZE) / 2.)
+            .left(toggle_left)
+            .size(SIDEBAR_BUTTON_SIZE)
             .flex()
             .items_center()
             .justify_center()
