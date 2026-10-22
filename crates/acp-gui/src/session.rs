@@ -3,13 +3,15 @@
 //! agent's events for it lands there.
 
 mod pacing;
+mod tool_call;
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::ops::Range;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use acp_core::{
-    PermissionRequest, SessionEvent, SessionKey, Setting, SettingKind, SettingValue, ToolStatus,
+    SessionEvent, SessionKey, Setting, SettingKind, SettingValue, ToolKind, ToolStatus,
 };
 use gpui_kit::base::Easing;
 use gpui_kit::component::ActiveTheme as _;
@@ -19,6 +21,7 @@ use gpui_kit::*;
 use crate::chat_view::scroller::TranscriptScroll;
 use crate::config::TitleSource;
 use pacing::Pacer;
+pub(crate) use tool_call::{Answer, Ask, Code, Diff, DiffLine, Shown, ToolCall};
 
 /// How much later each word of a streamed piece starts fading in than the one before,
 /// as in gpui-component's own `TextView::stream_fade`.
@@ -29,17 +32,8 @@ pub(crate) enum Row {
     /// Markdown, grown chunk by chunk as the agent streams.
     Agent(Entity<TextViewState>),
     Thought(Entity<TextViewState>),
-    Tool {
-        id: String,
-        title: String,
-        status: ToolStatus,
-    },
-    Permission {
-        request: PermissionRequest,
-        /// Replaces the option buttons once the request is closed: how it was answered,
-        /// or that it was cancelled.
-        decided: Option<String>,
-    },
+    /// A tool call, with the agent's request for permission to run it if it sent one.
+    Tool(ToolCall),
     Notice(String),
     Error(String),
 }
@@ -87,6 +81,9 @@ pub(crate) struct Session {
     /// The agent's text in a live turn, held back to show at an even pace, and the
     /// transcript's events that came after it.
     pacer: Pacer,
+    /// Groups of tool calls the user opened or closed, by their first row, which keep
+    /// that rather than opening and closing with the turn.
+    groups_set: HashMap<usize, bool>,
 }
 
 /// Which run a session's agent session comes from.
@@ -130,6 +127,7 @@ impl Session {
             entering: HashMap::new(),
             changed: Instant::now(),
             pacer: Pacer::default(),
+            groups_set: HashMap::new(),
         }
     }
 
@@ -144,6 +142,15 @@ impl Session {
         if self.waiting() != waiting {
             self.remeasure(self.rows.len() - 1, cx);
         }
+        // A group of tool calls the turn ended on closes.
+        if !live {
+            self.remeasure_tail_group(cx);
+        }
+    }
+
+    /// A turn prompted here is running.
+    pub(crate) fn is_live(&self) -> bool {
+        self.live
     }
 
     /// Waiting on the agent in a live turn: nothing has come since the prompt, or since
@@ -152,7 +159,7 @@ impl Session {
         self.live
             && match self.rows.last() {
                 Some(Row::User(_)) => true,
-                Some(Row::Tool { status, .. }) => status.finished(),
+                Some(Row::Tool(call)) => call.status.finished(),
                 _ => false,
             }
     }
@@ -213,7 +220,7 @@ impl Session {
         };
         self.rows
             .iter()
-            .any(|row| matches!(row, Row::Tool { id: shown, .. } if shown == id))
+            .any(|row| matches!(row, Row::Tool(call) if call.id == *id))
     }
 
     /// Whether any text or event is held back, for `pace` to show.
@@ -317,45 +324,66 @@ impl Session {
             SessionEvent::UserText(text) => self.append_user_text(&text, cx),
             SessionEvent::AgentText(text) => self.append_text(false, &text, cx),
             SessionEvent::AgentThought(text) => self.append_text(true, &text, cx),
-            SessionEvent::ToolCall { id, title, status } => {
-                self.push(Row::Tool { id, title, status }, cx)
+            SessionEvent::ToolCall {
+                id,
+                title,
+                kind,
+                status,
+                content,
+                locations,
+            } => {
+                let mut call = ToolCall::new(id, title, kind, status, self.live);
+                call.update(None, None, None, Some(content), Some(locations), cx);
+                self.push(Row::Tool(call), cx)
             }
-            SessionEvent::ToolCallUpdate { id, title, status } => {
-                let found =
-                    self.rows
-                        .iter_mut()
-                        .enumerate()
-                        .rev()
-                        .find_map(|(ix, row)| match row {
-                            Row::Tool {
-                                id: row_id,
-                                title: row_title,
-                                status: row_status,
-                            } if *row_id == id => {
-                                if let Some(title) = title.clone() {
-                                    *row_title = title;
-                                }
-                                if let Some(status) = status {
-                                    *row_status = status;
-                                }
-                                Some(ix)
-                            }
-                            _ => None,
-                        });
-                if let Some(ix) = found {
-                    self.remeasure(ix, cx);
+            SessionEvent::ToolCallUpdate {
+                id,
+                title,
+                kind,
+                status,
+                content,
+                locations,
+            } => {
+                // A call the agent never sent comes first in a permission request; acp-core
+                // sends its fields as an update just before.
+                let ix = self.tool_call_row(&id).unwrap_or_else(|| {
+                    let title = title.clone().unwrap_or_else(|| "Tool call".into());
+                    let call = ToolCall::new(
+                        id,
+                        title,
+                        kind.unwrap_or(ToolKind::Other),
+                        status.unwrap_or(ToolStatus::Pending),
+                        self.live,
+                    );
+                    self.push(Row::Tool(call), cx);
+                    self.rows.len() - 1
+                });
+                if let Row::Tool(call) = &mut self.rows[ix] {
+                    call.update(title, kind, status, content, locations, cx);
                 }
+                self.remeasure(ix, cx);
             }
             SessionEvent::Plan(entries) => {
                 self.push(Row::Notice(format!("plan\n{}", entries.join("\n"))), cx)
             }
-            SessionEvent::Permission(request) => self.push(
-                Row::Permission {
-                    request,
-                    decided: None,
-                },
-                cx,
-            ),
+            SessionEvent::Permission(request) => {
+                let ix = self.tool_call_row(&request.tool_call).unwrap_or_else(|| {
+                    let call = ToolCall::new(
+                        request.tool_call.clone(),
+                        request.title.clone(),
+                        ToolKind::Other,
+                        ToolStatus::Pending,
+                        self.live,
+                    );
+                    self.push(Row::Tool(call), cx);
+                    self.rows.len() - 1
+                });
+                if let Row::Tool(call) = &mut self.rows[ix] {
+                    call.ask(request, cx);
+                }
+                // The call's group opens for the card.
+                self.remeasure_group(ix, cx);
+            }
             // The turn's last row still comes in as the turn's others did.
             SessionEvent::TurnEnded { stop_reason } => {
                 self.busy = false;
@@ -411,35 +439,123 @@ impl Session {
         prompt.is_some_and(|prompt| echoes(prompt, title))
     }
 
+    /// Opens or closes the tool call at `ix`, to show what it produced or the change it
+    /// makes.
+    pub(crate) fn toggle_tool_call(&mut self, ix: usize, cx: &mut App) {
+        if let Some(Row::Tool(call)) = self.rows.get_mut(ix) {
+            call.open = !call.open;
+            self.remeasure(ix, cx);
+        }
+    }
+
+    /// The run of tool calls with no other row between them that the one at `ix` is in.
+    pub(crate) fn tool_group(&self, ix: usize) -> Range<usize> {
+        let is_tool = |row: &Row| matches!(row, Row::Tool(_));
+        let start = self.rows[..ix]
+            .iter()
+            .rposition(|row| !is_tool(row))
+            .map_or(0, |before| before + 1);
+        let end = self.rows[ix..]
+            .iter()
+            .position(|row| !is_tool(row))
+            .map_or(self.rows.len(), |after| ix + after);
+        start..end
+    }
+
+    /// Whether a group of tool calls shows its calls: while one of them asks for
+    /// permission; as the user left it; or else while it is the latest thing in a live
+    /// turn, so the calls show as they run and fold once the agent writes again.
+    pub(crate) fn group_open(&self, group: &Range<usize>) -> bool {
+        let asking = self.rows[group.clone()]
+            .iter()
+            .any(|row| matches!(row, Row::Tool(call) if call.asking()));
+        asking
+            || self
+                .groups_set
+                .get(&group.start)
+                .copied()
+                .unwrap_or(self.live && group.end == self.rows.len())
+    }
+
+    /// Opens or closes the group of tool calls that starts at `first`, for good.
+    pub(crate) fn toggle_tool_group(&mut self, first: usize, cx: &mut App) {
+        let group = self.tool_group(first);
+        let open = !self.group_open(&group);
+        self.groups_set.insert(group.start, open);
+        self.remeasure_group(first, cx);
+    }
+
+    /// Has the group of tool calls the one at `ix` is in measured again, as it opens,
+    /// closes or changes its header.
+    fn remeasure_group(&mut self, ix: usize, cx: &mut App) {
+        for ix in self.tool_group(ix) {
+            self.remeasure(ix, cx);
+        }
+    }
+
+    /// Has the group of tool calls at the end measured again, as it is about to close by
+    /// itself: rows of it out of view would otherwise keep their open height.
+    fn remeasure_tail_group(&mut self, cx: &mut App) {
+        let Some(last) = self.rows.len().checked_sub(1) else {
+            return;
+        };
+        if !matches!(self.rows[last], Row::Tool(_)) {
+            return;
+        }
+        if !self.groups_set.contains_key(&self.tool_group(last).start) {
+            self.remeasure_group(last, cx);
+        }
+    }
+
+    /// The folder the agent works in for it, where it comes from an earlier run; a new
+    /// one works in the window's.
+    pub(crate) fn folder(&self) -> Option<&Path> {
+        match &self.origin {
+            Origin::Saved(folder) | Origin::Loaded(folder) => Some(folder),
+            Origin::New => None,
+        }
+    }
+
     /// acp-core stops taking answers to a turn's permission requests once the turn is
     /// stopped or over, so the cards still open show as cancelled instead of offering options.
     pub(crate) fn cancel_open_permissions(&mut self, cx: &mut App) {
         for ix in 0..self.rows.len() {
-            if let Row::Permission {
-                decided: decided @ None,
-                ..
-            } = &mut self.rows[ix]
+            if let Row::Tool(call) = &mut self.rows[ix]
+                && let Some(ask) = call.ask.as_mut().filter(|ask| ask.answer == Answer::Open)
             {
-                *decided = Some("cancelled".into());
-                self.remeasure(ix, cx);
+                ask.answer = Answer::Cancelled;
+                self.remeasure_group(ix, cx);
             }
         }
     }
 
+    /// Answers the permission request on the tool call at `ix` with an option's id, or
+    /// `None` to reject it.
     pub(crate) fn answer(&mut self, ix: usize, choice: Option<String>, cx: &mut App) {
-        if let Some(Row::Permission { request, decided }) = self.rows.get_mut(ix) {
-            let label = choice
-                .as_ref()
-                .and_then(|id| request.options.iter().find(|option| option.id == *id))
-                .map_or_else(|| "rejected".to_string(), |option| option.name.clone());
-            // The turn may have been stopped or ended since the card was drawn.
-            *decided = Some(if request.answer(choice) {
-                format!("answered: {label}")
-            } else {
-                "cancelled".into()
-            });
-            self.remeasure(ix, cx);
-        }
+        let Some(Row::Tool(call)) = self.rows.get_mut(ix) else {
+            return;
+        };
+        let Some(ask) = call.ask.as_mut().filter(|ask| ask.answer == Answer::Open) else {
+            return;
+        };
+        let allowed = choice
+            .as_ref()
+            .and_then(|id| ask.request.options.iter().find(|option| option.id == *id))
+            .is_some_and(|option| option.allow);
+        // The turn may have been stopped or ended since the card was drawn.
+        ask.answer = match ask.request.answer(choice) {
+            false => Answer::Cancelled,
+            true if allowed => Answer::Allowed,
+            true => Answer::Rejected,
+        };
+        self.remeasure_group(ix, cx);
+    }
+
+    /// The row of the latest tool call with this id.
+    fn tool_call_row(&self, id: &str) -> Option<usize> {
+        self.rows
+            .iter()
+            .rposition(|row| matches!(row, Row::Tool(call) if call.id == id))
     }
 
     /// Streams arrive as small chunks; grow the last row instead of adding one per chunk.
@@ -486,6 +602,10 @@ impl Session {
     }
 
     pub(crate) fn push(&mut self, row: Row, cx: &mut App) {
+        // A group of tool calls closes once the agent goes on to something else.
+        if !matches!(row, Row::Tool(_)) {
+            self.remeasure_tail_group(cx);
+        }
         let now = Instant::now();
         if self.live {
             self.entering.insert(self.rows.len(), now);

@@ -13,7 +13,7 @@ mod session;
 use std::borrow::Cow;
 
 use acp_core::{AcpAgent, Harness};
-use gpui_kit::base::actions::{Confirm, SelectDown, SelectUp};
+use gpui_kit::base::actions::{Cancel, Confirm, SelectDown, SelectUp};
 use gpui_kit::component::Theme;
 use gpui_kit::*;
 
@@ -24,8 +24,8 @@ use crate::chrome::{
 };
 use crate::config::{AppSettings, load_settings};
 
-// The icons `mode_icon` and the settings use beyond those in the component library's
-// own bundle.
+// The icons `mode_icon`, the settings and the tool calls' kinds use beyond those in the
+// component library's own bundle.
 gpui_kit::assets::icon_assets!(
     ExtraIcons,
     [
@@ -38,7 +38,16 @@ gpui_kit::assets::icon_assets!(
         Shield,
         SlidersHorizontal,
         Keyboard,
-        Monitor
+        Monitor,
+        Pencil,
+        Trash,
+        ArrowRightLeft,
+        Terminal,
+        Lightbulb,
+        ToggleRight,
+        Wrench,
+        Layers,
+        CheckCheck
     ]
 );
 
@@ -154,6 +163,23 @@ fn main() {
                 KeyBinding::new("down", SelectDown, Some("PickerMenu")),
                 KeyBinding::new("enter", Confirm { secondary: false }, Some("PickerMenu")),
                 KeyBinding::new("space", Confirm { secondary: false }, Some("PickerMenu")),
+            ]);
+            // On a permission card holding the keys, Up and Down move between its
+            // options, Enter or Space answers with the lit one, and Esc says no.
+            cx.bind_keys([
+                KeyBinding::new("up", SelectUp, Some("PermissionCard")),
+                KeyBinding::new("down", SelectDown, Some("PermissionCard")),
+                KeyBinding::new(
+                    "enter",
+                    Confirm { secondary: false },
+                    Some("PermissionCard"),
+                ),
+                KeyBinding::new(
+                    "space",
+                    Confirm { secondary: false },
+                    Some("PermissionCard"),
+                ),
+                KeyBinding::new("escape", Cancel, Some("PermissionCard")),
             ]);
             #[cfg(feature = "profile")]
             bind_frame_overlay(cx);

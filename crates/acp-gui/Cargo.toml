@@ -26,6 +26,9 @@ gpui-kit = "0.8"
 # settings between runs.
 serde.workspace = true
 serde_json.workspace = true
+# Works out the lines an agent's edit changes, from the whole file before and after that
+# ACP sends. gpui-component already builds it at this version.
+similar = "2.7"
 # Hands the system-wide shortcut's presses from Carbon's callback to the window.
 smol.workspace = true
 
