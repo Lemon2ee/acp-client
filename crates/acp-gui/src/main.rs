@@ -30,6 +30,7 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
+use serde::{Deserialize, Serialize};
 
 enum Row {
     User(String),
@@ -76,6 +77,20 @@ struct Session {
     /// switches, and every setting of a session the agent hasn't created yet, as no
     /// answer comes until it has.
     asked: HashMap<String, Asked>,
+    /// The agent's id for it, once the agent has it, which keeps it for later runs.
+    id: Option<String>,
+    origin: Origin,
+}
+
+/// Which run a session's agent session comes from.
+enum Origin {
+    /// This one: the agent creates it on its first prompt, or as a spare.
+    New,
+    /// An earlier one, and the agent hasn't been asked to load it yet: the folder it
+    /// was created in, which loading it needs. It loads as it first shows.
+    Saved(PathBuf),
+    /// An earlier one, and the agent has been asked to load it.
+    Loaded,
 }
 
 /// A setting changed here, until the agent has answered every change it was asked for.
@@ -99,6 +114,8 @@ impl Session {
             settings: Vec::new(),
             created: false,
             asked: HashMap::new(),
+            id: None,
+            origin: Origin::New,
         }
     }
 
@@ -138,6 +155,8 @@ impl Session {
 
     fn apply(&mut self, event: SessionEvent, cx: &mut App) {
         match event {
+            SessionEvent::Created(id) => self.id = Some(id),
+            SessionEvent::UserText(text) => self.append_user_text(&text, cx),
             SessionEvent::AgentText(text) => self.append_text(false, &text, cx),
             SessionEvent::AgentThought(text) => self.append_text(true, &text, cx),
             SessionEvent::ToolCall { id, title, status } => {
@@ -268,6 +287,16 @@ impl Session {
         self.remeasure(self.rows.len() - 1, cx);
     }
 
+    /// The user's own messages come back in parts as the agent replays a session it
+    /// loads, each part of a message after the one before.
+    fn append_user_text(&mut self, text: &str, cx: &mut App) {
+        match self.rows.last_mut() {
+            Some(Row::User(message)) => message.push_str(text),
+            _ => return self.push(Row::User(text.to_string()), cx),
+        }
+        self.remeasure(self.rows.len() - 1, cx);
+    }
+
     fn push(&mut self, row: Row, cx: &mut App) {
         self.rows.push(row);
         self.scroller.update(cx, |scroller, cx| {
@@ -304,9 +333,10 @@ struct AgentSlot {
 }
 
 struct ChatView {
-    /// Never empty: the window starts with one session, which its first prompt has the
-    /// agent create. At most one has no prompt yet; the sidebar leaves it out, and a new
-    /// one on another agent takes its place.
+    /// Never empty: the window starts with the sessions kept from earlier runs, oldest
+    /// first, and one new session, which its first prompt has the agent create. At most
+    /// one has no prompt yet; the sidebar leaves it out, and a new one on another agent
+    /// takes its place.
     sessions: Vec<Session>,
     /// Index into `sessions` of the one on screen.
     active: usize,
@@ -315,6 +345,8 @@ struct ChatView {
     /// Never empty. New sessions go on the agent of the session on screen, until the
     /// user picks another agent's model.
     agents: Vec<AgentSlot>,
+    /// The folder the agents create new sessions in.
+    cwd: PathBuf,
     /// The window's top row, across the sidebar and the chat. It holds the traffic lights
     /// on macOS, the sidebar button, and the name of the session on screen.
     title_bar_height: Pixels,
@@ -332,8 +364,9 @@ struct ChatView {
 }
 
 impl ChatView {
-    /// Starts every agent in `agents`, each by name, and shows a session on the first
-    /// that no agent creates until its first prompt.
+    /// Starts every agent in `agents`, each by name, lists the sessions kept from
+    /// earlier runs on them, and shows a session on the first that no agent creates
+    /// until its first prompt.
     fn new(
         agents: Vec<(String, AcpAgent)>,
         cwd: PathBuf,
@@ -400,6 +433,7 @@ impl ChatView {
             next_key: 0,
             input,
             agents,
+            cwd,
             title_bar_height,
             traffic_lights_end,
             sidebar_open: true,
@@ -412,8 +446,80 @@ impl ChatView {
             _input_events: input_events,
             _search_events: search_events,
         };
-        view.new_session(window, cx);
+        view.restore_sessions(cx);
+        // On the first agent, whatever agent the oldest kept session is on, and even if
+        // that agent is already gone, so there is always a session to show.
+        let ix = view.untitled_on(0, cx);
+        view.show(ix, window, cx);
         view
+    }
+
+    /// Lists the sessions kept from earlier runs on the window's agents. None is loaded
+    /// until it shows, as Claude's adapter starts a Claude Code process for each.
+    fn restore_sessions(&mut self, cx: &mut App) {
+        for saved in load_saved_sessions() {
+            let agent = self
+                .agents
+                .iter()
+                .position(|slot| kept_name(&slot.name) == Some(saved.agent.as_str()));
+            let Some(agent) = agent else {
+                continue;
+            };
+            let key = SessionKey(self.next_key);
+            self.next_key += 1;
+            let mut session = Session::new(key, agent, cx);
+            session.title = Some(saved.title);
+            session.id = Some(saved.id);
+            session.origin = Origin::Saved(saved.cwd);
+            self.sessions.push(session);
+        }
+    }
+
+    /// Has the agent load a session kept from an earlier run, as it first shows. Its
+    /// transcript comes in as the agent replays it, and it takes prompts once loaded.
+    fn load(&mut self, ix: usize, cx: &mut App) {
+        let session = &mut self.sessions[ix];
+        let (Origin::Saved(cwd), Some(id)) = (&session.origin, &session.id) else {
+            return;
+        };
+        let load = Command::LoadSession(session.key, id.clone(), cwd.clone());
+        session.origin = Origin::Loaded;
+        session.busy = true;
+        let slot = &self.agents[session.agent];
+        if slot.commands.try_send(load).is_err() {
+            let message = format!("{} has gone; restart to use it", slot.name);
+            session.push(Row::Error(message), cx);
+        }
+    }
+
+    /// Keeps the session for later runs once it has both the agent's id and a title.
+    /// Only Claude's and Codex's are kept: any other agent is named only by its
+    /// command, which may carry a secret. One from an earlier run is kept already.
+    fn save_session(&self, key: SessionKey) {
+        let Some(session) = self.session(key) else {
+            return;
+        };
+        let (Some(id), Some(title)) = (&session.id, &session.title) else {
+            return;
+        };
+        let Some(agent) = kept_name(&self.agents[session.agent].name) else {
+            return;
+        };
+        if !matches!(session.origin, Origin::New) {
+            return;
+        }
+        let saved = SavedSession {
+            agent: agent.to_string(),
+            id: id.clone(),
+            title: title.clone(),
+            cwd: self.cwd.clone(),
+        };
+        let changed = config_folder()
+            .ok_or_else(|| std::io::Error::other("there is no config folder"))
+            .and_then(|folder| change_saved_sessions(&folder, |sessions| sessions.push(saved)));
+        if let Err(err) = changed {
+            eprintln!("couldn't keep the session for later runs: {err}");
+        }
     }
 
     /// A session on the agent that the agent hasn't created yet: acp-core has it created
@@ -433,11 +539,14 @@ impl ChatView {
     }
 
     /// Makes a spare session for each agent whose models the model menu could list no
-    /// other way: it has no spare, no session on show, and no settings kept from before.
-    /// None is made before the window's first prompt, so starting the window has no
-    /// agent create a session.
+    /// other way: it has no spare, no session on show that it will create or load, and
+    /// no settings kept from before. None is made before the window's first prompt or
+    /// load, so starting the window has no agent create a session.
     fn make_spares(&mut self, cx: &mut App) {
-        if self.sessions.iter().all(|session| session.title.is_none()) {
+        let asked = |session: &Session| {
+            session.title.is_some() && !matches!(session.origin, Origin::Saved(_))
+        };
+        if !self.sessions.iter().any(asked) {
             return;
         }
         for agent in 0..self.agents.len() {
@@ -445,7 +554,9 @@ impl ChatView {
             if slot.spare.is_some()
                 || !slot.last_settings.is_empty()
                 || slot.commands.is_closed()
-                || self.sessions.iter().any(|session| session.agent == agent)
+                || self.sessions.iter().any(|session| {
+                    session.agent == agent && !matches!(session.origin, Origin::Saved(_))
+                })
             {
                 continue;
             }
@@ -514,15 +625,10 @@ impl ChatView {
         }
     }
 
-    /// Shows a session with no prompt yet on the agent of the one on screen. The
-    /// window's first session is added even if the agent is already gone, so there is
-    /// always one to show.
+    /// Shows a session with no prompt yet on the agent of the one on screen.
     fn new_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let agent = self
-            .sessions
-            .get(self.active)
-            .map_or(0, |session| session.agent);
-        if self.agents[agent].commands.is_closed() && !self.sessions.is_empty() {
+        let agent = self.sessions[self.active].agent;
+        if self.agents[agent].commands.is_closed() {
             return;
         }
         let ix = self.untitled_on(agent, cx);
@@ -564,8 +670,10 @@ impl ChatView {
         }
     }
 
-    /// Puts the session at `ix` on screen; unsent text stays with the session it was typed in.
+    /// Puts the session at `ix` on screen; unsent text stays with the session it was typed
+    /// in. One kept from an earlier run loads now.
     fn show(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.load(ix, cx);
         if ix != self.active {
             self.sessions[self.active].draft = self.input.read(cx).value();
             self.active = ix;
@@ -627,14 +735,21 @@ impl ChatView {
             return;
         }
         self.input.update(cx, |input, cx| input.clean(window, cx));
+        let first = session.title.is_none();
         session
             .title
             .get_or_insert_with(|| text.lines().next().unwrap_or_default().to_string());
         session.busy = true;
         session.push(Row::User(text.clone()), cx);
+        let key = session.key;
         // Has the agent create the session first, if it hasn't yet.
-        let prompt = Command::Prompt(session.key, text);
+        let prompt = Command::Prompt(key, text);
         let _ = self.agents[session.agent].commands.try_send(prompt);
+        // A spare the agent created has its id already; any other session is kept
+        // once the agent gives it one.
+        if first {
+            self.save_session(key);
+        }
         // The window's first prompt lets the agents that need one make a spare.
         self.make_spares(cx);
         cx.notify();
@@ -734,12 +849,12 @@ impl ChatView {
     }
 
     /// Keeps the settings the agent created the session with as its last, here and on
-    /// disk, unless they are the ones kept already. Only a session's first settings are
-    /// those: later ones carry the changes made to it.
+    /// disk, unless they are the ones kept already. Only a new session's first settings
+    /// are those: later ones carry the changes made to it, as a loaded session's may.
     fn remember_settings(&mut self, agent: usize, key: SessionKey, settings: &[Setting]) {
         let first = self
             .session_mut(key)
-            .is_some_and(|session| !session.created);
+            .is_some_and(|session| !session.created && matches!(session.origin, Origin::New));
         let slot = &mut self.agents[agent];
         if !first || slot.last_settings == settings {
             return;
@@ -797,8 +912,12 @@ impl ChatView {
                     // failing after this is news.
                     self.agents[agent].spare_failed = false;
                 }
+                let created = matches!(event, SessionEvent::Created(_));
                 if let Some(session) = self.session_mut(key) {
                     session.apply(event, cx);
+                }
+                if created {
+                    self.save_session(key);
                 }
             }
             // Connection-wide failures show in the session on screen when it is the
@@ -2353,6 +2472,56 @@ fn save_last_settings(folder: &Path, agent: &str, settings: &[Setting]) -> std::
     all.insert(agent.to_string(), settings.to_vec());
     let written = folder.join(format!("{LAST_SETTINGS}.new"));
     std::fs::write(&written, serde_json::to_vec(&all)?)?;
+    std::fs::rename(&written, &path)
+}
+
+/// Holds the sessions kept for later runs, oldest first, as JSON.
+const SESSIONS: &str = "sessions";
+
+/// A session kept for later runs, which the agent loads by its id.
+#[derive(Serialize, Deserialize)]
+struct SavedSession {
+    /// Its agent's `kept_name`.
+    agent: String,
+    /// The agent's id for it.
+    id: String,
+    title: String,
+    /// The folder the agent created it in, which loading it needs.
+    cwd: PathBuf,
+}
+
+/// A file that is missing or can't be read gives none.
+fn load_saved_sessions() -> Vec<SavedSession> {
+    config_folder()
+        .and_then(|folder| read_saved_sessions(&folder.join(SESSIONS)).ok())
+        .unwrap_or_default()
+}
+
+/// An error other than a missing file is passed on, so sessions that couldn't be read
+/// aren't written over.
+fn read_saved_sessions(path: &Path) -> std::io::Result<Vec<SavedSession>> {
+    match std::fs::read(path) {
+        Ok(json) => Ok(serde_json::from_slice(&json)?),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(err) => Err(err),
+    }
+}
+
+/// Makes `change` to the sessions kept in `folder`. Windows changing them at once take
+/// turns under a lock, and the new file replaces the old one whole.
+fn change_saved_sessions(
+    folder: &Path,
+    change: impl FnOnce(&mut Vec<SavedSession>),
+) -> std::io::Result<()> {
+    std::fs::create_dir_all(folder)?;
+    // Held until the new file is in place.
+    let lock = std::fs::File::create(folder.join(format!("{SESSIONS}.lock")))?;
+    lock.lock()?;
+    let path = folder.join(SESSIONS);
+    let mut sessions = read_saved_sessions(&path)?;
+    change(&mut sessions);
+    let written = folder.join(format!("{SESSIONS}.new"));
+    std::fs::write(&written, serde_json::to_vec(&sessions)?)?;
     std::fs::rename(&written, &path)
 }
 
