@@ -13,7 +13,8 @@ use acp_core::{
     AcpAgent, Command, Event as AgentEvent, PermissionRequest, Sender, SessionEvent, SessionKey,
     Setting, SettingChoice, SettingKind, SettingValue,
 };
-use gpui_kit::base::{ElementExt as _, Transition, transition};
+use gpui_kit::base::input::Copy;
+use gpui_kit::base::{ElementExt as _, SelectableText, TextSelection, Transition, transition};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{
     InputEvent, InputGroup, InputGroupAddon, InputGroupAddonAlignment, InputGroupButton, Textarea,
@@ -577,11 +578,12 @@ impl ChatView {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let theme = cx.theme();
-        let (muted, border, bubble, danger) = (
+        let (muted, border, bubble, danger, selection) = (
             theme.muted_foreground,
             theme.border,
             theme.secondary,
             theme.danger,
+            theme.selection,
         );
         let session = &self.sessions[self.active];
         let key = session.key;
@@ -597,20 +599,31 @@ impl ChatView {
                         .py_2()
                         .rounded_lg()
                         .bg(bubble)
-                        .child(SharedString::from(text.clone())),
+                        .child(
+                            SelectableText::new(row_id("user", key, ix), text.clone())
+                                .selection_color(selection),
+                        ),
                 )
                 .into_any_element(),
-            Row::Agent(view) => row.child(TextView::new(view)).into_any_element(),
+            Row::Agent(view) => row
+                .child(TextView::new(view).selectable(true))
+                .into_any_element(),
             Row::Thought(view) => row
                 .text_sm()
                 .italic()
                 .text_color(muted)
-                .child(TextView::new(view))
+                .child(TextView::new(view).selectable(true))
                 .into_any_element(),
             Row::Tool { title, status, .. } => row
                 .text_sm()
                 .text_color(muted)
-                .child(format!("tool: {title} ({status})"))
+                .child(
+                    SelectableText::new(
+                        row_id("tool", key, ix),
+                        format!("tool: {title} ({status})"),
+                    )
+                    .selection_color(selection),
+                )
                 .into_any_element(),
             Row::Permission { request, decided } => {
                 let card = div()
@@ -623,7 +636,13 @@ impl ChatView {
                     .rounded_md()
                     .border_1()
                     .border_color(border)
-                    .child(format!("Permission requested: {}", request.title));
+                    .child(
+                        SelectableText::new(
+                            row_id("permission", key, ix),
+                            format!("Permission requested: {}", request.title),
+                        )
+                        .selection_color(selection),
+                    );
                 let card = match decided {
                     Some(note) => card.child(div().text_sm().text_color(muted).child(note.clone())),
                     None => card.child(
@@ -656,15 +675,27 @@ impl ChatView {
             Row::Notice(text) => row
                 .text_sm()
                 .text_color(muted)
-                .child(SharedString::from(text.clone()))
+                .child(
+                    SelectableText::new(row_id("notice", key, ix), text.clone())
+                        .selection_color(selection),
+                )
                 .into_any_element(),
             Row::Error(text) => row
                 .text_sm()
                 .text_color(danger)
-                .child(SharedString::from(text.clone()))
+                .child(
+                    SelectableText::new(row_id("error", key, ix), text.clone())
+                        .selection_color(selection),
+                )
                 .into_any_element(),
         }
     }
+}
+
+/// A selectable row's element id, which carries the session so a row of one session
+/// never inherits the selection state of another session's row at the same index.
+fn row_id(kind: &str, key: SessionKey, ix: usize) -> ElementId {
+    ElementId::Name(format!("{kind}-{}-{ix}", key.0).into())
 }
 
 const SIDEBAR_WIDTH: f32 = 240.;
@@ -1729,6 +1760,16 @@ impl Render for ChatView {
             .flex()
             .bg(sidebar)
             .text_color(foreground)
+            // The prompt box keeps keyboard focus while text in the chat is selected, and
+            // its own Copy handler would swallow cmd-c, so copy the chat's selection first.
+            .capture_action(|_: &Copy, window, cx| {
+                let text = TextSelection::selected_text(window, cx).trim().to_string();
+                if text.is_empty() {
+                    return;
+                }
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
+                cx.stop_propagation();
+            })
             .child(
                 // The sidebar keeps its width and slides out to the left as this narrows.
                 div()
