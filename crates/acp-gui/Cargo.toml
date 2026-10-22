@@ -4,6 +4,17 @@ version.workspace = true
 edition.workspace = true
 publish.workspace = true
 
+[features]
+# For finding slow frames and slow agents: `cargo run --release -p acp-gui --features profile`.
+# Cmd+Option+F cycles gpui's frame-time overlay; the agent's answer times go to stderr;
+# and both, with gpui's own frame zones, go to Tracy once it connects.
+profile = [
+    "gpui-kit/profiler",
+    "dep:profiling",
+    "dep:tracing-subscriber",
+    "dep:tracing-tracy",
+]
+
 [dependencies]
 acp-core.workspace = true
 # Finds the folder for the app's own files, such as the models added to the model list.
@@ -13,6 +24,24 @@ dirs = "6"
 gpui-kit = "0.8"
 # Keeps each agent's last settings between runs.
 serde_json.workspace = true
+
+# Only for `profile`. Not used here directly: turning on Tracy in `profiling` makes the
+# zones gpui already marks (each window draw, present and input dispatch, and a frame
+# mark per present) show up in Tracy.
+profiling = { version = "1", features = ["profile-with-tracy"], optional = true }
+tracing-subscriber = { version = "0.3", default-features = false, features = [
+    "ansi",
+    "fmt",
+    "std",
+], optional = true }
+# 0.11 links the same tracy-client (0.18) as `profiling`, and only one copy can be linked.
+# The Tracy viewer must be the version the locked tracy-client-sys builds: 0.14 for 0.29.
+# `ondemand` records only while Tracy is connected, so a long run without it holds no
+# data; `only-localhost` keeps other machines on the network from connecting.
+tracing-tracy = { version = "0.11", features = [
+    "ondemand",
+    "only-localhost",
+], optional = true }
 
 # Reads the traffic lights' size and spacing from AppKit. gpui's macOS layer already
 # builds these crates at these versions, with these features.

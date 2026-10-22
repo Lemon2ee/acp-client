@@ -2524,7 +2524,50 @@ impl AssetSource for AppAssets {
 
 actions!(acp_gui, [Quit]);
 
+#[cfg(feature = "profile")]
+actions!(acp_gui, [CycleFrameOverlay]);
+
+/// With `profile`, sends the agent's answer times and the protocol's warnings to
+/// stderr, and every info span and event to Tracy while it is connected.
+#[cfg(feature = "profile")]
+fn start_tracing() {
+    use tracing_subscriber::filter::{LevelFilter, Targets};
+    use tracing_subscriber::prelude::*;
+
+    let stderr = tracing_subscriber::fmt::layer()
+        .with_writer(std::io::stderr)
+        .with_filter(
+            Targets::new()
+                .with_target("acp_core", LevelFilter::INFO)
+                .with_target("agent_client_protocol", LevelFilter::WARN),
+        );
+    tracing_subscriber::registry()
+        .with(stderr)
+        // Also starts Tracy's client, which gpui's zones need before the first frame.
+        .with(tracing_tracy::TracyLayer::default().with_filter(LevelFilter::INFO))
+        .init();
+}
+
+/// With `profile`, Cmd+Option+F cycles gpui's frame-time overlay: hidden, the last
+/// frame's draw time, then that with the slowest 1% and 10%, the worst, and a count.
+#[cfg(feature = "profile")]
+fn bind_frame_overlay(cx: &mut App) {
+    cx.on_action(|_: &CycleFrameOverlay, cx| {
+        let Some(window) = cx.active_window() else {
+            return;
+        };
+        // A key press is dispatched from inside the window's own update, where the
+        // window can't be updated again.
+        cx.defer(move |cx| {
+            let _ = window.update(cx, |_, window, _| window.cycle_debug_frame_overlay_mode());
+        });
+    });
+    cx.bind_keys([KeyBinding::new("cmd-alt-f", CycleFrameOverlay, None)]);
+}
+
 fn main() {
+    #[cfg(feature = "profile")]
+    start_tracing();
     // One agent by name, or both harnesses to pick between from the model menu.
     let name = std::env::args().nth(1);
     let agents: Vec<(String, AcpAgent)> = match &name {
@@ -2554,9 +2597,13 @@ fn main() {
             // to the app, and with no menus set AppKit has no Quit item to match it to.
             cx.on_action(|_: &Quit, cx| cx.quit());
             cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
-            cx.set_menus([
-                Menu::new("ACP client").items([MenuItem::action("Quit ACP client", Quit)])
-            ]);
+            #[cfg(feature = "profile")]
+            bind_frame_overlay(cx);
+            cx.set_menus([Menu::new("ACP client").items([
+                #[cfg(feature = "profile")]
+                MenuItem::action("Cycle frame-time overlay", CycleFrameOverlay),
+                MenuItem::action("Quit ACP client", Quit),
+            ])]);
             Theme::update(cx, |theme| {
                 theme.light_theme = with_panel_colors(&theme.light_theme, "#f7f7f7", "#fcfcfc");
                 theme.dark_theme = with_panel_colors(&theme.dark_theme, "#111111", "#151515");
