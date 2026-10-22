@@ -19,6 +19,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::chat_view::ChatView;
+use crate::debug::{since_last_frame, switches};
 
 /// How far past the viewport the list lays rows out, as in `MessageScroller`.
 const OVERDRAW: Pixels = px(400.);
@@ -34,14 +35,16 @@ const JUMP_BUTTON_RISE: f32 = 0.5;
 /// while another is on screen.
 pub(crate) struct TranscriptScroll {
     /// In tail mode: it follows the end until the user scrolls away from it, and again
-    /// once they are back at it.
+    /// once they are back at it. In normal mode with `ACP_GUI_DEBUG=no-follow`.
     list: ListState,
 }
 
 impl TranscriptScroll {
     pub(crate) fn new() -> Self {
         let list = ListState::new(0, ListAlignment::Top, OVERDRAW);
-        list.set_follow_mode(FollowMode::Tail);
+        if switches().follow {
+            list.set_follow_mode(FollowMode::Tail);
+        }
         Self { list }
     }
 
@@ -59,6 +62,47 @@ impl TranscriptScroll {
     pub(crate) fn remeasure(&mut self, ix: usize) {
         self.list.remeasure_items(ix..ix + 1);
     }
+
+    /// Whether the newest text is out of view, which brings up the button back to it.
+    fn scrolled_up(&self) -> bool {
+        if switches().follow {
+            !self.list.is_following_tail()
+        } else {
+            self.list.is_scrolled_to_end() == Some(false)
+        }
+    }
+
+    /// Back to the newest text, and following it again where it follows at all.
+    fn jump_to_end(&self) {
+        if switches().follow {
+            self.list.set_follow_mode(FollowMode::Tail);
+        } else {
+            self.list.scroll_to_end();
+        }
+    }
+
+    /// One line of `ACP_GUI_DEBUG=log` for a frame, from the list as it last laid out:
+    /// the time since the last frame, the last row's height, where the view's top is
+    /// against the furthest it can go, and how much of the streaming row's text shows.
+    fn log_frame(&self, (shown, arrived): (usize, usize)) {
+        let gap = since_last_frame().map_or(0., |gap| gap.as_secs_f32() * 1000.);
+        let count = self.list.item_count();
+        let last = count
+            .checked_sub(1)
+            .and_then(|last| self.list.bounds_for_item(last))
+            .map_or(0., |bounds| bounds.size.height.as_f32());
+        let top = -self.list.scroll_px_offset_for_scrollbar().y.as_f32();
+        let end = self.list.max_offset_for_scrollbar().y.as_f32();
+        let follow = if self.list.is_following_tail() {
+            "following"
+        } else {
+            "still"
+        };
+        eprintln!(
+            "frame +{gap:5.1}ms  rows {count:3}  last {last:7.1}px  top {top:8.1} / end \
+             {end:8.1}  {follow:9}  text {shown}/{arrived}"
+        );
+    }
 }
 
 impl ChatView {
@@ -74,8 +118,13 @@ impl ChatView {
         let session = &self.sessions[self.active];
         // Keyed per session, so a switch never reuses another session's element state.
         let id = ElementId::Name(format!("messages-{}", session.key.0).into());
-        let state = session.scroller.read(cx).list.clone();
-        let scrolled_up = !state.is_following_tail();
+        let scroller = session.scroller.read(cx);
+        if switches().log {
+            scroller.log_frame(session.paced_text());
+        }
+        let state = scroller.list.clone();
+        let scrolled_up = scroller.scrolled_up();
+        let scroller = session.scroller.clone();
         let jump_shown = transition(
             (id.clone(), "jump-button-shown"),
             if scrolled_up { 1. } else { 0. },
@@ -145,13 +194,10 @@ impl ChatView {
                                 .border_color(colors.border)
                                 .bg(colors.background)
                                 .text_color(colors.foreground)
-                                .on_click(cx.listener({
-                                    let state = state.clone();
-                                    move |_, _: &ClickEvent, _, cx| {
-                                        // Follows again from the end, as the next layout puts it.
-                                        state.set_follow_mode(FollowMode::Tail);
-                                        cx.notify();
-                                    }
+                                .on_click(cx.listener(move |_, _: &ClickEvent, _, cx| {
+                                    // The next layout puts the end in view.
+                                    scroller.read(cx).jump_to_end();
+                                    cx.notify();
                                 }))
                                 .disabled(!scrolled_up),
                         ),

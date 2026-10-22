@@ -63,6 +63,11 @@ impl Pacer {
         self.shown < self.row.len()
     }
 
+    /// How much of the row's text shows, and how much has arrived, in bytes.
+    pub(crate) fn progress(&self) -> (usize, usize) {
+        (self.shown, self.row.len())
+    }
+
     /// The text arriving next opens a new row, a thought or not. Its pace starts from
     /// rest, not at the last row's, which may have been catching up.
     pub(crate) fn start_row(&mut self, thought: bool) {

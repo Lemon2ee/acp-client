@@ -5,6 +5,7 @@
 mod chat_view;
 mod chrome;
 mod config;
+mod debug;
 mod hotkey;
 #[cfg(target_os = "macos")]
 mod launch;
