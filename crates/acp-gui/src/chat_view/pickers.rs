@@ -395,8 +395,12 @@ impl MenuParts<'_> {
     /// and Enter or Space picks the lit row (see `main`'s key bindings). Esc is the
     /// popover's own. The light goes out as the pointer leaves the menu.
     fn surface(&self, id: &'static str, name: &str, rows: usize) -> Stateful<Div> {
-        let highlighted = self.nav.highlighted;
-        let (down, up, out) = (self.view.clone(), self.view.clone(), self.view.clone());
+        let (down, up, out, confirm) = (
+            self.view.clone(),
+            self.view.clone(),
+            self.view.clone(),
+            self.view.clone(),
+        );
         let pick = self.pick.clone();
         self.look
             .surface()
@@ -416,7 +420,11 @@ impl MenuParts<'_> {
                 let _ = up.update(cx, |this, cx| this.step_menu_highlight(-1, rows, cx));
             })
             .on_action(move |_: &Confirm, window, cx| {
-                if let Some(row) = highlighted {
+                // The light as it is now: a Down pressed since the last frame has moved it.
+                let lit = confirm
+                    .upgrade()
+                    .and_then(|view| view.read(cx).menu_nav.highlighted);
+                if let Some(row) = lit {
                     pick(row, window, cx);
                 }
             })
