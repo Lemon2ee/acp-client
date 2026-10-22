@@ -23,6 +23,7 @@ use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::message_scroller::{MessageScroller, MessageScrollerState};
 use gpui_kit::component::popover::{Popover, PopoverState};
 use gpui_kit::component::switch::Switch;
+use gpui_kit::component::text::{TextView, TextViewState};
 use gpui_kit::component::{
     ActiveTheme as _, FocusableExt as _, Icon, IconName, Sizable as _, Theme, ThemeConfig,
     ThemeStyled as _, h_flex, v_flex,
@@ -32,8 +33,9 @@ use gpui_kit::*;
 
 enum Row {
     User(String),
-    Agent(String),
-    Thought(String),
+    /// Markdown, grown chunk by chunk as the agent streams.
+    Agent(Entity<TextViewState>),
+    Thought(Entity<TextViewState>),
     Tool {
         id: String,
         title: String,
@@ -219,16 +221,21 @@ impl Session {
 
     /// Streams arrive as small chunks; grow the last row instead of adding one per chunk.
     fn append_text(&mut self, thought: bool, text: &str, cx: &mut App) {
-        match self.rows.last_mut() {
-            Some(Row::Agent(existing)) if !thought => existing.push_str(text),
-            Some(Row::Thought(existing)) if thought => existing.push_str(text),
+        match self.rows.last() {
+            Some(Row::Agent(existing)) if !thought => {
+                existing.update(cx, |view, cx| view.push_str(text, cx))
+            }
+            Some(Row::Thought(existing)) if thought => {
+                existing.update(cx, |view, cx| view.push_str(text, cx))
+            }
             // Agents often open a block with a bare "\n\n" chunk; don't start a row with it.
             _ if text.trim().is_empty() => return,
             _ => {
+                let view = cx.new(|cx| TextViewState::markdown(text, cx));
                 let row = if thought {
-                    Row::Thought(text.into())
+                    Row::Thought(view)
                 } else {
-                    Row::Agent(text.into())
+                    Row::Agent(view)
                 };
                 return self.push(row, cx);
             }
@@ -593,14 +600,12 @@ impl ChatView {
                         .child(SharedString::from(text.clone())),
                 )
                 .into_any_element(),
-            Row::Agent(text) => row
-                .child(SharedString::from(text.trim().to_string()))
-                .into_any_element(),
-            Row::Thought(text) => row
+            Row::Agent(view) => row.child(TextView::new(view)).into_any_element(),
+            Row::Thought(view) => row
                 .text_sm()
                 .italic()
                 .text_color(muted)
-                .child(SharedString::from(text.trim().to_string()))
+                .child(TextView::new(view))
                 .into_any_element(),
             Row::Tool { title, status, .. } => row
                 .text_sm()
