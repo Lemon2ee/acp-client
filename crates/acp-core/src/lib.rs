@@ -47,8 +47,9 @@ pub enum Command {
     /// `SettingChanged`, or `SettingFailed`; a prompt sent after it waits for the answer.
     ChangeSetting(SessionKey, String, SettingValue),
     /// Drops the session: its task is cancelled, whether it is still creating the
-    /// session or running a turn, so no more of its events come. The agent is left
-    /// to finish whatever it was doing for it.
+    /// session or running a turn, so no more of its events come. A permission request
+    /// the turn was waiting on is answered as cancelled; the agent is left to finish
+    /// the turn by itself.
     CloseSession(SessionKey),
 }
 
@@ -376,6 +377,9 @@ async fn run_session(
 ) {
     // The prompt to run once the session exists, when a prompt is creating it again.
     let mut retry = None;
+    // Setting changes made while there was no session to make them to, which the
+    // session gets before the prompt that created it again.
+    let mut changes_waiting = Vec::new();
     loop {
         // `run_until` sends `session/new` from this task, so a refusal comes back here;
         // `start_session` sends it from a connection task, where an error ends the
@@ -397,6 +401,7 @@ async fn run_session(
                     key,
                     &mut session,
                     waiting,
+                    std::mem::take(&mut changes_waiting),
                     &commands,
                     &events,
                     &login_options,
@@ -416,8 +421,11 @@ async fn run_session(
         retry = loop {
             match commands.recv().await {
                 Ok(SessionCommand::Prompt(text)) => break Some(text),
-                // No session, so nothing is running to stop, and no settings to change.
-                Ok(SessionCommand::Cancel | SessionCommand::ChangeSetting(..)) => {}
+                // No session, so nothing is running to stop.
+                Ok(SessionCommand::Cancel) => {}
+                Ok(SessionCommand::ChangeSetting(setting, value)) => {
+                    changes_waiting.push((setting, value))
+                }
                 Err(_) => return,
             }
         };
@@ -426,16 +434,21 @@ async fn run_session(
 
 /// Runs the session's prompts one at a time, as they arrive, until the front end has gone.
 /// Prompts sent during a turn wait in `waiting` for their own, and every prompt waits
-/// for the agent to answer the setting changes sent before it.
+/// for the agent to answer the setting changes sent before it, `first` included.
 async fn serve(
     key: SessionKey,
     session: &mut ActiveSession<'_, Agent>,
     mut waiting: VecDeque<String>,
+    first: Vec<(String, SettingValue)>,
     commands: &Receiver<SessionCommand>,
     events: &Sender<Event>,
     login_options: &[String],
 ) {
     let mut changes = Changes::default();
+    for (setting, value) in first {
+        // Only a closed connection fails this, which ends the session anyway.
+        let _ = change_setting(key, session, setting, value, events, &mut changes);
+    }
     loop {
         let text = match waiting.pop_front() {
             Some(text) => text,
@@ -809,28 +822,41 @@ async fn handle(
         .await
 }
 
-/// A permission request the user has not answered yet.
+/// A permission request the user has not answered yet. Dropped unanswered, as when
+/// its session is closed, it answers the agent with a cancellation.
 struct PendingPermission {
     options: Vec<PermissionOption>,
-    responder: Responder<RequestPermissionResponse>,
+    /// Taken by the answer.
+    responder: Option<Responder<RequestPermissionResponse>>,
     choice: oneshot::Receiver<Option<String>>,
 }
 
 impl PendingPermission {
     /// Answers the agent with the chosen option; `None`, or an id it did not offer, cancels.
-    fn answer(self, chosen: Option<String>) -> Result<(), Error> {
+    fn answer(mut self, chosen: Option<String>) -> Result<(), Error> {
         let outcome = match self
             .options
-            .into_iter()
+            .iter()
             .find(|option| Some(option.option_id.0.as_ref()) == chosen.as_deref())
         {
-            Some(option) => {
-                RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(option.option_id))
-            }
+            Some(option) => RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(
+                option.option_id.clone(),
+            )),
             None => RequestPermissionOutcome::Cancelled,
         };
-        self.responder
-            .respond(RequestPermissionResponse::new(outcome))
+        match self.responder.take() {
+            Some(responder) => responder.respond(RequestPermissionResponse::new(outcome)),
+            None => Ok(()),
+        }
+    }
+}
+
+impl Drop for PendingPermission {
+    fn drop(&mut self) {
+        if let Some(responder) = self.responder.take() {
+            let cancelled = RequestPermissionOutcome::Cancelled;
+            let _ = responder.respond(RequestPermissionResponse::new(cancelled));
+        }
     }
 }
 
@@ -873,7 +899,7 @@ fn ask_permission(
     );
     PendingPermission {
         options: request.options,
-        responder,
+        responder: Some(responder),
         choice,
     }
 }

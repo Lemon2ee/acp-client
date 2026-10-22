@@ -69,9 +69,6 @@ struct Session {
     settings: Vec<Setting>,
     /// Switches flipped here whose changes the agent hasn't all answered, by setting id.
     flipped: HashMap<String, Flip>,
-    /// A model picked for the session before the agent had created it, by setting id;
-    /// asked for once its settings come.
-    pending_model: Option<(String, SettingValue)>,
 }
 
 /// A switch flipped here, until the agent has answered every change it was asked for.
@@ -94,7 +91,6 @@ impl Session {
             draft: SharedString::default(),
             settings: Vec::new(),
             flipped: HashMap::new(),
-            pending_model: None,
         }
     }
 
@@ -265,10 +261,13 @@ struct AgentSlot {
     /// was started with.
     name: String,
     commands: Sender<Command>,
-    /// A session created ahead of its use, so one on this agent can be shown with its
-    /// settings at once, and so its models can be listed from sessions on other agents.
-    /// Taken by the next session on this agent, and made again.
+    /// A session created ahead of its use while the agent has no session on show, so
+    /// its models can be listed from sessions on other agents, and so the first
+    /// session on it is shown with its settings at once. Taken by that session.
     spare: Option<Session>,
+    /// The spare couldn't be created, and the user has been told; said once, as each
+    /// session added tries the spare again.
+    spare_failed: bool,
     _events: Task<()>,
 }
 
@@ -340,6 +339,7 @@ impl ChatView {
                     name,
                     commands: handle.commands,
                     spare: None,
+                    spare_failed: false,
                     _events: events_task,
                 }
             })
@@ -358,9 +358,6 @@ impl ChatView {
             added_models: load_added_models(),
             _input_events: input_events,
         };
-        for ix in 0..view.agents.len() {
-            view.make_spare(ix, cx);
-        }
         view.new_session(window, cx);
         view
     }
@@ -384,23 +381,46 @@ impl ChatView {
         session
     }
 
-    /// Makes the agent's spare session, when it has none and is still there to create it.
-    fn make_spare(&mut self, agent: usize, cx: &mut App) {
-        if self.agents[agent].spare.is_none() && !self.agents[agent].commands.is_closed() {
+    /// Makes a spare session for each agent that has no session on show and no spare,
+    /// and is still there to create it. A session on show lists the agent's models
+    /// just as well, so an agent with one keeps no spare.
+    fn make_spares(&mut self, cx: &mut App) {
+        for agent in 0..self.agents.len() {
+            let slot = &self.agents[agent];
+            if slot.spare.is_some()
+                || slot.commands.is_closed()
+                || self.sessions.iter().any(|session| session.agent == agent)
+            {
+                continue;
+            }
             let spare = self.create_session(agent, cx);
             self.agents[agent].spare = Some(spare);
         }
     }
 
     /// A session on the agent, to show: its spare, ready with its settings, or a new one
-    /// when the spare is gone.
+    /// when it has none.
     fn take_session(&mut self, agent: usize, cx: &mut App) -> Session {
-        let session = match self.agents[agent].spare.take() {
+        match self.agents[agent].spare.take() {
             Some(spare) => spare,
             None => self.create_session(agent, cx),
-        };
-        self.make_spare(agent, cx);
-        session
+        }
+    }
+
+    /// The session whose settings say what the agent's models are: its spare, or the
+    /// newest session on show on it.
+    fn model_source(&self, agent: usize) -> Option<&Session> {
+        let shown = self
+            .sessions
+            .iter()
+            .rev()
+            .filter(|session| session.agent == agent);
+        self.agents[agent]
+            .spare
+            .as_ref()
+            .into_iter()
+            .chain(shown)
+            .find(|session| !session.settings.is_empty())
     }
 
     /// Adds a session on the agent of the one on screen, and shows it. The window's
@@ -414,12 +434,10 @@ impl ChatView {
         if self.agents[agent].commands.is_closed() && !self.sessions.is_empty() {
             return;
         }
-        // Another go for any agent whose spare failed to be created.
-        for ix in 0..self.agents.len() {
-            self.make_spare(ix, cx);
-        }
         let session = self.take_session(agent, cx);
         self.sessions.push(session);
+        // Also another go for any agent whose spare failed to be created.
+        self.make_spares(cx);
         self.show(self.sessions.len() - 1, window, cx);
     }
 
@@ -442,24 +460,24 @@ impl ChatView {
         if self.agents[agent].commands.is_closed() {
             return;
         }
-        let mut session = self.take_session(agent, cx);
+        let session = self.take_session(agent, cx);
+        // acp-core holds the change until the session exists, and a prompt waits for it.
         let value = SettingValue::Choice(model);
-        if session.settings.is_empty() {
-            session.pending_model = Some((setting, value));
-        } else {
-            let change = Command::ChangeSetting(session.key, setting, value);
-            let _ = self.agents[agent].commands.try_send(change);
-        }
-        if self.sessions[ix].title.is_none() {
+        let change = Command::ChangeSetting(session.key, setting, value);
+        let _ = self.agents[agent].commands.try_send(change);
+        let shown = if self.sessions[ix].title.is_none() {
             let old = std::mem::replace(&mut self.sessions[ix], session);
             let _ = self.agents[old.agent]
                 .commands
                 .try_send(Command::CloseSession(old.key));
-            self.show(ix, window, cx);
+            ix
         } else {
             self.sessions.push(session);
-            self.show(self.sessions.len() - 1, window, cx);
-        }
+            self.sessions.len() - 1
+        };
+        // The agent left behind may have no session on show now.
+        self.make_spares(cx);
+        self.show(shown, window, cx);
     }
 
     /// Shows the session in the chat.
@@ -662,19 +680,26 @@ impl ChatView {
                 if let Some(session) = self.session_mut(key) {
                     session.busy = false;
                 }
+                self.agents[agent].spare_failed = false;
             }
             AgentEvent::SessionFailed(key, message) => {
-                let spare = &mut self.agents[agent].spare;
-                if spare.as_ref().is_some_and(|spare| spare.key == key) {
+                let several = self.agents.len() > 1;
+                let slot = &mut self.agents[agent];
+                let message = if several {
+                    format!("{}: {message}", slot.name)
+                } else {
+                    message
+                };
+                if slot.spare.as_ref().is_some_and(|spare| spare.key == key) {
                     // Nobody would prompt the spare to have it created again, so it goes,
                     // and the next session added makes another. Its error shows where
-                    // the user is.
-                    *spare = None;
-                    let _ = self.agents[agent]
-                        .commands
-                        .try_send(Command::CloseSession(key));
-                    let message = format!("{}: {message}", self.agents[agent].name);
-                    self.sessions[self.active].push(Row::Error(message), cx);
+                    // the user is, once: every session added would repeat it otherwise.
+                    slot.spare = None;
+                    let _ = slot.commands.try_send(Command::CloseSession(key));
+                    if !slot.spare_failed {
+                        slot.spare_failed = true;
+                        self.sessions[self.active].push(Row::Error(message), cx);
+                    }
                 } else if let Some(session) = self.session_mut(key) {
                     // Open for a prompt, which asks the agent to create the session again.
                     session.busy = false;
@@ -684,14 +709,6 @@ impl ChatView {
             AgentEvent::Session(key, event) => {
                 if let Some(session) = self.session_mut(key) {
                     session.apply(event, cx);
-                    // The model picked before the agent had created the session.
-                    if !session.settings.is_empty()
-                        && let Some((setting, value)) = session.pending_model.take()
-                    {
-                        let agent = session.agent;
-                        let change = Command::ChangeSetting(key, setting, value);
-                        let _ = self.agents[agent].commands.try_send(change);
-                    }
                 }
             }
             // Connection-wide failures show in the session on screen when it is the
@@ -1335,10 +1352,9 @@ fn model_menu(
 
     // A model row's list holds the other agents' models too, so it opens for them
     // even when the session's own agent offers no model.
-    let has_list = |setting: &Setting| {
-        !setting.choices.is_empty()
-            || (setting.kind == SettingKind::Model && !menu.others.is_empty())
-    };
+    let has_others =
+        |setting: &Setting| setting.kind == SettingKind::Model && !menu.others.is_empty();
+    let has_list = |setting: &Setting| !setting.choices.is_empty() || has_others(setting);
     let rows = settings.iter().map(|setting| {
         let list = has_list(setting).then(|| setting.id.clone());
         let row = div()
@@ -1416,16 +1432,20 @@ fn model_menu(
                 row.on_hover(menu.wants(Some(setting.id.clone()), false))
                     .into_any_element()
             };
-            let grouped = setting.kind == SettingKind::Model && !menu.others.is_empty();
+            let grouped = has_others(setting);
             let mut rows: Vec<AnyElement> = Vec::new();
             if grouped && !own.is_empty() {
                 rows.push(menu.group_header(menu.own_name));
             }
             rows.extend(own.into_iter().map(hold));
-            // The other agents' models, each group under its agent's name. Claude's
-            // older models stay a level down in a session on Claude.
+            // The other agents' models, each group under its agent's name, go below
+            // the session's own agent's, after its older models' row, so that row
+            // reads as Claude's. They don't scroll with the own agent's rows, so the
+            // older models' list can be set level with its row by their height.
+            let mut other_groups: Vec<AnyElement> = Vec::new();
+            let mut others_height = px(0.);
             for other in menu.others.iter().filter(|_| grouped) {
-                rows.push(
+                other_groups.push(
                     div()
                         .flex_none()
                         .h(px(1.))
@@ -1433,7 +1453,7 @@ fn model_menu(
                         .bg(border)
                         .into_any_element(),
                 );
-                rows.push(menu.group_header(&other.name));
+                other_groups.push(menu.group_header(&other.name));
                 let listed: Vec<&SettingChoice> = match claude_models(&other.setting.choices, added)
                 {
                     Some(models) => models
@@ -1443,7 +1463,11 @@ fn model_menu(
                         .collect(),
                     None => other.setting.choices.iter().collect(),
                 };
-                rows.extend(
+                others_height += px(1.)
+                    + LIST_HEADER_HEIGHT
+                    + MENU_ROW_GAP * 2.
+                    + (LIST_ROW_HEIGHT + MENU_ROW_GAP) * listed.len() as f32;
+                other_groups.extend(
                     listed
                         .into_iter()
                         .map(|choice| hold(menu.other_choice(other, choice))),
@@ -1459,57 +1483,59 @@ fn model_menu(
                 cx,
             );
             let older = claude.filter(|models| !models.older.is_empty());
-            frame.when_some(older, |frame, models| {
-                let older_list = older_open.then(|| {
-                    let rows = models
-                        .older
-                        .iter()
-                        .map(|&choice| {
-                            let button = Some(menu.add_button(&choice.id, true));
-                            menu.choice(
-                                setting,
-                                choice,
-                                current == Some(choice.id.as_str()),
-                                button,
-                            )
-                            .into_any_element()
-                        })
-                        .collect();
-                    // Level with the row that opens it, the last of this list.
-                    menu.list(
-                        "model-menu-older",
-                        rows,
-                        px(0.),
-                        older_bounds.clone(),
-                        window,
-                        cx,
-                    )
-                });
-                frame
-                    .child(
-                        // A line across the list, above the row for the older models.
-                        div().flex_none().h(px(1.)).mx_neg_1().bg(cx.theme().border),
-                    )
-                    .child(
-                        div()
-                            .id("model-menu-older-row")
-                            .h(LIST_ROW_HEIGHT)
-                            .flex_none()
-                            .px_2()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .rounded(menu.radius)
-                            .hover(move |style| style.bg(accent).text_color(accent_foreground))
-                            .when(older_open, |row| {
-                                row.bg(accent).text_color(accent_foreground)
+            frame
+                .when_some(older, |frame, models| {
+                    let older_list = older_open.then(|| {
+                        let rows = models
+                            .older
+                            .iter()
+                            .map(|&choice| {
+                                let button = Some(menu.add_button(&choice.id, true));
+                                menu.choice(
+                                    setting,
+                                    choice,
+                                    current == Some(choice.id.as_str()),
+                                    button,
+                                )
+                                .into_any_element()
                             })
-                            .child(div().flex_1().child("Older models"))
-                            .child(Icon::new(IconName::ChevronRight).xsmall().text_color(muted))
-                            .on_hover(menu.wants(Some(setting.id.clone()), true)),
-                    )
-                    .children(older_list)
-            })
+                            .collect();
+                        // Level with the row that opens it, above the other agents' groups.
+                        menu.list(
+                            "model-menu-older",
+                            rows,
+                            others_height,
+                            older_bounds.clone(),
+                            window,
+                            cx,
+                        )
+                    });
+                    frame
+                        .child(
+                            // A line across the list, above the row for the older models.
+                            div().flex_none().h(px(1.)).mx_neg_1().bg(cx.theme().border),
+                        )
+                        .child(
+                            div()
+                                .id("model-menu-older-row")
+                                .h(LIST_ROW_HEIGHT)
+                                .flex_none()
+                                .px_2()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .rounded(menu.radius)
+                                .hover(move |style| style.bg(accent).text_color(accent_foreground))
+                                .when(older_open, |row| {
+                                    row.bg(accent).text_color(accent_foreground)
+                                })
+                                .child(div().flex_1().child("Older models"))
+                                .child(Icon::new(IconName::ChevronRight).xsmall().text_color(muted))
+                                .on_hover(menu.wants(Some(setting.id.clone()), true)),
+                        )
+                        .children(older_list)
+                })
+                .children(other_groups)
         });
 
     let popover = menu.popover.clone();
@@ -1613,16 +1639,16 @@ impl ChatView {
         })
         .map(|setting| session.shown(setting))
         .collect();
-        // The other agents' models, from their spare sessions, once those exist. An
-        // agent that is gone can't take a session, so its models aren't offered.
+        // The other agents' models, once a session on each has its settings. An agent
+        // that is gone can't take a session, so its models aren't offered.
         let others: Vec<OtherModels> = self
             .agents
             .iter()
             .enumerate()
             .filter(|&(ix, slot)| ix != session.agent && !slot.commands.is_closed())
             .filter_map(|(ix, slot)| {
-                let spare = slot.spare.as_ref()?;
-                let setting = spare
+                let setting = self
+                    .model_source(ix)?
                     .settings
                     .iter()
                     .find(|setting| setting.kind == SettingKind::Model)?;
