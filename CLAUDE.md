@@ -50,9 +50,9 @@ mean little.
 - Cmd+Option+F (also in the app menu) cycles gpui's frame-time overlay: hidden, the last
   draw time, then the slowest 1% and 10%, the worst, and a frame count.
 - acp-core's request timings print to stderr: `initialize` (from starting the agent
-  process), `session/new`, `session/set_config_option`, and `session/prompt` with its first
-  update, update count and time after a stop. `session/request_permission` is the time the
-  user took, which `session/prompt` includes.
+  process), `session/new`, `session/set_config_option`, `session/close`, and
+  `session/prompt` with its first update, update count and time after a stop.
+  `session/request_permission` is the time the user took, which `session/prompt` includes.
 - Tracy sees all of it plus gpui's draw, present and input zones and a frame mark per
   present. The viewer must be Tracy 0.14, the version the locked tracy-client-sys 0.29 builds,
   and it only records while connected (`ondemand`, localhost only).
