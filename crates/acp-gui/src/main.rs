@@ -410,18 +410,25 @@ impl ChatView {
         self.show(self.sessions.len() - 1, window, cx);
     }
 
-    /// Picks a model of another agent's for the session on screen. A session with no
-    /// prompt yet is replaced by one on that agent, as ACP can't move it there; one
-    /// with prompts keeps its agent, and a new session on the other agent is shown
-    /// instead.
+    /// Picks a model of another agent's from the model menu of the session `from`. A
+    /// session with no prompt yet is replaced by one on that agent, as ACP can't move
+    /// it there; one with prompts keeps its agent, and a new session on the other
+    /// agent is shown instead. Nothing happens for an agent that is gone.
     fn pick_model(
         &mut self,
+        from: SessionKey,
         agent: usize,
         setting: String,
         model: String,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let Some(ix) = self.sessions.iter().position(|session| session.key == from) else {
+            return;
+        };
+        if self.agents[agent].commands.is_closed() {
+            return;
+        }
         let mut session = self.take_session(agent, cx);
         let value = SettingValue::Choice(model);
         if session.settings.is_empty() {
@@ -430,12 +437,12 @@ impl ChatView {
             let change = Command::ChangeSetting(session.key, setting, value);
             let _ = self.agents[agent].commands.try_send(change);
         }
-        if self.sessions[self.active].title.is_none() {
-            let old = std::mem::replace(&mut self.sessions[self.active], session);
+        if self.sessions[ix].title.is_none() {
+            let old = std::mem::replace(&mut self.sessions[ix], session);
             let _ = self.agents[old.agent]
                 .commands
                 .try_send(Command::CloseSession(old.key));
-            self.show(self.active, window, cx);
+            self.show(ix, window, cx);
         } else {
             self.sessions.push(session);
             self.show(self.sessions.len() - 1, window, cx);
@@ -663,14 +670,23 @@ impl ChatView {
                     }
                 }
             }
-            // Connection-wide failures show in the session on screen.
+            // Connection-wide failures show in the session on screen when it is the
+            // agent's, else in the agent's newest session; an agent with no session
+            // shown is named in the session on screen.
             AgentEvent::Error(message) => {
-                let message = if self.agents.len() > 1 {
-                    format!("{}: {message}", self.agents[agent].name)
-                } else {
-                    message
+                let active = self.active;
+                let ix = Some(active)
+                    .filter(|&ix| self.sessions[ix].agent == agent)
+                    .or_else(|| {
+                        self.sessions
+                            .iter()
+                            .rposition(|session| session.agent == agent)
+                    });
+                let message = match ix {
+                    Some(_) => message,
+                    None => format!("{}: {message}", self.agents[agent].name),
                 };
-                self.sessions[self.active].push(Row::Error(message), cx)
+                self.sessions[ix.unwrap_or(active)].push(Row::Error(message), cx)
             }
             AgentEvent::Closed => {
                 let spare = self.agents[agent].spare.as_mut();
@@ -1151,7 +1167,7 @@ impl ModelMenu<'_> {
     /// A row of the model list for another agent's model, which goes on to a session
     /// on that agent with the model, and closes the menu.
     fn other_choice(&self, other: &OtherModels, choice: &SettingChoice) -> Stateful<Div> {
-        let (view, popover) = (self.view.clone(), self.popover.clone());
+        let (view, popover, key) = (self.view.clone(), self.popover.clone(), self.key);
         let (agent, id, value) = (other.agent, other.setting.id.clone(), choice.id.clone());
         let (accent, accent_foreground) = (self.accent, self.accent_foreground);
         div()
@@ -1173,7 +1189,7 @@ impl ModelMenu<'_> {
             )
             .on_click(move |_, window, cx| {
                 let _ = view.update(cx, |this, cx| {
-                    this.pick_model(agent, id.clone(), value.clone(), window, cx)
+                    this.pick_model(key, agent, id.clone(), value.clone(), window, cx)
                 });
                 popover.update(cx, |state, cx| state.dismiss(window, cx));
             })
@@ -1586,12 +1602,13 @@ impl ChatView {
         } else {
             names.join(" ")
         };
-        // The other agents' models, from their spare sessions, once those exist.
+        // The other agents' models, from their spare sessions, once those exist. An
+        // agent that is gone can't take a session, so its models aren't offered.
         let others: Vec<OtherModels> = self
             .agents
             .iter()
             .enumerate()
-            .filter(|&(ix, _)| ix != session.agent)
+            .filter(|&(ix, slot)| ix != session.agent && !slot.commands.is_closed())
             .filter_map(|(ix, slot)| {
                 let spare = slot.spare.as_ref()?;
                 let setting = spare
