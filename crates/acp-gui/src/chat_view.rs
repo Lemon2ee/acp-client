@@ -3,11 +3,13 @@
 //! modules below it, which can read its private fields.
 
 mod pickers;
+pub(crate) mod scroller;
 mod settings_page;
 mod sidebar;
 mod transcript;
 
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use acp_core::{
     AcpAgent, Command, Event as AgentEvent, Sender, SessionEvent, SessionKey, Setting, SettingKind,
@@ -20,7 +22,6 @@ use gpui_kit::component::input::{
     InputEvent, InputGroup, InputGroupAddon, InputGroupAddonAlignment, InputGroupButton, Textarea,
     TextareaState,
 };
-use gpui_kit::component::message_scroller::MessageScroller;
 use gpui_kit::component::{ActiveTheme as _, FocusableExt as _, Icon, IconName, Sizable as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -39,6 +40,9 @@ use crate::config::{
 };
 use crate::hotkey::{self, GlobalShortcut};
 use crate::session::{Origin, Row, Session};
+
+/// How often text held back in a live turn shows its next piece: about once a frame.
+const PACE_TICK: Duration = Duration::from_millis(16);
 
 /// One agent the window drives, and what it keeps ready on it.
 struct AgentSlot {
@@ -95,6 +99,8 @@ pub(crate) struct ChatView {
     settings_page: SettingsPageState,
     /// The system-wide shortcut the settings name, as macOS holds it for the app.
     global_shortcut: GlobalShortcut,
+    /// Shows the text held back in live turns a piece at a time, while any is held.
+    pacing: Option<Task<()>>,
     _input_events: Subscription,
     _bounds_events: Subscription,
     _settings_events: Subscription,
@@ -248,6 +254,7 @@ impl ChatView {
             model_panel: ModelPanelState::new(window, cx),
             settings_page: SettingsPageState::new(cx),
             global_shortcut: GlobalShortcut::default(),
+            pacing: None,
             _input_events: input_events,
             _bounds_events: bounds_events,
             _settings_events: settings_events,
@@ -300,7 +307,7 @@ impl ChatView {
         let slot = &self.agents[session.agent];
         if slot.commands.try_send(load).is_err() {
             let message = format!("{} has gone; restart to use it", slot.name);
-            session.push(Row::Error(message), cx);
+            session.push_error(message, cx);
         }
     }
 
@@ -377,7 +384,7 @@ impl ChatView {
         if slot.commands.is_closed() {
             session.busy = true;
             let message = format!("{} has gone; restart to use it", slot.name);
-            session.push(Row::Error(message), cx);
+            session.push_error(message, cx);
         }
         session
     }
@@ -521,6 +528,9 @@ impl ChatView {
         if ix != self.active {
             self.sessions[self.active].draft = self.input.read(cx).value();
             self.active = ix;
+            self.sessions[ix]
+                .scroller
+                .update(cx, |scroller, _| scroller.catch_up());
             let draft = std::mem::take(&mut self.sessions[ix].draft);
             self.input.update(cx, |input, cx| {
                 input.set_value(draft, window, cx);
@@ -719,6 +729,8 @@ impl ChatView {
             .get_or_insert_with(|| text.lines().next().unwrap_or_default().to_string());
         session.busy = true;
         session.push(Row::User(text.clone()), cx);
+        // Live from after the prompt's own row, which shows at once as it was typed here.
+        session.set_live(true, cx);
         let key = session.key;
         // Has the agent create the session first, if it hasn't yet.
         let prompt = Command::Prompt(key, text);
@@ -738,7 +750,9 @@ impl ChatView {
         let _ = self.agents[session.agent]
             .commands
             .try_send(Command::Cancel(session.key));
-        // Stopping makes acp-core answer the turn's open permission requests as cancelled.
+        // What has arrived shows at once, and permission requests held back behind it
+        // show as cancelled: stopping makes acp-core answer the turn's open ones so.
+        session.flush(cx);
         session.cancel_open_permissions(cx);
         cx.notify();
     }
@@ -844,12 +858,13 @@ impl ChatView {
                     let _ = slot.commands.try_send(Command::CloseSession(key));
                     if !slot.spare_failed {
                         slot.spare_failed = true;
-                        self.sessions[self.active].push(Row::Error(message), cx);
+                        self.sessions[self.active].push_error(message, cx);
                     }
                 } else if let Some(session) = self.session_mut(key) {
                     // Open for a prompt, which asks the agent to create the session again.
                     session.busy = false;
-                    session.push(Row::Error(message), cx);
+                    session.push_error(message, cx);
+                    session.set_live(false, cx);
                 }
             }
             AgentEvent::Session(key, event) => {
@@ -863,6 +878,9 @@ impl ChatView {
                 let created = matches!(event, SessionEvent::Created(_));
                 if let Some(session) = self.session_mut(key) {
                     session.apply(event, cx);
+                    if session.pacing() {
+                        self.pace(cx);
+                    }
                 }
                 if created {
                     self.save_session(key);
@@ -887,7 +905,7 @@ impl ChatView {
                 } else {
                     message
                 };
-                self.sessions[ix].push(Row::Error(message), cx)
+                self.sessions[ix].push_error(message, cx)
             }
             AgentEvent::Closed => {
                 let spare = self.agents[agent].spare.as_mut();
@@ -895,15 +913,55 @@ impl ChatView {
                     if session.agent != agent {
                         continue;
                     }
-                    session.busy = true;
                     // A turn cut off with the connection may never report its end, nor
-                    // a setting change its answer.
+                    // a setting change its answer. Flushed first: the turn's end, if it
+                    // came, would open the session to prompts again.
+                    session.flush(cx);
+                    session.busy = true;
+                    session.set_live(false, cx);
                     session.cancel_open_permissions(cx);
                     session.asked.clear();
                 }
             }
         }
         cx.notify();
+    }
+
+    /// Has the sessions show the text held back in their live turns a piece at a time,
+    /// until none holds any.
+    fn pace(&mut self, cx: &mut Context<Self>) {
+        if self.pacing.is_some() {
+            return;
+        }
+        self.pacing = Some(cx.spawn(async move |this, cx| {
+            let mut last = Instant::now();
+            loop {
+                cx.background_executor().timer(PACE_TICK).await;
+                let now = Instant::now();
+                let dt = now - last;
+                last = now;
+                let holding = this.update(cx, |this, cx| {
+                    let (mut holding, mut changed) = (false, false);
+                    for (ix, session) in this.sessions.iter_mut().enumerate() {
+                        let paced = session.pace(dt, cx);
+                        holding |= paced.holds;
+                        // Text shown off screen draws nothing; a landed event may change
+                        // what the window shows of the session anywhere, as its busy state.
+                        changed |= paced.landed || paced.shown && ix == this.active;
+                    }
+                    if !holding {
+                        this.pacing = None;
+                    }
+                    if changed {
+                        cx.notify();
+                    }
+                    holding
+                });
+                if !matches!(holding, Ok(true)) {
+                    break;
+                }
+            }
+        }));
     }
 
     fn answer(
@@ -974,6 +1032,7 @@ impl Render for ChatView {
             cx,
         );
         let sidebar_width = self.sidebar.width * (1. - hidden);
+        let transcript = self.render_transcript(window, cx);
         let session = &self.sessions[self.active];
         // The model, how hard it thinks, then the mode, each once the agent has said
         // what it can be, for this session or the last it created.
@@ -1039,17 +1098,7 @@ impl Render for ChatView {
                     .opacity(chat_shown)
                     .when(title_bar, as_title_bar),
             )
-            .child(
-                MessageScroller::new(
-                    // Keyed per session, so a switch never reuses another session's list state.
-                    ElementId::Name(format!("messages-{}", session.key.0).into()),
-                    session.scroller.clone(),
-                    cx.processor(|this, ix: usize, window, cx| this.render_row(ix, window, cx)),
-                )
-                .flex_1()
-                .min_h(px(0.))
-                .opacity(chat_shown),
-            )
+            .child(transcript.flex_1().min_h(px(0.)).opacity(chat_shown))
             .child(
                 // A row along the input box's bottom: the session's model and mode on the
                 // left, the send/stop button on the right.

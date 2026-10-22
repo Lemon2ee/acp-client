@@ -25,9 +25,11 @@ clearly needs splitting. acp-gui is split by what each part keeps or draws:
 | `config.rs` | What is kept on disk between runs: `AppSettings`, the starred models, each agent's last settings, the kept sessions. |
 | `hotkey.rs` | The system-wide shortcut that brings the window to the front: what it can't be, holding it with macOS through Carbon, and what a press does. |
 | `session.rs` | `Session`: one conversation's transcript rows and settings, and how each `SessionEvent` lands on it. |
+| `session/pacing.rs` | The agent's text in a live turn, held back and shown at an even pace, and where it may stop so half-arrived markdown never shows. |
 | `chrome.rs` | The window around the content: the macOS title bar row, the traffic lights, the blur, the light or dark theme. |
 | `chat_view.rs` | `ChatView`: the agents, the sessions and what happens to them, and the window's layout (`Render`). |
 | `chat_view/transcript.rs` | How each row of a transcript is drawn. |
+| `chat_view/scroller.rs` | The transcript's list: how it glides to new text while following it, and the button back to the newest. |
 | `chat_view/sidebar.rs` | The session cards, renaming, the delete prompt, the Archived list, the draggable edge. |
 | `chat_view/settings_page.rs` | The settings, which take the window while open. |
 | `chat_view/pickers.rs` | What the buttons below the prompt and their menus share: `MenuLook`, sizes, `picker_button`. |
@@ -44,6 +46,7 @@ cargo run -p acp-gui                # Claude and Codex, picked between from the 
 cargo run -p acp-gui -- claude     # or: codex, or "<any shell-style agent command>"
 cargo run -p acp-cli -- claude
 cargo run --release -p acp-gui --features profile   # see "Profiling" below
+cargo test -p acp-gui
 cargo clippy --workspace --all-targets
 cargo fmt --all
 ```
@@ -52,8 +55,9 @@ cargo fmt --all
   Bump those pins deliberately; they tie the adapter to the agent CLI it was tested with.
 - Build output goes to `target.nosync/` (see `.cargo/config.toml`): `~/Documents` syncs to
   iCloud, which skips `.nosync` names. Do not change the target dir.
-- There are no tests yet. "Verified" means `cargo build`, `cargo clippy` and `cargo fmt`
-  are clean, plus a run of the affected front end when the change is user-visible.
+- Tests are few: only acp-gui's pacing rules have unit tests, as plain functions need no
+  window. "Verified" means `cargo build`, `cargo test`, `cargo clippy` and `cargo fmt` are
+  clean, plus a run of the affected front end when the change is user-visible.
 - `profile` is off by default, so clippy also needs a run with `-p acp-gui --features profile`
   when a change touches it.
 - Do not start `ACPClient.app` or run `.claude/hooks/run-latest-app.sh` unless the user asks.
@@ -82,8 +86,8 @@ In debug builds, gpui-component already binds Cmd+Option+I to gpui's element ins
 
 - **Core owns the protocol; front ends own display.** Anything that talks to
   `agent_client_protocol` lives in `acp-core`. The CLI and GUI see only `Command`,
-  `Event`, `SessionEvent`, `Setting`, `PermissionRequest` and `Harness` (the agents
-  the client can start by name).
+  `Event`, `SessionEvent`, `Setting`, `PermissionRequest`, `ToolStatus` and `Harness`
+  (the agents the client can start by name).
 - **One connection, many sessions.** `SessionKey` is chosen by the front end so it can show
   a session before the agent has created it. Each session reads its commands from one
   queue in order, so a cancel never overtakes the prompt it is meant to stop.

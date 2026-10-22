@@ -24,7 +24,7 @@ use agent_client_protocol::schema::v1::{
     SelectedPermissionOutcome, SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory,
     SessionConfigOptionValue, SessionConfigOptionsCapabilities, SessionConfigSelectOptions,
     SessionId, SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
-    SetSessionConfigOptionResponse, StopReason,
+    SetSessionConfigOptionResponse, StopReason, ToolCallStatus,
 };
 use agent_client_protocol::util::{MatchDispatch, internal_error};
 pub use agent_client_protocol::{AcpAgent, Error};
@@ -102,12 +102,12 @@ pub enum SessionEvent {
     ToolCall {
         id: String,
         title: String,
-        status: String,
+        status: ToolStatus,
     },
     ToolCallUpdate {
         id: String,
         title: Option<String>,
-        status: Option<String>,
+        status: Option<ToolStatus>,
     },
     Plan(Vec<String>),
     Permission(PermissionRequest),
@@ -135,6 +135,42 @@ pub enum SessionEvent {
         setting: String,
         message: String,
     },
+}
+
+/// Where a tool call stands. Shown as ACP names it: `Pending`, `InProgress`, `Completed`,
+/// `Failed`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToolStatus {
+    Pending,
+    InProgress,
+    Completed,
+    Failed,
+}
+
+impl ToolStatus {
+    /// The call is over, whether it worked or not.
+    pub fn finished(self) -> bool {
+        matches!(self, ToolStatus::Completed | ToolStatus::Failed)
+    }
+}
+
+impl std::fmt::Display for ToolStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(self, f)
+    }
+}
+
+impl From<ToolCallStatus> for ToolStatus {
+    fn from(status: ToolCallStatus) -> Self {
+        match status {
+            ToolCallStatus::Pending => ToolStatus::Pending,
+            ToolCallStatus::InProgress => ToolStatus::InProgress,
+            ToolCallStatus::Completed => ToolStatus::Completed,
+            ToolCallStatus::Failed => ToolStatus::Failed,
+            // ACP may add statuses; one this version doesn't know is taken as still running.
+            _ => ToolStatus::InProgress,
+        }
+    }
 }
 
 /// Something the agent lets the user choose for one session, such as its model.
@@ -1326,12 +1362,12 @@ fn flatten(update: SessionUpdate, replaying: bool) -> Option<SessionEvent> {
         SessionUpdate::ToolCall(call) => SessionEvent::ToolCall {
             id: call.tool_call_id.0.to_string(),
             title: call.title,
-            status: format!("{:?}", call.status),
+            status: call.status.into(),
         },
         SessionUpdate::ToolCallUpdate(update) => SessionEvent::ToolCallUpdate {
             id: update.tool_call_id.0.to_string(),
             title: update.fields.title,
-            status: update.fields.status.map(|status| format!("{status:?}")),
+            status: update.fields.status.map(ToolStatus::from),
         },
         SessionUpdate::Plan(plan) => SessionEvent::Plan(
             plan.entries

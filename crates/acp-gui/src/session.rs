@@ -2,13 +2,26 @@
 //! its settings with the changes the agent hasn't answered yet, and how each of the
 //! agent's events for it lands there.
 
+mod pacing;
+
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
-use acp_core::{PermissionRequest, SessionEvent, SessionKey, Setting, SettingKind, SettingValue};
-use gpui_kit::component::message_scroller::MessageScrollerState;
-use gpui_kit::component::text::TextViewState;
+use acp_core::{
+    PermissionRequest, SessionEvent, SessionKey, Setting, SettingKind, SettingValue, ToolStatus,
+};
+use gpui_kit::base::Easing;
+use gpui_kit::component::ActiveTheme as _;
+use gpui_kit::component::text::{TextViewMotion, TextViewState};
 use gpui_kit::*;
+
+use crate::chat_view::scroller::TranscriptScroll;
+use pacing::Pacer;
+
+/// How much later each word of a streamed piece starts fading in than the one before,
+/// as in gpui-component's own `TextView::stream_fade`.
+const STREAM_FADE_STAGGER: Duration = Duration::from_millis(10);
 
 pub(crate) enum Row {
     User(String),
@@ -18,7 +31,7 @@ pub(crate) enum Row {
     Tool {
         id: String,
         title: String,
-        status: String,
+        status: ToolStatus,
     },
     Permission {
         request: PermissionRequest,
@@ -39,7 +52,7 @@ pub(crate) struct Session {
     /// The first line of the first prompt, shown on the session's card.
     pub(crate) title: Option<String>,
     pub(crate) rows: Vec<Row>,
-    pub(crate) scroller: Entity<MessageScrollerState>,
+    pub(crate) scroller: Entity<TranscriptScroll>,
     /// Not ready for a prompt: a spare still being created, a turn is running, or the
     /// agent is gone. A session the agent hasn't created yet takes a prompt, which has
     /// the agent create it.
@@ -60,6 +73,18 @@ pub(crate) struct Session {
     pub(crate) origin: Origin,
     /// In the sidebar's Archived list, out of the way.
     pub(crate) archived: bool,
+    /// A turn prompted here is running, so the agent's text arrives as it is written: it
+    /// fades in, new rows come in with motion, and the transcript glides down to them. A
+    /// loaded session's replay shows at once.
+    live: bool,
+    /// When each row added in a live turn came in, until its entrance has played. Kept
+    /// here because the list drops a row's element state once it scrolls out of view.
+    pub(crate) entering: HashMap<usize, Instant>,
+    /// When the rows last changed, which the waiting line's delay counts from.
+    pub(crate) changed: Instant,
+    /// The agent's text in a live turn, held back to show at an even pace, and the
+    /// transcript's events that came after it.
+    pacer: Pacer,
 }
 
 /// Which run a session's agent session comes from.
@@ -89,7 +114,7 @@ impl Session {
             agent,
             title: None,
             rows: Vec::new(),
-            scroller: cx.new(|cx| MessageScrollerState::new(0, cx)),
+            scroller: cx.new(|_| TranscriptScroll::new()),
             busy: false,
             draft: SharedString::default(),
             settings: Vec::new(),
@@ -98,7 +123,35 @@ impl Session {
             id: None,
             origin: Origin::New,
             archived: false,
+            live: false,
+            entering: HashMap::new(),
+            changed: Instant::now(),
+            pacer: Pacer::default(),
         }
+    }
+
+    /// Starts or ends a live turn. Only a live turn shows the waiting line under the last
+    /// row, so that row is measured again when it comes or goes.
+    pub(crate) fn set_live(&mut self, live: bool, cx: &mut App) {
+        if self.live == live {
+            return;
+        }
+        let waiting = self.waiting();
+        self.live = live;
+        if self.waiting() != waiting {
+            self.remeasure(self.rows.len() - 1, cx);
+        }
+    }
+
+    /// Waiting on the agent in a live turn: nothing has come since the prompt, or since
+    /// the last tool call finished.
+    pub(crate) fn waiting(&self) -> bool {
+        self.live
+            && match self.rows.last() {
+                Some(Row::User(_)) => true,
+                Some(Row::Tool { status, .. }) => status.finished(),
+                _ => false,
+            }
     }
 
     /// A setting as it shows: one changed here shows the value last asked for until the
@@ -135,7 +188,127 @@ impl Session {
         }
     }
 
+    /// Takes an event from the agent. In a live turn its text is held back to show at an
+    /// even pace, and the transcript's other events wait behind it, keeping their order.
     pub(crate) fn apply(&mut self, event: SessionEvent, cx: &mut App) {
+        if !self.live || !in_transcript(&event) || self.updates_shown_tool(&event) {
+            return self.land(event, cx);
+        }
+        if self.pacer.after.is_empty() {
+            self.take(event, cx);
+        } else {
+            self.pacer.after.push_back(event);
+        }
+    }
+
+    /// An update to a tool call whose row shows already. It changes a row above any text
+    /// held back, so it can't land out of order; held back, it would make the pacer take
+    /// that text's row as finished while more of it may follow the update.
+    fn updates_shown_tool(&self, event: &SessionEvent) -> bool {
+        let SessionEvent::ToolCallUpdate { id, .. } = event else {
+            return false;
+        };
+        self.rows
+            .iter()
+            .any(|row| matches!(row, Row::Tool { id: shown, .. } if shown == id))
+    }
+
+    /// Whether any text or event is held back, for `pace` to show.
+    pub(crate) fn pacing(&self) -> bool {
+        self.pacer.holds()
+    }
+
+    /// Shows the next piece of held-back text, `dt` after the last, and once all of it
+    /// shows, lands what came after it.
+    pub(crate) fn pace(&mut self, dt: Duration, cx: &mut App) -> Paced {
+        let mut paced = Paced::default();
+        if let Some(piece) = self.pacer.next(dt, Instant::now()) {
+            self.show(piece, cx);
+            paced.shown = true;
+        }
+        while !self.pacer.has_text() {
+            let Some(event) = self.pacer.after.pop_front() else {
+                break;
+            };
+            self.take(event, cx);
+            paced.landed = true;
+        }
+        paced.holds = self.pacer.holds();
+        paced
+    }
+
+    /// Shows all held-back text at once and lands what came after it, as when the user
+    /// stops the turn or the agent is gone.
+    pub(crate) fn flush(&mut self, cx: &mut App) {
+        loop {
+            if self.pacer.has_text() {
+                let text = self.pacer.take_all();
+                self.show(text, cx);
+            }
+            let Some(event) = self.pacer.after.pop_front() else {
+                break;
+            };
+            self.take(event, cx);
+        }
+    }
+
+    /// A transcript event in a live turn with no event before it still held back: text
+    /// joins the held text, and anything else lands once no text is held.
+    fn take(&mut self, event: SessionEvent, cx: &mut App) {
+        let (thought, text) = match event {
+            SessionEvent::AgentText(text) => (false, text),
+            SessionEvent::AgentThought(text) => (true, text),
+            event if self.pacer.has_text() => return self.pacer.after.push_back(event),
+            event => return self.land(event, cx),
+        };
+        let streaming = self.pacer.opens.or(match self.rows.last() {
+            Some(Row::Agent(_)) => Some(false),
+            Some(Row::Thought(_)) => Some(true),
+            _ => None,
+        });
+        if streaming != Some(thought) {
+            // Text for another row waits until this one has shown all of its own.
+            if self.pacer.has_text() {
+                let event = if thought {
+                    SessionEvent::AgentThought(text)
+                } else {
+                    SessionEvent::AgentText(text)
+                };
+                return self.pacer.after.push_back(event);
+            }
+            // Agents often open a block with a bare "\n\n" chunk; don't start a row with it.
+            if text.trim().is_empty() {
+                return;
+            }
+            self.pacer.start_row(thought);
+        }
+        self.pacer.arrived(&text, Instant::now());
+    }
+
+    /// Shows a piece of the held-back text: in the last row, or in a new one it opens.
+    fn show(&mut self, piece: String, cx: &mut App) {
+        if let Some(thought) = self.pacer.opens.take() {
+            let view = cx.new(|cx| {
+                // Pushed rather than set, so the row's first piece fades in too.
+                let mut view = TextViewState::markdown("", cx).motion(stream_fade(cx));
+                view.push_str(&piece, cx);
+                view
+            });
+            let row = if thought {
+                Row::Thought(view)
+            } else {
+                Row::Agent(view)
+            };
+            return self.push(row, cx);
+        }
+        if let Some(Row::Agent(view) | Row::Thought(view)) = self.rows.last() {
+            view.update(cx, |view, cx| view.push_str(&piece, cx));
+            self.remeasure(self.rows.len() - 1, cx);
+        }
+    }
+
+    /// An event as it lands in the session, at once.
+    fn land(&mut self, event: SessionEvent, cx: &mut App) {
         match event {
             SessionEvent::Created(id) => self.id = Some(id),
             SessionEvent::UserText(text) => self.append_user_text(&text, cx),
@@ -159,7 +332,7 @@ impl Session {
                                 if let Some(title) = title.clone() {
                                     *row_title = title;
                                 }
-                                if let Some(status) = status.clone() {
+                                if let Some(status) = status {
                                     *row_status = status;
                                 }
                                 Some(ix)
@@ -180,17 +353,20 @@ impl Session {
                 },
                 cx,
             ),
+            // The turn's last row still comes in as the turn's others did.
             SessionEvent::TurnEnded { stop_reason } => {
                 self.busy = false;
                 self.cancel_open_permissions(cx);
                 if stop_reason != "EndTurn" {
                     self.push(Row::Notice(format!("turn ended: {stop_reason}")), cx);
                 }
+                self.set_live(false, cx);
             }
             SessionEvent::TurnFailed(message) => {
                 self.busy = false;
                 self.cancel_open_permissions(cx);
                 self.push(Row::Error(message), cx);
+                self.set_live(false, cx);
             }
             SessionEvent::Settings(settings) => {
                 self.settings = settings;
@@ -209,7 +385,7 @@ impl Session {
             }
             SessionEvent::SettingFailed { setting, message } => {
                 self.answered(&setting);
-                self.push(Row::Error(message), cx)
+                self.push_error(message, cx)
             }
         }
     }
@@ -246,6 +422,7 @@ impl Session {
     }
 
     /// Streams arrive as small chunks; grow the last row instead of adding one per chunk.
+    /// Only text outside a live turn comes here, such as a loaded session's replay.
     fn append_text(&mut self, thought: bool, text: &str, cx: &mut App) {
         match self.rows.last() {
             Some(Row::Agent(existing)) if !thought => {
@@ -279,18 +456,66 @@ impl Session {
         self.remeasure(self.rows.len() - 1, cx);
     }
 
+    /// An error from outside the turn's own events, such as the connection's or a setting
+    /// change's. What the turn has sent shows first, all of it, so the error comes after
+    /// it and no held-back text is left for a row that is no longer the last.
+    pub(crate) fn push_error(&mut self, message: String, cx: &mut App) {
+        self.flush(cx);
+        self.push(Row::Error(message), cx);
+    }
+
     pub(crate) fn push(&mut self, row: Row, cx: &mut App) {
+        let now = Instant::now();
+        if self.live {
+            self.entering.insert(self.rows.len(), now);
+        }
+        self.changed = now;
         self.rows.push(row);
-        self.scroller.update(cx, |scroller, cx| {
-            scroller.append(1, cx);
-        });
+        let live = self.live;
+        self.scroller.update(cx, |scroller, _| scroller.push(live));
     }
 
     fn remeasure(&mut self, ix: usize, cx: &mut App) {
-        self.scroller.update(cx, |scroller, cx| {
-            scroller.remeasure_items(ix..ix + 1, cx);
-        });
+        self.changed = Instant::now();
+        let live = self.live;
+        self.scroller
+            .update(cx, |scroller, _| scroller.remeasure(ix, live));
     }
+}
+
+/// What one `Session::pace` step did.
+#[derive(Default)]
+pub(crate) struct Paced {
+    /// A piece of held-back text showed.
+    pub(crate) shown: bool,
+    /// An event that waited behind the text landed.
+    pub(crate) landed: bool,
+    /// Text or events are still held back.
+    pub(crate) holds: bool,
+}
+
+/// Events that land in the transcript, which keep their order behind held-back text.
+/// The others concern settings and land at once.
+fn in_transcript(event: &SessionEvent) -> bool {
+    !matches!(
+        event,
+        SessionEvent::Created(_)
+            | SessionEvent::Settings(_)
+            | SessionEvent::SettingChanged { .. }
+            | SessionEvent::ModeChanged(_)
+            | SessionEvent::SettingFailed { .. }
+    )
+}
+
+/// The agent's text fading in as it streams: each piece over the theme's slow duration,
+/// its words one after another, as `TextView::stream_fade` does. A piece too large to
+/// light up within one fade, such as one after a stall, fades as a whole. gpui-component
+/// draws it at once while macOS's Reduce motion is on.
+fn stream_fade(cx: &App) -> TextViewMotion {
+    TextViewMotion::default()
+        .with_stream_fade(cx.theme().motion_tokens().duration_slow)
+        .with_stream_fade_stagger(STREAM_FADE_STAGGER)
+        .with_stream_fade_easing(Easing::EaseOut)
 }
 
 /// A selectable row's element id, which carries the session so a row of one session
