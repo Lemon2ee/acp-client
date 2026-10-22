@@ -2274,6 +2274,8 @@ impl AssetSource for AppAssets {
     }
 }
 
+actions!(acp_gui, [Quit]);
+
 fn main() {
     // One agent by name, or both harnesses to pick between from the model menu.
     let name = std::env::args().nth(1);
@@ -2300,6 +2302,13 @@ fn main() {
         .with_assets(AppAssets)
         .run(move |cx: &mut App| {
             gpui_kit::init(cx);
+            // Nothing quits on Cmd+Q unless the app says so: gpui-kit leaves the shortcut
+            // to the app, and with no menus set AppKit has no Quit item to match it to.
+            cx.on_action(|_: &Quit, cx| cx.quit());
+            cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
+            cx.set_menus([
+                Menu::new("ACP client").items([MenuItem::action("Quit ACP client", Quit)])
+            ]);
             Theme::update(cx, |theme| {
                 theme.light_theme = with_panel_colors(&theme.light_theme, "#f7f7f7", "#fcfcfc");
                 theme.dark_theme = with_panel_colors(&theme.dark_theme, "#111111", "#151515");
