@@ -85,6 +85,10 @@ pub(crate) struct Session {
     /// Groups of tool calls the user opened or closed, by their first row, which keep
     /// that rather than opening and closing with the turn.
     groups_set: HashMap<usize, bool>,
+    /// A turn ended and no text has come since. Text the agent sends between turns, as
+    /// acp-core passes it on, is a message of its own rather than more of the turn's last
+    /// reply.
+    after_turn: bool,
 }
 
 /// Which run a session's agent session comes from.
@@ -129,6 +133,7 @@ impl Session {
             changed: Instant::now(),
             pacer: Pacer::default(),
             groups_set: HashMap::new(),
+            after_turn: false,
         }
     }
 
@@ -404,6 +409,7 @@ impl Session {
             // The turn's last row still comes in as the turn's others did.
             SessionEvent::TurnEnded { stop_reason } => {
                 self.busy = false;
+                self.after_turn = true;
                 self.cancel_open_permissions(cx);
                 if stop_reason != "EndTurn" {
                     self.push(Row::Notice(format!("turn ended: {stop_reason}")), cx);
@@ -412,6 +418,7 @@ impl Session {
             }
             SessionEvent::TurnFailed(message) => {
                 self.busy = false;
+                self.after_turn = true;
                 self.cancel_open_permissions(cx);
                 self.push(Row::Error(message), cx);
                 self.set_live(false, cx);
@@ -582,18 +589,21 @@ impl Session {
     }
 
     /// Streams arrive as small chunks; grow the last row instead of adding one per chunk.
-    /// Only text outside a live turn comes here, such as a loaded session's replay.
+    /// Only text outside a live turn comes here: a loaded session's replay, or what the
+    /// agent sends between turns.
     fn append_text(&mut self, thought: bool, text: &str, cx: &mut App) {
+        let joins = !self.after_turn;
         match self.rows.last() {
-            Some(Row::Agent(existing)) if !thought => {
+            Some(Row::Agent(existing)) if !thought && joins => {
                 existing.update(cx, |view, cx| view.push_str(text, cx))
             }
-            Some(Row::Thought(existing)) if thought => {
+            Some(Row::Thought(existing)) if thought && joins => {
                 existing.update(cx, |view, cx| view.push_str(text, cx))
             }
             // Agents often open a block with a bare "\n\n" chunk; don't start a row with it.
             _ if text.trim().is_empty() => return,
             _ => {
+                self.after_turn = false;
                 let view = cx.new(|cx| TextViewState::markdown(text, cx));
                 let row = if thought {
                     Row::Thought(view)
