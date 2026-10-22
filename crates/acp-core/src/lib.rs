@@ -36,16 +36,18 @@ pub struct SessionKey(pub u64);
 
 /// What the front end asks the agent to do.
 pub enum Command {
-    /// Answered with `SessionReady` or `SessionFailed`. A key already in use keeps its
-    /// session, and the repeated command is ignored.
+    /// Creates the session now, ahead of its first prompt. Answered with `SessionReady`
+    /// or `SessionFailed`. A key already in use keeps its session, and the repeated
+    /// command is ignored.
     NewSession(SessionKey),
-    /// Runs after the session's earlier prompts. If the agent failed to create the
-    /// session, it is created again first.
+    /// Runs after the session's earlier prompts. A session not created yet, or that the
+    /// agent failed to create, is created first; if that fails, so does the prompt.
     Prompt(SessionKey, String),
     /// Stop the session's turn in flight; ignored when idle.
     Cancel(SessionKey),
     /// Sets one of the session's settings, by id, during a turn or not. Answered with
     /// `SettingChanged`, or `SettingFailed`; a prompt sent after it waits for the answer.
+    /// A session not created yet gets the change once its first prompt creates it.
     ChangeSetting(SessionKey, String, SettingValue),
     /// Drops the session: its task is cancelled, whether it is still creating the
     /// session or running a turn, so no more of its events come. A permission request
@@ -305,22 +307,27 @@ async fn run(
             // Each session's queue and its task, which dropping cancels.
             let mut sessions: HashMap<SessionKey, (Sender<SessionCommand>, smol::Task<()>)> =
                 HashMap::new();
+            // A session's task, created now or by its first prompt.
+            let start = |key, create_now| {
+                let (command_tx, command_rx) = smol::channel::unbounded();
+                let task = tasks.spawn(run_session(
+                    key,
+                    cx.clone(),
+                    cwd.to_path_buf(),
+                    command_rx,
+                    events.clone(),
+                    login_options.clone(),
+                    create_now,
+                ));
+                (command_tx, task)
+            };
             tasks
                 .run(async {
                     while let Some(command) = next_command(commands, &cx).await? {
                         let (key, command) = match command {
                             Command::NewSession(key) => {
                                 if let Entry::Vacant(entry) = sessions.entry(key) {
-                                    let (command_tx, command_rx) = smol::channel::unbounded();
-                                    let task = tasks.spawn(run_session(
-                                        key,
-                                        cx.clone(),
-                                        cwd.to_path_buf(),
-                                        command_rx,
-                                        events.clone(),
-                                        login_options.clone(),
-                                    ));
-                                    entry.insert((command_tx, task));
+                                    entry.insert(start(key, true));
                                 }
                                 continue;
                             }
@@ -336,9 +343,16 @@ async fn run(
                                 continue;
                             }
                         };
-                        if let Some((session, _)) = sessions.get(&key) {
-                            let _ = session.try_send(command);
-                        }
+                        let (session, _) = match sessions.entry(key) {
+                            Entry::Occupied(entry) => entry.into_mut(),
+                            // No session, so nothing is running to stop.
+                            Entry::Vacant(_) if matches!(command, SessionCommand::Cancel) => {
+                                continue;
+                            }
+                            // Waits for its first prompt to create the session.
+                            Entry::Vacant(entry) => entry.insert(start(key, false)),
+                        };
+                        let _ = session.try_send(command);
                     }
                     Ok(())
                 })
@@ -368,8 +382,9 @@ async fn next_command(
     }
 }
 
-/// Creates the session, then runs its prompts one at a time, as they arrive.
-/// A session the agent failed to create is created again by its next prompt.
+/// Creates the session, now or once its first prompt comes, then runs its prompts one
+/// at a time, as they arrive. A session the agent failed to create is created again by
+/// its next prompt.
 async fn run_session(
     key: SessionKey,
     cx: ConnectionTo<Agent>,
@@ -377,12 +392,19 @@ async fn run_session(
     commands: Receiver<SessionCommand>,
     events: Sender<Event>,
     login_options: Vec<String>,
+    create_now: bool,
 ) {
-    // The prompt to run once the session exists, when a prompt is creating it again.
+    // The prompt to run once the session exists, when a prompt is creating it.
     let mut retry = None;
     // Setting changes made while there was no session to make them to, which the
-    // session gets before the prompt that created it again.
+    // session gets before the prompt that creates it.
     let mut changes_waiting = Vec::new();
+    if !create_now {
+        let Some(text) = creating_prompt(&commands, &mut changes_waiting).await else {
+            return;
+        };
+        retry = Some(text);
+    }
     loop {
         // `run_until` sends `session/new` from this task, so a refusal comes back here;
         // `start_session` sends it from a connection task, where an error ends the
@@ -421,17 +443,27 @@ async fn run_session(
             Some(_) => Event::Session(key, SessionEvent::TurnFailed(message)),
         };
         emit(&events, failed);
-        retry = loop {
-            match commands.recv().await {
-                Ok(SessionCommand::Prompt(text)) => break Some(text),
-                // No session, so nothing is running to stop.
-                Ok(SessionCommand::Cancel) => {}
-                Ok(SessionCommand::ChangeSetting(setting, value)) => {
-                    changes_waiting.push((setting, value))
-                }
-                Err(_) => return,
-            }
+        let Some(text) = creating_prompt(&commands, &mut changes_waiting).await else {
+            return;
         };
+        retry = Some(text);
+    }
+}
+
+/// Waits, while there is no session, for the prompt that is to create it, keeping the
+/// setting changes made meanwhile in `changes`. `None` once the front end has gone.
+async fn creating_prompt(
+    commands: &Receiver<SessionCommand>,
+    changes: &mut Vec<(String, SettingValue)>,
+) -> Option<String> {
+    loop {
+        match commands.recv().await {
+            Ok(SessionCommand::Prompt(text)) => return Some(text),
+            // No session, so nothing is running to stop.
+            Ok(SessionCommand::Cancel) => {}
+            Ok(SessionCommand::ChangeSetting(setting, value)) => changes.push((setting, value)),
+            Err(_) => return None,
+        }
     }
 }
 
