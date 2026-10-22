@@ -33,7 +33,7 @@ clearly needs splitting. acp-gui is split by what each part keeps or draws:
 | `chat_view.rs` | `ChatView`: the agents, the sessions and what happens to them, and the window's layout (`Render`). |
 | `chat_view/transcript.rs` | How each row of a transcript is drawn. |
 | `chat_view/tool_call.rs` | A tool call's row (icon, title, state, time) and the box it opens to; calls in a row grouped under one header that folds them; the permission card in a call's place, with its keys. |
-| `chat_view/scroller.rs` | The transcript's list: following its newest text, and the button back to the newest. |
+| `chat_view/scroller.rs` | The transcript's list: following its newest text, the button back to the newest, and how far a finger may push it past either end. |
 | `chat_view/sidebar.rs` | The session cards, renaming, the delete prompt, the Archived list, the draggable edge. |
 | `chat_view/settings_page.rs` | The settings, which take the window while open. |
 | `chat_view/pickers.rs` | What the buttons below the prompt and their menus share: `MenuLook`, sizes, `picker_button`. |
