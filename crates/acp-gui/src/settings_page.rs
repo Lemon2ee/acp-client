@@ -12,7 +12,8 @@ use gpui_kit::*;
 
 use crate::chrome::{WINDOW_BLUR, as_title_bar};
 use crate::config::{AppSettings, Appearance, SETTINGS, config_folder};
-use crate::{ChatView, CloseSettings, ResizeSidebar, agent_logo};
+use crate::sidebar::ResizeSidebar;
+use crate::{ChatView, CloseSettings, agent_logo};
 
 /// The widest the settings' column gets: 560 for the settings, and 32 either side.
 const SETTINGS_COLUMN_WIDTH: Pixels = px(624.);
