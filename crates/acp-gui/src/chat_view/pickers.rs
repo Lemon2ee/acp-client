@@ -1,20 +1,26 @@
 //! The buttons below the prompt for the model, the effort and the mode, and what their
-//! menus share: the sizes, `MenuLook`'s colors and shadows, how a menu comes in, and how a
-//! setting's "default" choice can stand for another.
+//! menus share: the sizes, `MenuLook`'s colors and shadows, how a menu comes in, how the
+//! keys move through a menu, and how a setting's "default" choice can stand for another.
 
 mod effort;
 mod mode;
 pub(crate) mod model_panel;
 
-use acp_core::{Harness, Setting, SettingChoice, SettingKind};
+use std::rc::Rc;
+
+use acp_core::{Harness, SessionKey, Setting, SettingChoice, SettingKind, SettingValue};
+use gpui_kit::base::actions::{Confirm, SelectDown, SelectUp};
 use gpui_kit::component::button::{ButtonCustomVariant, ButtonVariants as _};
 use gpui_kit::component::input::InputGroupButton;
+use gpui_kit::component::popover::{Popover, PopoverState};
 use gpui_kit::component::{ActiveTheme as _, Icon, IconName, Sizable as _};
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
+use crate::chat_view::ChatView;
 use crate::config::harness_of;
 
-/// The text of the model panel, the effort menu and the buttons that open them, and of
+/// The text of the model panel, the menus and the buttons that open them, and of
 /// the small headings in them. 13px text on 28px rows is the density of macOS's menus.
 const MENU_TEXT_SIZE: Pixels = px(13.);
 const MENU_LINE_HEIGHT: Pixels = px(16.);
@@ -26,7 +32,7 @@ const LIST_ROW_HEIGHT: Pixels = px(28.);
 const SWITCH_ROW_HEIGHT: Pixels = px(30.);
 const LIST_HEADER_HEIGHT: Pixels = px(26.);
 const LIST_HEADER_GAP: Pixels = px(6.);
-/// The heading over the effort menu's levels.
+/// The heading over the effort menu's levels and the mode menu's modes.
 const MENU_HEADING_HEIGHT: Pixels = px(24.);
 /// A row's padding. The right is narrower, as the star's button has room of its own.
 const ROW_PAD_LEFT: Pixels = px(6.);
@@ -42,14 +48,14 @@ const HEADING_ICON_SIZE: Pixels = px(12.);
 /// as tall as one with many.
 const PANEL_WIDTH: Pixels = px(320.);
 const PANEL_HEIGHT: Pixels = px(380.);
-/// How wide the effort menu is.
+/// How wide the effort menu is, and the narrowest the mode menu gets.
 const EFFORT_MENU_WIDTH: Pixels = px(196.);
-/// How round the panel and the effort menu are, and the rows and tabs in them. The rows
+/// How round the panel and the menus are, and the rows and tabs in them. The rows
 /// sit 4px in from the edge, so their corners follow the surface's.
 const SURFACE_RADIUS: Pixels = px(10.);
 const ROW_RADIUS: Pixels = px(6.);
 const SURFACE_PADDING: Pixels = px(4.);
-/// How far above its button the panel or the effort menu opens.
+/// How far above its button the panel or a menu opens.
 const MENU_OFFSET: Pixels = px(6.);
 /// How wide the panel's column of tabs is, and how big each tab is.
 const TAB_COLUMN_WIDTH: Pixels = px(44.);
@@ -71,7 +77,7 @@ const METER_BAR_WIDTH: Pixels = px(2.);
 /// Groups a model's row with its star, which shows while the row is pointed at.
 const MODEL_ROW_GROUP: &str = "model-panel-row";
 
-/// The colors of the model panel and the effort menu. In dark mode the surface is a step
+/// The colors of the model panel and the menus. In dark mode the surface is a step
 /// lighter than the window (#1f1f1f over #151515): the theme's popover color, #0a0a0a,
 /// is darker than the window and made the panel look sunk into it.
 #[derive(Clone, Copy)]
@@ -151,7 +157,7 @@ impl MenuLook {
         ]
     }
 
-    /// The surface of the panel or the effort menu, rounded and lifted off the window.
+    /// The surface of the panel or a menu, rounded and lifted off the window.
     fn surface(&self) -> Div {
         div()
             .relative()
@@ -298,15 +304,15 @@ fn come_in<E: Styled + IntoElement + 'static>(
     })
 }
 
-/// `surface`, the model panel or the effort menu, coming in as it opens upward: it
+/// `surface`, the model panel or a menu, coming in as it opens upward: it
 /// rises out of the button below it as it fades in. The popover is drawn only while
 /// open, so each open plays this afresh.
-fn rise_in(
-    surface: Div,
+fn rise_in<E: Styled + IntoElement + 'static>(
+    surface: E,
     id: impl Into<ElementId>,
     window: &Window,
     cx: &App,
-) -> AnimationElement<Div> {
+) -> AnimationElement<E> {
     let motion = cx.theme().motion_tokens();
     let travel = motion.distance_short.to_pixels(window.rem_size());
     let easing = motion.easing_enter.clone();
@@ -314,6 +320,181 @@ fn rise_in(
     come_in(surface, id, enter, move |surface, rest| {
         surface.top(travel * rest)
     })
+}
+
+/// What a menu below the prompt keeps while it is open: the focus that brings it the
+/// arrow keys, and the row they or the pointer last lit. Only one menu is open at a time.
+#[derive(Clone)]
+pub(crate) struct MenuNav {
+    focus: FocusHandle,
+    highlighted: Option<usize>,
+}
+
+impl MenuNav {
+    pub(crate) fn new(cx: &mut App) -> Self {
+        Self {
+            focus: cx.focus_handle(),
+            highlighted: None,
+        }
+    }
+}
+
+/// What a press on a menu's row, or Enter on its lit row, does with the row's index.
+type PickRow = Rc<dyn Fn(usize, &mut Window, &mut App)>;
+
+/// The pick of a menu whose rows are `choices` of the session's setting `setting`, by id:
+/// it sets the setting to the row's choice and closes the menu.
+fn pick_choice(
+    setting: &str,
+    choices: Vec<String>,
+    key: SessionKey,
+    view: &WeakEntity<ChatView>,
+    popover: &Entity<PopoverState>,
+) -> PickRow {
+    let (setting, view, popover) = (setting.to_string(), view.clone(), popover.clone());
+    Rc::new(move |row, window, cx| {
+        let Some(choice) = choices.get(row) else {
+            return;
+        };
+        let _ = view.update(cx, |this, cx| {
+            let value = SettingValue::Choice(choice.clone());
+            this.change_setting(key, setting.clone(), value, cx)
+        });
+        popover.update(cx, |state, cx| state.dismiss(window, cx));
+    })
+}
+
+/// The popover of a menu below the prompt, opening upward from its button. It gives the
+/// menu the focus, so the keys reach it, and opens with no row lit.
+fn menu_popover(id: &'static str, nav: &MenuNav, view: &WeakEntity<ChatView>) -> Popover {
+    let view = view.clone();
+    Popover::new(id)
+        .appearance(false)
+        .anchor(Anchor::BottomLeft)
+        .offset(MENU_OFFSET)
+        .track_focus(&nav.focus)
+        .on_open_change(move |open, _, cx| {
+            if *open {
+                let _ = view.update(cx, |this, cx| this.highlight_menu_row(None, cx));
+            }
+        })
+}
+
+/// What the parts of an open menu below the prompt share: its look, its light, and what
+/// a press on a row, or Enter on the lit one, does.
+struct MenuParts<'a> {
+    look: MenuLook,
+    nav: &'a MenuNav,
+    view: &'a WeakEntity<ChatView>,
+    pick: PickRow,
+}
+
+impl MenuParts<'_> {
+    /// The menu's surface, named `name` for screen readers. It holds the focus while
+    /// open: Up and Down move the light through its `rows` rows, wrapping at either end,
+    /// and Enter or Space picks the lit row (see `main`'s key bindings). Esc is the
+    /// popover's own. The light goes out as the pointer leaves the menu.
+    fn surface(&self, id: &'static str, name: &str, rows: usize) -> Stateful<Div> {
+        let highlighted = self.nav.highlighted;
+        let (down, up, out) = (self.view.clone(), self.view.clone(), self.view.clone());
+        let pick = self.pick.clone();
+        self.look
+            .surface()
+            .id(id)
+            .track_focus(&self.nav.focus)
+            .key_context("PickerMenu")
+            .role(Role::Menu)
+            .aria_label(SharedString::from(name.to_string()))
+            .p(SURFACE_PADDING)
+            .flex()
+            .flex_col()
+            .whitespace_nowrap()
+            .on_action(move |_: &SelectDown, _, cx| {
+                let _ = down.update(cx, |this, cx| this.step_menu_highlight(1, rows, cx));
+            })
+            .on_action(move |_: &SelectUp, _, cx| {
+                let _ = up.update(cx, |this, cx| this.step_menu_highlight(-1, rows, cx));
+            })
+            .on_action(move |_: &Confirm, window, cx| {
+                if let Some(row) = highlighted {
+                    pick(row, window, cx);
+                }
+            })
+            .on_hover(move |hovered, _, cx| {
+                if !hovered {
+                    let _ = out.update(cx, |this, cx| this.highlight_menu_row(None, cx));
+                }
+            })
+    }
+
+    /// The menu's `row`th row, a choice of the setting, `current` if it is the one in
+    /// use. The keys and the pointer share one light: moving the pointer over a row
+    /// lights it, and the keys go on from there. A press picks the row.
+    fn row(&self, id: impl Into<ElementId>, row: usize, current: bool) -> Stateful<Div> {
+        let (view, pick) = (self.view.clone(), self.pick.clone());
+        let lit = self.nav.highlighted == Some(row);
+        div()
+            .id(id)
+            .flex_none()
+            .flex()
+            .gap(LEAD_GAP)
+            .rounded(ROW_RADIUS)
+            .role(Role::MenuItemRadio)
+            .aria_toggled(if current {
+                Toggled::True
+            } else {
+                Toggled::False
+            })
+            .when(lit, |item| {
+                item.bg(self.look.hover).aria_active_descendant()
+            })
+            .on_mouse_move(move |_, _, cx| {
+                if !lit {
+                    let _ = view.update(cx, |this, cx| this.highlight_menu_row(Some(row), cx));
+                }
+            })
+            .on_click(move |_, window, cx| pick(row, window, cx))
+    }
+
+    /// The small heading at the top of the menu, the setting's name, at the rows' lead
+    /// column.
+    fn heading(&self, name: &str) -> Div {
+        div()
+            .h(MENU_HEADING_HEIGHT)
+            .flex_none()
+            .pl(ROW_PAD_LEFT)
+            .flex()
+            .items_center()
+            .text_size(MENU_HEADING_SIZE)
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_color(self.look.muted)
+            .child(SharedString::from(name.to_string()))
+    }
+}
+
+impl ChatView {
+    /// Lights `row` of the open menu, or none.
+    fn highlight_menu_row(&mut self, row: Option<usize>, cx: &mut Context<Self>) {
+        if self.menu_nav.highlighted != row {
+            self.menu_nav.highlighted = row;
+            cx.notify();
+        }
+    }
+
+    /// Moves the open menu's light `step` rows down, or up for a negative step, among its
+    /// `rows`, wrapping at either end. With no row lit, Down lights the first and Up the
+    /// last.
+    fn step_menu_highlight(&mut self, step: isize, rows: usize, cx: &mut Context<Self>) {
+        if rows == 0 {
+            return;
+        }
+        let next = match self.menu_nav.highlighted {
+            Some(row) => (row as isize + step).rem_euclid(rows as isize) as usize,
+            None if step > 0 => 0,
+            None => rows - 1,
+        };
+        self.highlight_menu_row(Some(next), cx);
+    }
 }
 
 /// A button below the prompt: an icon, a name and a caret, in 13px text on a 28px

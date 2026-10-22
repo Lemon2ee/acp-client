@@ -11,6 +11,7 @@ mod session;
 use std::borrow::Cow;
 
 use acp_core::{AcpAgent, Harness};
+use gpui_kit::base::actions::{Confirm, SelectDown, SelectUp};
 use gpui_kit::component::Theme;
 use gpui_kit::*;
 
@@ -138,6 +139,15 @@ fn main() {
                 KeyBinding::new("cmd-,", OpenSettings, None),
                 KeyBinding::new("cmd-,", CloseSettings, Some("Settings")),
                 KeyBinding::new("escape", CloseSettings, Some("Settings")),
+            ]);
+            // In the mode menu, Up and Down move the light and Enter or Space picks the
+            // lit row. Esc is the popover's, which closes it. These are the component
+            // library's own actions, as its menus take them.
+            cx.bind_keys([
+                KeyBinding::new("up", SelectUp, Some("PickerMenu")),
+                KeyBinding::new("down", SelectDown, Some("PickerMenu")),
+                KeyBinding::new("enter", Confirm { secondary: false }, Some("PickerMenu")),
+                KeyBinding::new("space", Confirm { secondary: false }, Some("PickerMenu")),
             ]);
             #[cfg(feature = "profile")]
             bind_frame_overlay(cx);

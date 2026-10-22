@@ -27,6 +27,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::OpenSettings;
+use crate::chat_view::pickers::MenuNav;
 use crate::chat_view::pickers::model_panel::ModelPanelState;
 use crate::chat_view::settings_page::SettingsPageState;
 use crate::chat_view::sidebar::{ResizeSidebar, SidebarState};
@@ -96,6 +97,8 @@ pub(crate) struct ChatView {
     blurred: bool,
     sidebar: SidebarState,
     model_panel: ModelPanelState,
+    /// The light and the focus of the menu below the prompt that is open.
+    menu_nav: MenuNav,
     settings_page: SettingsPageState,
     /// The system-wide shortcut the settings name, as macOS holds it for the app.
     global_shortcut: GlobalShortcut,
@@ -252,6 +255,7 @@ impl ChatView {
             blurred: blur,
             sidebar: SidebarState::default(),
             model_panel: ModelPanelState::new(window, cx),
+            menu_nav: MenuNav::new(cx),
             settings_page: SettingsPageState::new(cx),
             global_shortcut: GlobalShortcut::default(),
             pacing: None,
