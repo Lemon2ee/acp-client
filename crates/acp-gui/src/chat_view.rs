@@ -8,6 +8,7 @@ mod sidebar;
 mod transcript;
 
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use acp_core::{
     AcpAgent, Command, Event as AgentEvent, Sender, SessionEvent, SessionKey, Setting, SettingKind,
@@ -39,6 +40,9 @@ use crate::config::{
 };
 use crate::hotkey::{self, GlobalShortcut};
 use crate::session::{Origin, Row, Session};
+
+/// How often text held back in a live turn shows its next piece: about once a frame.
+const PACE_TICK: Duration = Duration::from_millis(16);
 
 /// One agent the window drives, and what it keeps ready on it.
 struct AgentSlot {
@@ -95,6 +99,8 @@ pub(crate) struct ChatView {
     settings_page: SettingsPageState,
     /// The system-wide shortcut the settings name, as macOS holds it for the app.
     global_shortcut: GlobalShortcut,
+    /// Shows the text held back in live turns a piece at a time, while any is held.
+    pacing: Option<Task<()>>,
     _input_events: Subscription,
     _bounds_events: Subscription,
     _settings_events: Subscription,
@@ -248,6 +254,7 @@ impl ChatView {
             model_panel: ModelPanelState::new(window, cx),
             settings_page: SettingsPageState::new(cx),
             global_shortcut: GlobalShortcut::default(),
+            pacing: None,
             _input_events: input_events,
             _bounds_events: bounds_events,
             _settings_events: settings_events,
@@ -740,7 +747,9 @@ impl ChatView {
         let _ = self.agents[session.agent]
             .commands
             .try_send(Command::Cancel(session.key));
-        // Stopping makes acp-core answer the turn's open permission requests as cancelled.
+        // What has arrived shows at once, and permission requests held back behind it
+        // show as cancelled: stopping makes acp-core answer the turn's open ones so.
+        session.flush(cx);
         session.cancel_open_permissions(cx);
         cx.notify();
     }
@@ -866,6 +875,9 @@ impl ChatView {
                 let created = matches!(event, SessionEvent::Created(_));
                 if let Some(session) = self.session_mut(key) {
                     session.apply(event, cx);
+                    if session.pacing() {
+                        self.pace(cx);
+                    }
                 }
                 if created {
                     self.save_session(key);
@@ -901,6 +913,7 @@ impl ChatView {
                     session.busy = true;
                     // A turn cut off with the connection may never report its end, nor
                     // a setting change its answer.
+                    session.flush(cx);
                     session.set_live(false, cx);
                     session.cancel_open_permissions(cx);
                     session.asked.clear();
@@ -908,6 +921,37 @@ impl ChatView {
             }
         }
         cx.notify();
+    }
+
+    /// Has the sessions show the text held back in their live turns a piece at a time,
+    /// until none holds any.
+    fn pace(&mut self, cx: &mut Context<Self>) {
+        if self.pacing.is_some() {
+            return;
+        }
+        self.pacing = Some(cx.spawn(async move |this, cx| {
+            let mut last = Instant::now();
+            loop {
+                cx.background_executor().timer(PACE_TICK).await;
+                let now = Instant::now();
+                let dt = now - last;
+                last = now;
+                let holding = this.update(cx, |this, cx| {
+                    let mut holding = false;
+                    for session in &mut this.sessions {
+                        holding |= session.pace(dt, cx);
+                    }
+                    if !holding {
+                        this.pacing = None;
+                    }
+                    cx.notify();
+                    holding
+                });
+                if !matches!(holding, Ok(true)) {
+                    break;
+                }
+            }
+        }));
     }
 
     fn answer(
