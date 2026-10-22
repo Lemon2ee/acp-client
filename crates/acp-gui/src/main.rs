@@ -327,6 +327,8 @@ struct ChatView {
     /// The models the user starred, which the model panel's favorites tab lists.
     /// Kept on disk.
     favorites: Vec<Favorite>,
+    /// The desktop shows through the window, blurred, behind the sidebar and the chat.
+    window_blur: bool,
     _input_events: Subscription,
     _search_events: Subscription,
 }
@@ -409,11 +411,28 @@ impl ChatView {
                 search,
             },
             favorites: load_favorites(),
+            window_blur: false,
             _input_events: input_events,
             _search_events: search_events,
         };
         view.new_session(window, cx);
         view
+    }
+
+    /// Has the desktop show through the window, blurred, behind the sidebar and the chat,
+    /// or stop. Where gpui can't blur (see `WINDOW_BLUR`) the window stays opaque.
+    fn set_window_blur(&mut self, on: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let on = on && WINDOW_BLUR;
+        if on == self.window_blur {
+            return;
+        }
+        self.window_blur = on;
+        window.set_background_appearance(if on {
+            WindowBackgroundAppearance::Blurred
+        } else {
+            WindowBackgroundAppearance::Opaque
+        });
+        cx.notify();
     }
 
     /// A session on the agent that the agent hasn't created yet: acp-core has it created
@@ -1005,6 +1024,17 @@ const SIDEBAR_BUTTON_SIZE: Pixels = px(28.);
 /// top edge, with the traffic lights in the window's top row. Elsewhere the system
 /// title bar stays.
 const OWN_TITLE_BAR: bool = cfg!(target_os = "macos");
+
+/// Whether the window can blur what is behind it. On macOS gpui puts an
+/// `NSVisualEffectView` under its Metal layer and the window server blurs; elsewhere
+/// the window stays opaque, as gpui's blur there is a guess: Windows uses an undocumented
+/// acrylic attribute, Wayland blurs only under KDE, and X11 just turns see-through.
+const WINDOW_BLUR: bool = cfg!(target_os = "macos");
+/// How much of the blur the sidebar's and the chat's colors cover while the window is
+/// blurred. The sidebar lets more of it through, as macOS sidebars do, and the chat
+/// little enough that its text reads as well as on an opaque window.
+const BLURRED_SIDEBAR_ALPHA: f32 = 0.6;
+const BLURRED_CHAT_ALPHA: f32 = 0.85;
 
 /// Where the traffic lights go, and the top row that holds them, with as much space to
 /// the lights' left and below them as above.
@@ -2024,6 +2054,16 @@ impl Render for ChatView {
             theme.sidebar,
             theme.input,
         );
+        // In full screen the window has a space of its own, with nothing behind it to
+        // blur, so the colors stay opaque there.
+        let (background, sidebar) = if self.window_blur && !window.is_fullscreen() {
+            (
+                background.opacity(BLURRED_CHAT_ALPHA),
+                sidebar.opacity(BLURRED_SIDEBAR_ALPHA),
+            )
+        } else {
+            (background, sidebar)
+        };
         let (muted, hover) = (theme.muted_foreground, theme.secondary);
         let motion = theme.motion_tokens();
         let slide = Transition::new(motion.duration_slow).easing(motion.easing_move.clone());
@@ -2191,7 +2231,6 @@ impl Render for ChatView {
             .size_full()
             .relative()
             .flex()
-            .bg(sidebar)
             .text_color(foreground)
             // A drag of the sidebar's edge can leave the edge's own band within a pixel,
             // so the whole window follows it: the sidebar ends where the pointer is.
@@ -2220,11 +2259,14 @@ impl Render for ChatView {
             })
             .child(
                 // The sidebar keeps its width and slides out to the left as this narrows.
+                // Its color stops here, so that while the window is blurred it isn't
+                // also under the chat's.
                 div()
                     .flex_none()
                     .h_full()
                     .w(sidebar_width)
                     .overflow_hidden()
+                    .bg(sidebar)
                     .child(
                         self.render_sidebar(title_bar, cx)
                             .ml(sidebar_width - self.sidebar_width),
@@ -2475,6 +2517,8 @@ fn main() {
                 theme.dark_theme = with_panel_colors(&theme.dark_theme, "#111111", "#151515");
             });
             let lights = TrafficLights::new(traffic_light_size());
+            // Blurred from the start, where the platform can blur.
+            let blur = true;
             let options = WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
                     None,
@@ -2492,7 +2536,10 @@ fn main() {
                 app_owns_titlebar_drag: OWN_TITLE_BAR,
                 ..Default::default()
             };
-            gpui_kit::open_window(options, cx, |window, cx| {
+            // What `gpui_kit::open_window` does, but the root paints no background of its
+            // own: the chat view paints every surface, and the root's opaque one under
+            // them would hide the blur.
+            cx.open_window(options, |window, cx| {
                 // Light or dark as the system is set, and again whenever that setting changes.
                 Theme::sync_system_appearance(Some(window), cx);
                 window
@@ -2501,7 +2548,11 @@ fn main() {
                     })
                     .detach();
                 let lights_end = lights.end(window);
-                cx.new(|cx| ChatView::new(agents, cwd, lights.row_height, lights_end, window, cx))
+                let view = cx.new(|cx| {
+                    ChatView::new(agents, cwd, lights.row_height, lights_end, window, cx)
+                });
+                view.update(cx, |view, cx| view.set_window_blur(blur, window, cx));
+                cx.new(|cx| gpui_kit::base::Root::new(view, window, cx).bg(transparent_black()))
             })
             .expect("failed to open the window");
             cx.activate(true);
