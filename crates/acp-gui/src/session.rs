@@ -10,7 +10,9 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use acp_core::{PermissionRequest, SessionEvent, SessionKey, Setting, SettingKind, SettingValue};
+use acp_core::{
+    SessionEvent, SessionKey, Setting, SettingKind, SettingValue, ToolKind, ToolStatus,
+};
 use gpui_kit::base::Easing;
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::text::{TextViewMotion, TextViewState};
@@ -19,7 +21,7 @@ use gpui_kit::*;
 use crate::chat_view::scroller::TranscriptScroll;
 use crate::config::TitleSource;
 use pacing::Pacer;
-pub(crate) use tool_call::{Code, Diff, DiffLine, Shown, ToolCall};
+pub(crate) use tool_call::{Answer, Ask, Code, Diff, DiffLine, Shown, ToolCall};
 
 /// How much later each word of a streamed piece starts fading in than the one before,
 /// as in gpui-component's own `TextView::stream_fade`.
@@ -30,13 +32,8 @@ pub(crate) enum Row {
     /// Markdown, grown chunk by chunk as the agent streams.
     Agent(Entity<TextViewState>),
     Thought(Entity<TextViewState>),
+    /// A tool call, with the agent's request for permission to run it if it sent one.
     Tool(ToolCall),
-    Permission {
-        request: PermissionRequest,
-        /// Replaces the option buttons once the request is closed: how it was answered,
-        /// or that it was cancelled.
-        decided: Option<String>,
-    },
     Notice(String),
     Error(String),
 }
@@ -347,27 +344,46 @@ impl Session {
                 content,
                 locations,
             } => {
-                let found = self
-                    .rows
-                    .iter()
-                    .rposition(|row| matches!(row, Row::Tool(call) if call.id == id));
-                if let Some(ix) = found {
-                    if let Row::Tool(call) = &mut self.rows[ix] {
-                        call.update(title, kind, status, content, locations, cx);
-                    }
-                    self.remeasure(ix, cx);
+                // A call the agent never sent comes first in a permission request; acp-core
+                // sends its fields as an update just before.
+                let ix = self.tool_call_row(&id).unwrap_or_else(|| {
+                    let title = title.clone().unwrap_or_else(|| "Tool call".into());
+                    let call = ToolCall::new(
+                        id,
+                        title,
+                        kind.unwrap_or(ToolKind::Other),
+                        status.unwrap_or(ToolStatus::Pending),
+                        self.live,
+                    );
+                    self.push(Row::Tool(call), cx);
+                    self.rows.len() - 1
+                });
+                if let Row::Tool(call) = &mut self.rows[ix] {
+                    call.update(title, kind, status, content, locations, cx);
                 }
+                self.remeasure(ix, cx);
             }
             SessionEvent::Plan(entries) => {
                 self.push(Row::Notice(format!("plan\n{}", entries.join("\n"))), cx)
             }
-            SessionEvent::Permission(request) => self.push(
-                Row::Permission {
-                    request,
-                    decided: None,
-                },
-                cx,
-            ),
+            SessionEvent::Permission(request) => {
+                let ix = self.tool_call_row(&request.tool_call).unwrap_or_else(|| {
+                    let call = ToolCall::new(
+                        request.tool_call.clone(),
+                        request.title.clone(),
+                        ToolKind::Other,
+                        ToolStatus::Pending,
+                        self.live,
+                    );
+                    self.push(Row::Tool(call), cx);
+                    self.rows.len() - 1
+                });
+                if let Row::Tool(call) = &mut self.rows[ix] {
+                    call.ask(request, cx);
+                }
+                // The call's group opens for the card.
+                self.remeasure_group(ix, cx);
+            }
             // The turn's last row still comes in as the turn's others did.
             SessionEvent::TurnEnded { stop_reason } => {
                 self.busy = false;
@@ -446,14 +462,19 @@ impl Session {
         start..end
     }
 
-    /// Whether a group of tool calls shows its calls: as the user left it, or else while
-    /// it is the latest thing in a live turn, so the calls show as they run and fold once
-    /// the agent writes again.
+    /// Whether a group of tool calls shows its calls: while one of them asks for
+    /// permission; as the user left it; or else while it is the latest thing in a live
+    /// turn, so the calls show as they run and fold once the agent writes again.
     pub(crate) fn group_open(&self, group: &Range<usize>) -> bool {
-        self.groups_set
-            .get(&group.start)
-            .copied()
-            .unwrap_or(self.live && group.end == self.rows.len())
+        let asking = self.rows[group.clone()]
+            .iter()
+            .any(|row| matches!(row, Row::Tool(call) if call.asking()));
+        asking
+            || self
+                .groups_set
+                .get(&group.start)
+                .copied()
+                .unwrap_or(self.live && group.end == self.rows.len())
     }
 
     /// Opens or closes the group of tool calls that starts at `first`, for good.
@@ -461,7 +482,13 @@ impl Session {
         let group = self.tool_group(first);
         let open = !self.group_open(&group);
         self.groups_set.insert(group.start, open);
-        for ix in group {
+        self.remeasure_group(first, cx);
+    }
+
+    /// Has the group of tool calls the one at `ix` is in measured again, as it opens,
+    /// closes or changes its header.
+    fn remeasure_group(&mut self, ix: usize, cx: &mut App) {
+        for ix in self.tool_group(ix) {
             self.remeasure(ix, cx);
         }
     }
@@ -475,11 +502,8 @@ impl Session {
         if !matches!(self.rows[last], Row::Tool(_)) {
             return;
         }
-        let group = self.tool_group(last);
-        if !self.groups_set.contains_key(&group.start) {
-            for ix in group {
-                self.remeasure(ix, cx);
-            }
+        if !self.groups_set.contains_key(&self.tool_group(last).start) {
+            self.remeasure_group(last, cx);
         }
     }
 
@@ -496,31 +520,42 @@ impl Session {
     /// stopped or over, so the cards still open show as cancelled instead of offering options.
     pub(crate) fn cancel_open_permissions(&mut self, cx: &mut App) {
         for ix in 0..self.rows.len() {
-            if let Row::Permission {
-                decided: decided @ None,
-                ..
-            } = &mut self.rows[ix]
+            if let Row::Tool(call) = &mut self.rows[ix]
+                && let Some(ask) = call.ask.as_mut().filter(|ask| ask.answer == Answer::Open)
             {
-                *decided = Some("cancelled".into());
-                self.remeasure(ix, cx);
+                ask.answer = Answer::Cancelled;
+                self.remeasure_group(ix, cx);
             }
         }
     }
 
+    /// Answers the permission request on the tool call at `ix` with an option's id, or
+    /// `None` to reject it.
     pub(crate) fn answer(&mut self, ix: usize, choice: Option<String>, cx: &mut App) {
-        if let Some(Row::Permission { request, decided }) = self.rows.get_mut(ix) {
-            let label = choice
-                .as_ref()
-                .and_then(|id| request.options.iter().find(|option| option.id == *id))
-                .map_or_else(|| "rejected".to_string(), |option| option.name.clone());
-            // The turn may have been stopped or ended since the card was drawn.
-            *decided = Some(if request.answer(choice) {
-                format!("answered: {label}")
-            } else {
-                "cancelled".into()
-            });
-            self.remeasure(ix, cx);
-        }
+        let Some(Row::Tool(call)) = self.rows.get_mut(ix) else {
+            return;
+        };
+        let Some(ask) = call.ask.as_mut().filter(|ask| ask.answer == Answer::Open) else {
+            return;
+        };
+        let allowed = choice
+            .as_ref()
+            .and_then(|id| ask.request.options.iter().find(|option| option.id == *id))
+            .is_some_and(|option| option.allow);
+        // The turn may have been stopped or ended since the card was drawn.
+        ask.answer = match ask.request.answer(choice) {
+            false => Answer::Cancelled,
+            true if allowed => Answer::Allowed,
+            true => Answer::Rejected,
+        };
+        self.remeasure_group(ix, cx);
+    }
+
+    /// The row of the latest tool call with this id.
+    fn tool_call_row(&self, id: &str) -> Option<usize> {
+        self.rows
+            .iter()
+            .rposition(|row| matches!(row, Row::Tool(call) if call.id == id))
     }
 
     /// Streams arrive as small chunks; grow the last row instead of adding one per chunk.

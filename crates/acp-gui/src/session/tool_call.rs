@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use acp_core::{ToolContent, ToolKind, ToolLocation, ToolStatus};
+use acp_core::{PermissionRequest, ToolContent, ToolKind, ToolLocation, ToolStatus};
 use gpui_kit::component::text::TextViewState;
 use gpui_kit::*;
 use similar::{ChangeTag, TextDiff};
@@ -37,6 +37,33 @@ pub(crate) struct ToolCall {
     pub(crate) took: Option<Duration>,
     /// The user has opened it to show its content.
     pub(crate) open: bool,
+    /// The agent's request for permission to run it, which the call shows as a card in
+    /// its row's place until answered. Boxed, as few calls have one.
+    pub(crate) ask: Option<Box<Ask>>,
+}
+
+/// A permission request on a tool call, and how it went.
+pub(crate) struct Ask {
+    /// Kept once answered, for the card to fold away with its options.
+    pub(crate) request: PermissionRequest,
+    /// One for each option, so the keys can move between them.
+    pub(crate) focus: Vec<FocusHandle>,
+    /// The card has shown once, when it may take the keys.
+    pub(crate) shown: bool,
+    pub(crate) answer: Answer,
+    /// What the card shows of the call when its content doesn't: the command a shell
+    /// call would run, which is its title, or the title of a call with nothing else.
+    pub(crate) preview: Option<Code>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Answer {
+    Open,
+    Allowed,
+    /// ACP reports a rejected call as failed; this keeps it from showing as one.
+    Rejected,
+    /// The turn was stopped or ended before an answer.
+    Cancelled,
 }
 
 /// One piece of a tool call's content, ready to draw.
@@ -108,7 +135,48 @@ impl ToolCall {
             started: (live && !status.finished()).then(Instant::now),
             took: None,
             open: false,
+            ask: None,
         }
+    }
+
+    /// The card asking for permission to run it is up.
+    pub(crate) fn asking(&self) -> bool {
+        self.ask
+            .as_ref()
+            .is_some_and(|ask| ask.answer == Answer::Open)
+    }
+
+    /// No permission request stands in its way: none came, or the user allowed it.
+    pub(crate) fn may_run(&self) -> bool {
+        self.ask
+            .as_ref()
+            .is_none_or(|ask| ask.answer == Answer::Allowed)
+    }
+
+    /// The user turned its permission request down.
+    pub(crate) fn rejected(&self) -> bool {
+        self.ask
+            .as_ref()
+            .is_some_and(|ask| ask.answer == Answer::Rejected)
+    }
+
+    /// It failed on its own, rather than by being turned down.
+    pub(crate) fn failed(&self) -> bool {
+        self.status == ToolStatus::Failed && !self.rejected()
+    }
+
+    /// Takes a permission request for it, which asks until answered.
+    pub(crate) fn ask(&mut self, request: PermissionRequest, cx: &mut App) {
+        let focus = request.options.iter().map(|_| cx.focus_handle()).collect();
+        let bare = self.content.is_empty() && self.locations.is_empty();
+        let preview = (self.kind == ToolKind::Execute || bare).then(|| plain_code(&self.title));
+        self.ask = Some(Box::new(Ask {
+            request,
+            focus,
+            shown: false,
+            answer: Answer::Open,
+            preview,
+        }));
     }
 
     /// Takes the fields an update names; the content and the locations replace the ones
@@ -180,22 +248,38 @@ fn shown_text(text: String, cx: &mut App) -> Option<Shown> {
         if lines.iter().all(|line| line.text.trim().is_empty()) {
             return None;
         }
-        let copy = lines
-            .iter()
-            .map(|line| line.text.as_ref())
-            .collect::<Vec<_>>()
-            .join("\n");
-        return Some(Shown::Code(Code {
-            widest: widest(lines.iter().map(|line| line.text.as_ref())),
-            lines: lines.into(),
-            copy: copy.into(),
-        }));
+        return Some(Shown::Code(code(lines)));
     }
     if text.trim().is_empty() {
         return None;
     }
     let view = cx.new(|cx| TextViewState::markdown(&text, cx));
     Some(Shown::Text(view, text.into()))
+}
+
+/// Text as lines of code, with no numbers.
+fn plain_code(text: &str) -> Code {
+    code(text.lines().map(plain_line).collect())
+}
+
+fn code(lines: Vec<CodeLine>) -> Code {
+    let copy = lines
+        .iter()
+        .map(|line| line.text.as_ref())
+        .collect::<Vec<_>>()
+        .join("\n");
+    Code {
+        widest: widest(lines.iter().map(|line| line.text.as_ref())),
+        lines: lines.into(),
+        copy: copy.into(),
+    }
+}
+
+fn plain_line(line: &str) -> CodeLine {
+    CodeLine {
+        number: None,
+        text: line.replace('\t', TAB).into(),
+    }
 }
 
 /// The body of `text` if it is one fenced code block and nothing else.
@@ -222,10 +306,6 @@ fn fenced(text: &str) -> Option<&str> {
 /// Claude's Read gives them: the number, maybe padded, then a tab or an arrow. The last
 /// line may go without, as Read's note that it cut the file short does.
 fn code_lines(body: &str) -> Vec<CodeLine> {
-    let plain = |line: &str| CodeLine {
-        number: None,
-        text: line.replace('\t', TAB).into(),
-    };
     let lines: Vec<&str> = body.lines().collect();
     let Some((last, rest)) = lines.split_last() else {
         return Vec::new();
@@ -233,10 +313,10 @@ fn code_lines(body: &str) -> Vec<CodeLine> {
     let numbered: Option<Vec<CodeLine>> = rest.iter().map(|line| numbered_line(line)).collect();
     match numbered {
         Some(mut numbered) if !rest.is_empty() || numbered_line(last).is_some() => {
-            numbered.push(numbered_line(last).unwrap_or_else(|| plain(last)));
+            numbered.push(numbered_line(last).unwrap_or_else(|| plain_line(last)));
             numbered
         }
-        _ => lines.into_iter().map(plain).collect(),
+        _ => lines.into_iter().map(plain_line).collect(),
     }
 }
 

@@ -993,15 +993,30 @@ impl ChatView {
         }));
     }
 
+    /// Answers the permission request on the tool call at `ix` of the session with an
+    /// option's id, or `None` to reject it.
     fn answer(
         &mut self,
         key: SessionKey,
         ix: usize,
         choice: Option<String>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(session) = self.session_mut(key) {
-            session.answer(ix, choice, cx);
+        let Some(session) = self.session_mut(key) else {
+            return;
+        };
+        let held = match session.rows.get(ix) {
+            Some(Row::Tool(call)) => call
+                .ask
+                .as_ref()
+                .is_some_and(|ask| ask.focus.iter().any(|focus| focus.is_focused(window))),
+            _ => false,
+        };
+        session.answer(ix, choice, cx);
+        // The keys go back to the prompt from a card that held them, as it folds away.
+        if held {
+            self.input.update(cx, |input, cx| input.focus(window, cx));
         }
         cx.notify();
     }

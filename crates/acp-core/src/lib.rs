@@ -318,6 +318,8 @@ pub struct PermissionChoice {
     pub id: String,
     pub name: String,
     pub allow: bool,
+    /// The answer stands for later calls like this one too, not just this one.
+    pub always: bool,
 }
 
 pub struct AgentHandle {
@@ -1440,6 +1442,10 @@ fn ask_permission(
             allow: matches!(
                 option.kind,
                 PermissionOptionKind::AllowOnce | PermissionOptionKind::AllowAlways
+            ),
+            always: matches!(
+                option.kind,
+                PermissionOptionKind::AllowAlways | PermissionOptionKind::RejectAlways
             ),
         })
         .collect();

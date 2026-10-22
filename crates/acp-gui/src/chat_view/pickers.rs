@@ -79,11 +79,11 @@ const METER_BAR_WIDTH: Pixels = px(2.);
 /// Groups a model's row with its star, which shows while the row is pointed at.
 const MODEL_ROW_GROUP: &str = "model-panel-row";
 
-/// The colors of the model panel and the menus. In dark mode the surface is a step
+/// The colors of the model panel and the menus, which a permission card shares. In dark mode the surface is a step
 /// lighter than the window (#1f1f1f over #151515): the theme's popover color, #0a0a0a,
 /// is darker than the window and made the panel look sunk into it.
 #[derive(Clone, Copy)]
-struct MenuLook {
+pub(crate) struct MenuLook {
     dark: bool,
     surface: Hsla,
     /// Behind the panel's column of tabs.
@@ -91,10 +91,10 @@ struct MenuLook {
     /// Between the panel's search box, its list and its switches.
     line: Hsla,
     /// Under the pointer.
-    hover: Hsla,
+    pub(crate) hover: Hsla,
     /// The tab on show, a button whose menu is open, the star's button being pressed.
-    pressed: Hsla,
-    foreground: Hsla,
+    pub(crate) pressed: Hsla,
+    pub(crate) foreground: Hsla,
     muted: Hsla,
     /// A starred model's star.
     star: Hsla,
@@ -103,7 +103,7 @@ struct MenuLook {
 }
 
 impl MenuLook {
-    fn new(cx: &App) -> Self {
+    pub(crate) fn new(cx: &App) -> Self {
         let theme = cx.theme();
         let foreground = theme.foreground;
         if theme.is_dark() {
@@ -160,7 +160,7 @@ impl MenuLook {
     }
 
     /// The surface of the panel or a menu, rounded and lifted off the window.
-    fn surface(&self) -> Div {
+    pub(crate) fn surface(&self) -> Div {
         div()
             .relative()
             .bg(self.surface)
@@ -173,7 +173,7 @@ impl MenuLook {
 
     /// In dark mode, a hairline just inside the surface's edge, as macOS's menus have.
     /// It goes last, over the surface's content, so the tab column's gray can't hide it.
-    fn edge(&self) -> Option<Div> {
+    pub(crate) fn edge(&self) -> Option<Div> {
         self.dark.then(|| {
             div()
                 .absolute()

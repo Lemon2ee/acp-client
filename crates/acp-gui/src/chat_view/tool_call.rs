@@ -8,7 +8,8 @@ use std::path::Path;
 use std::rc::Rc;
 use std::time::Duration;
 
-use acp_core::{SessionKey, ToolKind, ToolStatus};
+use acp_core::{PermissionChoice, SessionKey, ToolKind};
+use gpui_kit::base::actions::{Cancel, Confirm, SelectDown, SelectUp};
 use gpui_kit::base::{ElementExt as _, Transition, spring, transition};
 use gpui_kit::component::button::{Button, ButtonCustomVariant, ButtonVariants as _};
 use gpui_kit::component::clipboard::Clipboard;
@@ -21,7 +22,8 @@ use gpui_kit::*;
 use similar::ChangeTag;
 
 use crate::chat_view::ChatView;
-use crate::session::{Code, Diff, DiffLine, Row, Shown, ToolCall, row_id};
+use crate::chat_view::pickers::MenuLook;
+use crate::session::{Answer, Ask, Code, Diff, DiffLine, Row, Shown, ToolCall, row_id};
 
 /// A row is as tall as the menus' rows and sits a little in from the transcript's sides,
 /// its padding putting the icon in line with the agent's text.
@@ -63,6 +65,18 @@ const BOX_MAX_HEIGHT: Pixels = px(216.);
 /// Over the bottom of a box that scrolls, while more is below.
 const BOX_FADE: Pixels = px(28.);
 const COPY_INSET: Pixels = px(6.);
+/// The permission card, the menus' surface: its padding inside, and how far it sits
+/// from the rows above and below it.
+const CARD_PAD: Pixels = px(6.);
+const CARD_ABOVE: Pixels = px(4.);
+const CARD_BELOW: Pixels = px(8.);
+/// The card's question and each of its options, as tall as the menus' roomier rows.
+const CARD_ROW_HEIGHT: Pixels = px(32.);
+const CARD_ROW_PAD: Pixels = px(10.);
+const QUESTION_SIZE: Pixels = px(14.);
+/// Around the preview of what the call would do, inside the card.
+const PREVIEW_INSET: Pixels = px(4.);
+const PREVIEW_BELOW: Pixels = px(6.);
 /// How long a running call goes before its row counts the seconds.
 const COUNT_AFTER: Duration = Duration::from_secs(1);
 /// How often the count goes up.
@@ -243,6 +257,7 @@ impl ChatView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Div {
+        self.offer_keys(ix, window, cx);
         let look = ToolLook::new(cx);
         let motion = cx.theme().motion_tokens();
         let (control, fast) = (motion.spring_control, motion.duration_fast);
@@ -253,9 +268,20 @@ impl ChatView {
             return div();
         };
         let id = row_id("tool", key, ix);
+        let folder = session.folder().unwrap_or(&self.cwd).to_path_buf();
         // Claude's adapter keeps a call pending until it finishes, sending in_progress only
-        // with progress beats on long ones, so any unfinished call in a live turn runs.
-        let running = session.is_live() && !call.status.finished();
+        // with progress beats on long ones, so any unfinished call in a live turn runs,
+        // unless it waits for the user's permission or didn't get it.
+        let asking = call.asking();
+        let running = session.is_live() && !call.status.finished() && call.may_run();
+        // The row and the permission card trade places with the control spring.
+        let asked = spring(
+            (id.clone(), "asked"),
+            if asking { 1. } else { 0. },
+            control,
+            window,
+            cx,
+        );
         let counting = call.running_for().filter(|_| running);
         let expandable = !call.content.is_empty();
         let reveal = spring(
@@ -273,10 +299,12 @@ impl ChatView {
             window,
             cx,
         );
+        // A call that never got to run took no time worth showing.
         let time = call
             .took
             .map(took_text)
-            .or_else(|| counting.filter(|d| *d >= COUNT_AFTER).map(count_text));
+            .or_else(|| counting.filter(|d| *d >= COUNT_AFTER).map(count_text))
+            .filter(|_| call.may_run());
         let time_shown = transition(
             (id.clone(), "time"),
             if time.is_some() { 1. } else { 0. },
@@ -333,15 +361,21 @@ impl ChatView {
 
         // The box is only laid out while open or moving: closed, it stays out of the frame.
         let content = (reveal > 0. || call.open && expandable).then(|| {
-            let folder = session.folder().unwrap_or(&self.cwd).to_path_buf();
             let shown = content_box(call, &id, &folder, look, &mono, window, cx);
             reveal_clip((id.clone(), "box"), reveal, shown, window, cx)
         });
-        let element = v_flex()
-            .w_full()
-            .pl(indent)
-            .child(div().px(ROW_INSET).child(row))
-            .children(content);
+        let side = (asked < 1.).then(|| {
+            let side = v_flex()
+                .w_full()
+                .child(div().px(ROW_INSET).child(row))
+                .children(content);
+            reveal_clip((id.clone(), "row"), 1. - asked, side, window, cx)
+        });
+        let card = call.ask.as_ref().filter(|_| asked > 0.).map(|ask| {
+            let card = ask_card(call, ask, key, ix, &id, &folder, look, &mono, window, cx);
+            reveal_clip((id.clone(), "card"), asked, card, window, cx)
+        });
+        let element = v_flex().w_full().pl(indent).children(side).children(card);
         if counting.is_some() {
             self.keep_tool_clock(cx);
         }
@@ -369,7 +403,11 @@ impl ChatView {
                 _ => None,
             })
             .collect();
-        let running = live && calls.iter().any(|call| !call.status.finished());
+        let waiting = calls.iter().any(|call| call.asking());
+        let running = live
+            && calls
+                .iter()
+                .any(|call| !call.status.finished() && call.may_run());
         let id = row_id("tool-group", key, group.start);
         let settled = transition(
             (id.clone(), "settled"),
@@ -378,17 +416,16 @@ impl ChatView {
             window,
             cx,
         );
+        // The call asking for permission says so on its card.
         let summary: SharedString = summary(
             calls
                 .iter()
-                .map(|call| (call.kind, live && !call.status.finished())),
+                .filter(|call| !call.asking())
+                .map(|call| (call.kind, live && !call.status.finished() && call.may_run())),
         )
         .into();
-        let failed = calls
-            .iter()
-            .filter(|call| call.status == ToolStatus::Failed)
-            .count();
-        let time = group_time(&calls, running);
+        let failed = calls.iter().filter(|call| call.failed()).count();
+        let time = group_time(&calls, running).filter(|_| !waiting);
         let time_shown = transition(
             (id.clone(), "time"),
             if time.is_some() { 1. } else { 0. },
@@ -429,6 +466,9 @@ impl ChatView {
                                 .child(format!("{failed} failed")),
                         )
                     })
+                    .when(waiting, |notes| {
+                        notes.child(div().text_color(look.bright).child("Waiting for you"))
+                    })
                     .when_some(time, |notes, time| {
                         notes.child(div().opacity(time_shown).child(time))
                     }),
@@ -455,6 +495,33 @@ impl ChatView {
             self.keep_tool_clock(cx);
         }
         div().px(ROW_INSET).child(header)
+    }
+
+    /// The first time a permission card shows, it takes the keys with its first option
+    /// lit, so Enter allows and Esc says no. It leaves them where the user is writing,
+    /// in the prompt or anywhere else, where a key meant for the text would answer it.
+    fn offer_keys(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(Row::Tool(call)) = self.sessions[self.active].rows.get_mut(ix) else {
+            return;
+        };
+        let Some(ask) = call
+            .ask
+            .as_mut()
+            .filter(|ask| ask.answer == Answer::Open && !ask.shown)
+        else {
+            return;
+        };
+        ask.shown = true;
+        let first = ask.focus.first().cloned();
+        let prompt = self.input.read(cx);
+        let free = window
+            .focused(cx)
+            .is_none_or(|focused| focused == prompt.focus_handle(cx) && prompt.value().is_empty());
+        if let Some(first) = first.filter(|_| free) {
+            // Not while the transcript draws, which would leave the frame showing the
+            // keys where they were.
+            window.defer(cx, move |window, cx| window.focus(&first, cx));
+        }
     }
 
     fn toggle_tool_group(&mut self, key: SessionKey, first: usize, cx: &mut Context<Self>) {
@@ -501,10 +568,10 @@ impl ChatView {
     }
 }
 
-/// `child` cut to `reveal` of the height it last laid out at, and faded as much; whole
-/// once `reveal` is 1. Measured here rather than by the library's reveal, which lays
-/// content out at no height the frame it first draws, so an open row scrolling into view
-/// would jump.
+/// `child` cut to `reveal` of the height it last laid out at, and faded as much; whole,
+/// and its shadows uncut, once `reveal` is 1. Measured here rather than by the library's
+/// reveal, which lays content out at no height the frame it first draws, so an open row
+/// scrolling into view would jump.
 fn reveal_clip(
     id: impl Into<ElementId>,
     reveal: f32,
@@ -518,20 +585,23 @@ fn reveal_clip(
         .clone();
     let measured = height.clone();
     div()
-        .overflow_hidden()
         .opacity(reveal)
         .when(reveal < 1., |clip| {
-            clip.h(height.get().unwrap_or_default() * reveal)
+            clip.overflow_hidden()
+                .h(height.get().unwrap_or_default() * reveal)
         })
         .child(child.on_prepaint(move |bounds, _, _| measured.set(Some(bounds.size.height))))
 }
 
-/// The icon at the row's start: a spinner while the call runs, a cross once it failed,
-/// otherwise its kind's.
+/// The icon at the row's start: a spinner while the call runs, a cross once it failed, a
+/// barred circle once the user turned it down, otherwise its kind's.
 fn lead_icon(call: &ToolCall, settled: f32, look: ToolLook) -> Div {
-    let icon = match call.status {
-        ToolStatus::Failed => Icon::new(IconName::CircleX).text_color(look.failed),
-        _ => Icon::new(kind_icon(call.kind)),
+    let icon = if call.rejected() {
+        Icon::new(IconName::Ban)
+    } else if call.failed() {
+        Icon::new(IconName::CircleX).text_color(look.failed)
+    } else {
+        Icon::new(kind_icon(call.kind))
     };
     lead(icon, settled)
 }
@@ -587,8 +657,8 @@ fn title(call: &ToolCall, running: bool, mono: &SharedString, id: &ElementId) ->
         })
 }
 
-/// The row's end: the lines an edit adds and removes, that the call failed, and how long
-/// it ran, or has been running.
+/// The row's end: the lines an edit adds and removes, that the call failed, was turned
+/// down or never got an answer, and how long it ran, or has been running.
 fn notes(
     call: &ToolCall,
     time: Option<String>,
@@ -607,9 +677,14 @@ fn notes(
         .when(call.added + call.removed > 0, |notes| {
             notes.child(counts(call.added, call.removed, look, mono))
         })
-        .when(call.status == ToolStatus::Failed, |notes| {
+        .when(call.failed(), |notes| {
             notes.child(div().text_color(look.failed).child("Failed"))
         })
+        .children(call.ask.as_ref().and_then(|ask| match ask.answer {
+            Answer::Rejected => Some("Rejected"),
+            Answer::Cancelled => Some("Cancelled"),
+            Answer::Open | Answer::Allowed => None,
+        }))
         .when_some(time, |notes, time| {
             notes.child(div().opacity(time_shown).child(time))
         })
@@ -775,7 +850,7 @@ fn content_box(
                 let path = shown_path(&diff.path, folder);
                 let counts = counts(diff.added, diff.removed, look, mono).into_any_element();
                 let header = header(path, Some(counts), &id, &diff.copy, look, mono);
-                diff_box(diff, header, &id, look, mono, window, cx)
+                diff_box(diff, Some(header), &id, look, mono, window, cx)
             }
         };
         boxes.push(piece);
@@ -788,6 +863,224 @@ fn content_box(
         .pb_2()
         .gap_1()
         .children(boxes)
+}
+
+/// The card asking for permission to run a call, in its row's place: the kind's
+/// question, a preview of what the call would do, and the agent's options in its own
+/// words, the one the keys are on lit, or the first while they are elsewhere.
+#[allow(clippy::too_many_arguments)]
+fn ask_card(
+    call: &ToolCall,
+    ask: &Ask,
+    key: SessionKey,
+    ix: usize,
+    id: &ElementId,
+    folder: &Path,
+    look: ToolLook,
+    mono: &SharedString,
+    window: &mut Window,
+    cx: &mut Context<ChatView>,
+) -> Div {
+    let menu = MenuLook::new(cx);
+    let open = ask.answer == Answer::Open;
+    let options = &ask.request.options;
+    let path = call
+        .content
+        .iter()
+        .find_map(|shown| match shown {
+            Shown::Diff(diff) => Some(diff.path.as_path()),
+            _ => None,
+        })
+        .or_else(|| {
+            call.locations
+                .first()
+                .map(|location| location.path.as_path())
+        })
+        .filter(|_| call.kind != ToolKind::Execute)
+        .map(|path| shown_path(path, folder));
+    let heading = h_flex()
+        .h(CARD_ROW_HEIGHT)
+        .px(CARD_ROW_PAD)
+        .gap(ICON_GAP)
+        .text_color(look.muted)
+        .child(Icon::new(kind_icon(call.kind)).with_size(ICON_SIZE))
+        .child(
+            div()
+                .flex_none()
+                .text_size(QUESTION_SIZE)
+                .line_height(ROW_LINE_HEIGHT)
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(menu.foreground)
+                .child(question(call.kind)),
+        )
+        .children(path.map(|path| {
+            div()
+                .ml_auto()
+                .pl_3()
+                .min_w_0()
+                .truncate()
+                .font_family(mono.clone())
+                .text_size(NOTE_SIZE)
+                .line_height(NOTE_LINE_HEIGHT)
+                .text_color(look.faint)
+                .child(path)
+        }));
+
+    let preview_id = ElementId::from((id.clone(), "preview"));
+    let mut preview = Vec::new();
+    match &ask.preview {
+        Some(code) => preview.push(code_box(code, None, &preview_id, look, mono, window, cx)),
+        None => {
+            for (n, shown) in call.content.iter().enumerate() {
+                let id = ElementId::from((preview_id.clone(), format!("box-{n}")));
+                preview.push(match shown {
+                    Shown::Code(code) => code_box(code, None, &id, look, mono, window, cx),
+                    Shown::Text(view, copy) => text_box(view, copy, None, &id, look, window, cx),
+                    Shown::Diff(diff) => diff_box(diff, None, &id, look, mono, window, cx),
+                });
+            }
+        }
+    }
+
+    let held = ask.focus.iter().position(|focus| focus.is_focused(window));
+    let lit = held.unwrap_or(0);
+    let reject = reject_option(options);
+    let rows = options.iter().enumerate().map(|(n, option)| {
+        let icon: gpui_kit::assets::IconName = match (option.allow, option.always) {
+            (true, false) => IconName::Check.into(),
+            (true, true) => gpui_kit::assets::IconName::CheckCheck,
+            (false, _) => IconName::Close.into(),
+        };
+        let hint = held.and_then(|_| {
+            if n == lit {
+                Some("↵")
+            } else if Some(n) == reject {
+                Some("esc")
+            } else {
+                None
+            }
+        });
+        let hover = menu.hover;
+        let choice = option.id.clone();
+        div()
+            .id(ElementId::from((id.clone(), format!("option-{n}"))))
+            .track_focus(&ask.focus[n])
+            .tab_stop(open)
+            .role(Role::Button)
+            .aria_label(SharedString::from(option.name.clone()))
+            .h(CARD_ROW_HEIGHT)
+            .flex_none()
+            .px(CARD_ROW_PAD)
+            .flex()
+            .items_center()
+            .gap(ICON_GAP)
+            .rounded(ROW_RADIUS)
+            .map(|row| {
+                if n == lit {
+                    row.bg(menu.pressed)
+                } else {
+                    row.hover(move |style| style.bg(hover))
+                }
+            })
+            .child(
+                Icon::new(icon)
+                    .with_size(ICON_SIZE)
+                    .text_color(if n == lit {
+                        menu.foreground
+                    } else {
+                        look.muted
+                    }),
+            )
+            .child(div().min_w_0().truncate().child(option.name.clone()))
+            .children(hint.map(|hint| {
+                div()
+                    .ml_auto()
+                    .pl_3()
+                    .flex_none()
+                    .text_size(NOTE_SIZE)
+                    .text_color(look.faint)
+                    .child(hint)
+            }))
+            .when(open, |row| {
+                row.on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                    this.answer(key, ix, Some(choice.clone()), window, cx)
+                }))
+            })
+    });
+
+    let (down, up, lit_now) = (ask.focus.clone(), ask.focus.clone(), ask.focus.clone());
+    let ids: Vec<String> = options.iter().map(|option| option.id.clone()).collect();
+    let no = reject.map(|n| options[n].id.clone());
+    let card = menu
+        .surface()
+        .id(ElementId::from((id.clone(), "permission")))
+        .p(CARD_PAD)
+        .key_context("PermissionCard")
+        .role(Role::Group)
+        .aria_label(SharedString::from(question(call.kind)))
+        .when(open, |card| {
+            card.on_action(move |_: &SelectDown, window, cx| step_focus(&down, 1, window, cx))
+                .on_action(move |_: &SelectUp, window, cx| step_focus(&up, -1, window, cx))
+                .on_action(cx.listener(move |this, _: &Confirm, window, cx| {
+                    let lit = lit_now.iter().position(|focus| focus.is_focused(window));
+                    if let Some(lit) = lit {
+                        this.answer(key, ix, Some(ids[lit].clone()), window, cx)
+                    }
+                }))
+                .on_action(cx.listener(move |this, _: &Cancel, window, cx| {
+                    this.answer(key, ix, no.clone(), window, cx)
+                }))
+        })
+        .child(heading)
+        .when(!preview.is_empty(), |card| {
+            card.child(
+                v_flex()
+                    .px(PREVIEW_INSET)
+                    .pb(PREVIEW_BELOW)
+                    .gap_1()
+                    .children(preview),
+            )
+        })
+        .children(rows)
+        .children(menu.edge());
+    // Padded rather than set off by margins, so the height it opens to takes them in.
+    div()
+        .px(ROW_INSET + ROW_PAD)
+        .pt(CARD_ABOVE)
+        .pb(CARD_BELOW)
+        .child(card)
+}
+
+/// What the card asks, by what the call would do.
+fn question(kind: ToolKind) -> &'static str {
+    match kind {
+        ToolKind::Execute => "Run this command?",
+        ToolKind::Edit | ToolKind::Delete | ToolKind::Move => "Make this edit?",
+        ToolKind::Read => "Read this file?",
+        ToolKind::Fetch => "Fetch this page?",
+        _ => "Allow this tool?",
+    }
+}
+
+/// The option Esc picks: the agent's no for this call alone, or else its first no.
+fn reject_option(options: &[PermissionChoice]) -> Option<usize> {
+    options
+        .iter()
+        .position(|option| !option.allow && !option.always)
+        .or_else(|| options.iter().position(|option| !option.allow))
+}
+
+/// Moves the keys `step` options along a card's, round from either end.
+fn step_focus(options: &[FocusHandle], step: isize, window: &mut Window, cx: &mut App) {
+    let count = options.len() as isize;
+    if count == 0 {
+        return;
+    }
+    let at = options
+        .iter()
+        .position(|focus| focus.is_focused(window))
+        .map_or(if step > 0 { -1 } else { 0 }, |at| at as isize);
+    window.focus(&options[(at + step).rem_euclid(count) as usize], cx);
 }
 
 /// A path as the box's header shows it: inside the session's folder, from there.
@@ -938,56 +1231,62 @@ fn code_box(
 /// with its number, and the unchanged runs between changes folded.
 fn diff_box(
     diff: &Diff,
-    header: Div,
+    header: Option<Div>,
     id: &ElementId,
     look: ToolLook,
     mono: &SharedString,
     window: &mut Window,
     cx: &mut App,
 ) -> Div {
-    frame(look).child(header).child(lines_body(
-        id,
-        diff.lines.clone(),
-        diff.widest,
-        |line, look| match line {
-            DiffLine::Line {
-                change,
-                number,
-                text,
-            } => {
-                let (bg, sign, sign_color) = match change {
-                    ChangeTag::Insert => (Some(look.added_bg), "+", look.added),
-                    ChangeTag::Delete => (Some(look.removed_bg), "−", look.removed),
-                    ChangeTag::Equal => (None, "", look.muted),
-                };
-                h_flex()
+    let copy = header
+        .is_none()
+        .then(|| floating_copy(id, &diff.copy, look));
+    frame(look)
+        .children(header)
+        .child(lines_body(
+            id,
+            diff.lines.clone(),
+            diff.widest,
+            |line, look| match line {
+                DiffLine::Line {
+                    change,
+                    number,
+                    text,
+                } => {
+                    let (bg, sign, sign_color) = match change {
+                        ChangeTag::Insert => (Some(look.added_bg), "+", look.added),
+                        ChangeTag::Delete => (Some(look.removed_bg), "−", look.removed),
+                        ChangeTag::Equal => (None, "", look.muted),
+                    };
+                    h_flex()
+                        .px(CODE_PAD)
+                        .whitespace_nowrap()
+                        .when_some(bg, |row, bg| row.bg(bg))
+                        .child(number_cell(number.clone(), look))
+                        .child(
+                            div()
+                                .w(SIGN_WIDTH)
+                                .flex_none()
+                                .text_color(sign_color)
+                                .child(sign),
+                        )
+                        .child(text.clone())
+                        .into_any_element()
+                }
+                DiffLine::Folded(count) => h_flex()
                     .px(CODE_PAD)
                     .whitespace_nowrap()
-                    .when_some(bg, |row, bg| row.bg(bg))
-                    .child(number_cell(number.clone(), look))
-                    .child(
-                        div()
-                            .w(SIGN_WIDTH)
-                            .flex_none()
-                            .text_color(sign_color)
-                            .child(sign),
-                    )
-                    .child(text.clone())
-                    .into_any_element()
-            }
-            DiffLine::Folded(count) => h_flex()
-                .px(CODE_PAD)
-                .whitespace_nowrap()
-                .bg(look.hover)
-                .text_color(look.muted)
-                .child(format!("⋯ {count} unchanged lines"))
-                .into_any_element(),
-        },
-        look,
-        mono,
-        window,
-        cx,
-    ))
+                    .bg(look.hover)
+                    .text_color(look.muted)
+                    .child(format!("⋯ {count} unchanged lines"))
+                    .into_any_element(),
+            },
+            look,
+            mono,
+            window,
+            cx,
+        ))
+        .children(copy)
 }
 
 fn number_cell(number: SharedString, look: ToolLook) -> Div {
@@ -1087,9 +1386,27 @@ fn text_box(
 #[cfg(test)]
 mod tests {
     // Not a glob: gpui's own `test` attribute would shadow the standard one.
-    use super::{count_text, summary, took_text};
-    use acp_core::ToolKind;
+    use super::{count_text, reject_option, summary, took_text};
+    use acp_core::{PermissionChoice, ToolKind};
     use std::time::Duration;
+
+    #[test]
+    fn esc_says_no_to_this_call_alone() {
+        let choice = |id: &str, allow, always| PermissionChoice {
+            id: id.into(),
+            name: id.into(),
+            allow,
+            always,
+        };
+        let options = [
+            choice("allow", true, false),
+            choice("never", false, true),
+            choice("reject", false, false),
+        ];
+        assert_eq!(reject_option(&options), Some(2));
+        assert_eq!(reject_option(&options[..2]), Some(1));
+        assert_eq!(reject_option(&options[..1]), None);
+    }
 
     #[test]
     fn a_group_says_what_its_calls_did_kind_by_kind() {
