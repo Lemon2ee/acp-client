@@ -1,21 +1,30 @@
 //! Minimal gpui front end: a sidebar of sessions beside a chat, driving one ACP agent.
 //! Usage: `acp-gui [claude | codex | "<agent command>"]`.
 
+use std::borrow::Cow;
+use std::cell::Cell;
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::time::Duration;
 
 use acp_core::{
     AcpAgent, Command, Event as AgentEvent, PermissionRequest, Sender, SessionEvent, SessionKey,
+    Setting, SettingChoice, SettingKind, SettingValue,
 };
-use gpui_kit::base::{Transition, transition};
+use gpui_kit::base::{ElementExt as _, Transition, transition};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{
     InputEvent, InputGroup, InputGroupAddon, InputGroupAddonAlignment, InputGroupButton, Textarea,
     TextareaState,
 };
+use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::message_scroller::{MessageScroller, MessageScrollerState};
+use gpui_kit::component::popover::{Popover, PopoverState};
+use gpui_kit::component::switch::Switch;
 use gpui_kit::component::{
     ActiveTheme as _, FocusableExt as _, Icon, IconName, Sizable as _, Theme, ThemeConfig,
+    ThemeStyled as _, h_flex, v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -50,6 +59,9 @@ struct Session {
     busy: bool,
     /// Text typed here but not sent, kept while another session is on screen.
     draft: SharedString,
+    /// What the agent lets the user choose for this session, such as its model; none
+    /// until the agent has created it.
+    settings: Vec<Setting>,
 }
 
 impl Session {
@@ -61,6 +73,7 @@ impl Session {
             scroller: cx.new(|cx| MessageScrollerState::new(0, cx)),
             busy: true,
             draft: SharedString::default(),
+            settings: Vec::new(),
         }
     }
 
@@ -119,10 +132,15 @@ impl Session {
                 self.cancel_open_permissions(cx);
                 self.push(Row::Error(message), cx);
             }
-            // The window doesn't show the session's settings yet, nor change them.
-            SessionEvent::Settings(_)
-            | SessionEvent::ModeChanged(_)
-            | SessionEvent::SettingFailed(_) => {}
+            SessionEvent::Settings(settings) => self.settings = settings,
+            SessionEvent::ModeChanged(mode) => {
+                for setting in &mut self.settings {
+                    if setting.kind == SettingKind::Mode {
+                        setting.value = SettingValue::Choice(mode.clone());
+                    }
+                }
+            }
+            SessionEvent::SettingFailed(message) => self.push(Row::Error(message), cx),
         }
     }
 
@@ -204,6 +222,7 @@ struct ChatView {
     /// Where the traffic lights end, from the window's left edge.
     traffic_lights_end: Pixels,
     sidebar_open: bool,
+    model_menu: ModelMenuState,
     _events: Task<()>,
     _input_events: Subscription,
 }
@@ -252,6 +271,7 @@ impl ChatView {
             title_bar_height,
             traffic_lights_end,
             sidebar_open: true,
+            model_menu: ModelMenuState::default(),
             _events: events_task,
             _input_events: input_events,
         };
@@ -324,6 +344,66 @@ impl ChatView {
         // Stopping makes acp-core answer the turn's open permission requests as cancelled.
         session.cancel_open_permissions(cx);
         cx.notify();
+    }
+
+    /// The setting shows its old value until the agent confirms the change.
+    fn change_setting(&mut self, key: SessionKey, setting: String, value: SettingValue) {
+        let _ = self
+            .commands
+            .try_send(Command::ChangeSetting(key, setting, value));
+    }
+
+    /// The pointer came, at `position`, to a row of the model menu that wants `list` open
+    /// beside the menu. A change that closes the open list waits while the pointer heads
+    /// for that list, as the way there can cross other rows; any other change is made at
+    /// once.
+    fn point_model_menu(
+        &mut self,
+        list: Option<String>,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let menu = &mut self.model_menu;
+        // Where the list the change would close was drawn.
+        let closing = (menu.list.is_some() && menu.list != list).then(|| menu.list_bounds.clone());
+        let heading = closing.filter(|bounds| {
+            let from = menu.trail.front().copied();
+            from.zip(bounds.get())
+                .is_some_and(|(from, list)| heading_for(from, position, list))
+        });
+        let Some(bounds) = heading else {
+            menu.pending = None;
+            if menu.list != list {
+                menu.list = list;
+                cx.notify();
+            }
+            return;
+        };
+        menu.pending = Some(cx.spawn_in(window, async move |this, cx| {
+            let mut from = position;
+            loop {
+                cx.background_executor().timer(MENU_HOVER_DELAY).await;
+                // Still on its way if it moved on toward the list; otherwise it rests on
+                // the row, and gets what the row wants.
+                let moved_on = this.update_in(cx, |this, window, cx| {
+                    let now = window.mouse_position();
+                    let heading = now != from
+                        && bounds
+                            .get()
+                            .is_some_and(|list| heading_for(from, now, list));
+                    if !heading {
+                        this.model_menu.list = list.clone();
+                        cx.notify();
+                    }
+                    heading.then_some(now)
+                });
+                match moved_on {
+                    Ok(Some(now)) => from = now,
+                    _ => return,
+                }
+            }
+        }));
     }
 
     fn apply(&mut self, event: AgentEvent, cx: &mut Context<Self>) {
@@ -567,7 +647,458 @@ fn as_title_bar(strip: Div) -> Div {
     })
 }
 
+/// How tall the model menu's rows are, and the gap between them.
+const MENU_ROW_HEIGHT: Pixels = px(36.);
+const MENU_ROW_GAP: Pixels = px(2.);
+/// How tall the rows of a list beside the model menu are.
+const LIST_ROW_HEIGHT: Pixels = px(32.);
+/// How long a change to the model menu's open lists waits, while the pointer heads for
+/// a list the change would close, before looking again at where the pointer went.
+const MENU_HOVER_DELAY: Duration = Duration::from_millis(300);
+
+/// What the model menu keeps from frame to frame while it is open.
+#[derive(Default)]
+struct ModelMenuState {
+    /// The row whose choices are open beside the menu, by its setting's id.
+    list: Option<String>,
+    /// A change to the open list, waiting while the pointer heads for it.
+    pending: Option<Task<()>>,
+    /// The last few places the pointer moved to over the menu, oldest first.
+    trail: VecDeque<Point<Pixels>>,
+    /// Where the list beside the menu was last drawn.
+    list_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+}
+
+/// Whether the pointer, moving from `from` to `to`, is heading for `list`, which is to
+/// its right: `to` lies in the triangle between `from` and the list's left edge, made a
+/// little taller than the list.
+fn heading_for(from: Point<Pixels>, to: Point<Pixels>, list: Bounds<Pixels>) -> bool {
+    const SLACK: f32 = 16.;
+    let at = |point: Point<Pixels>| (f32::from(point.x), f32::from(point.y));
+    let (a, p) = (at(from), at(to));
+    let left = f32::from(list.left());
+    let b = (left, f32::from(list.top()) - SLACK);
+    let c = (left, f32::from(list.bottom()) + SLACK);
+    // Which side of the line from `u` to `v` the pointer is on.
+    let side = |u: (f32, f32), v: (f32, f32)| (v.0 - u.0) * (p.1 - u.1) - (v.1 - u.1) * (p.0 - u.0);
+    let sides = [side(a, b), side(b, c), side(c, a)];
+    p.0 > a.0 && (sides.iter().all(|side| *side >= 0.) || sides.iter().all(|side| *side <= 0.))
+}
+
+/// What the parts of the model menu share.
+struct ModelMenu<'a> {
+    view: &'a WeakEntity<ChatView>,
+    key: SessionKey,
+    popover: &'a Entity<PopoverState>,
+    list_bounds: &'a Rc<Cell<Option<Bounds<Pixels>>>>,
+    accent: Hsla,
+    accent_foreground: Hsla,
+    muted: Hsla,
+    /// How the component library's menus round their rows.
+    radius: Pixels,
+}
+
+impl ModelMenu<'_> {
+    /// While the row is pointed at, it wants `list` open beside the menu.
+    fn wants(&self, list: Option<String>) -> impl Fn(&bool, &mut Window, &mut App) + 'static {
+        let view = self.view.clone();
+        move |hovered, window, cx| {
+            if *hovered {
+                let position = window.mouse_position();
+                let _ = view.update(cx, |this, cx| {
+                    this.point_model_menu(list.clone(), position, window, cx)
+                });
+            }
+        }
+    }
+
+    /// Pointing at an open list keeps it open, whatever rows the pointer crossed.
+    fn holds(&self) -> impl Fn(&bool, &mut Window, &mut App) + 'static {
+        let view = self.view.clone();
+        move |hovered, _, cx| {
+            if *hovered {
+                let _ = view.update(cx, |this, _| this.model_menu.pending = None);
+            }
+        }
+    }
+
+    /// Notes where the pointer moves over the menu, to tell where it is heading. A row
+    /// hears that the pointer came to it before this does, so the note holds where the
+    /// pointer was before.
+    fn trails(&self) -> impl Fn(&MouseMoveEvent, &mut Window, &mut App) + 'static {
+        let view = self.view.clone();
+        move |event, _, cx| {
+            let _ = view.update(cx, |this, _| {
+                let trail = &mut this.model_menu.trail;
+                trail.push_back(event.position);
+                // Three moves back is far enough to tell a direction by.
+                if trail.len() > 3 {
+                    trail.pop_front();
+                }
+            });
+        }
+    }
+
+    /// A row of the list beside the menu, which sets `setting` to its choice and closes
+    /// the menu.
+    fn choice(&self, setting: &Setting, choice: &SettingChoice, current: bool) -> Stateful<Div> {
+        let (view, popover, key) = (self.view.clone(), self.popover.clone(), self.key);
+        let (id, value) = (setting.id.clone(), choice.id.clone());
+        let (accent, accent_foreground) = (self.accent, self.accent_foreground);
+        div()
+            .id(ElementId::Name(
+                format!("model-menu-choice-{}", choice.id).into(),
+            ))
+            .h(LIST_ROW_HEIGHT)
+            .flex_none()
+            .px_2()
+            .flex()
+            .items_center()
+            .gap_2()
+            .rounded(self.radius)
+            .hover(move |style| style.bg(accent).text_color(accent_foreground))
+            .child(
+                div()
+                    .flex_1()
+                    .child(SharedString::from(choice.name.clone())),
+            )
+            .when(current, |row| {
+                row.child(Icon::new(IconName::Check).xsmall())
+            })
+            .on_click(move |_, window, cx| {
+                let _ = view.update(cx, |this, _| {
+                    this.change_setting(key, id.clone(), SettingValue::Choice(value.clone()))
+                });
+                popover.update(cx, |state, cx| state.dismiss(window, cx));
+            })
+    }
+
+    /// The list beside the menu, its bottom `bottom` above the menu's.
+    fn list(
+        &self,
+        rows: Vec<AnyElement>,
+        bottom: Pixels,
+        window: &Window,
+        cx: &App,
+    ) -> Stateful<Div> {
+        let bounds = self.list_bounds.clone();
+        div()
+            .id("model-menu-list")
+            .absolute()
+            .left(relative(1.))
+            .ml_1()
+            .bottom(bottom)
+            .min_w(px(160.))
+            .popover_style(cx)
+            .p_1()
+            .flex()
+            .flex_col()
+            .gap(MENU_ROW_GAP)
+            // It lies outside the popover, which keeps the pointer from what is under
+            // the menu but not from what is under the list.
+            .occlude()
+            .on_hover(self.holds())
+            .on_mouse_move(self.trails())
+            .child(
+                // Scrolls inside the frame, so the frame's bounds stay where it is drawn.
+                div()
+                    .id("rows")
+                    .max_h(window.viewport_size().height * 0.7)
+                    .overflow_y_scroll()
+                    .flex()
+                    .flex_col()
+                    .gap(MENU_ROW_GAP)
+                    .children(rows),
+            )
+            .on_prepaint(move |frame, _, _| bounds.set(Some(frame)))
+    }
+}
+
+/// The model menu: a row for each setting, and beside the row whose list is open, a
+/// list of that setting's choices. The list's bottom is level with the row's, so it
+/// opens upward like the menu.
+fn model_menu(
+    menu: &ModelMenu,
+    settings: &[Setting],
+    open_list: Option<&str>,
+    window: &Window,
+    cx: &App,
+) -> Div {
+    let (accent, accent_foreground, muted) = (menu.accent, menu.accent_foreground, menu.muted);
+    // Where the open list is drawn, so a press in it leaves the menu open, and the
+    // pointer's way to it can be told. Set as it is drawn; a closed list has none.
+    let list_bounds = menu.list_bounds.clone();
+    list_bounds.set(None);
+
+    let rows = settings.iter().map(|setting| {
+        let list = (!setting.choices.is_empty()).then(|| setting.id.clone());
+        let row = div()
+            .id(ElementId::Name(format!("model-menu-{}", setting.id).into()))
+            .h(MENU_ROW_HEIGHT)
+            .flex_none()
+            .px_2()
+            .flex()
+            .items_center()
+            .gap_2()
+            .rounded(menu.radius)
+            .hover(move |style| style.bg(accent).text_color(accent_foreground))
+            .child(
+                div()
+                    .flex_1()
+                    .child(SharedString::from(setting.name.clone())),
+            )
+            .on_hover(menu.wants(list));
+        match &setting.value {
+            SettingValue::Switch(on) => {
+                let (view, key, id, on) = (menu.view.clone(), menu.key, setting.id.clone(), *on);
+                row.child(
+                    // Only shows the value: a press anywhere on the row flips it.
+                    Switch::new(ElementId::Name(
+                        format!("model-menu-switch-{}", setting.id).into(),
+                    ))
+                    .checked(on)
+                    .tab_stop(false),
+                )
+                .on_click(move |_, _, cx| {
+                    let _ = view.update(cx, |this, _| {
+                        this.change_setting(key, id.clone(), SettingValue::Switch(!on))
+                    });
+                })
+            }
+            SettingValue::Choice(_) => row
+                .when(open_list == Some(setting.id.as_str()), |row| {
+                    row.bg(accent).text_color(accent_foreground)
+                })
+                .children(setting.chosen().map(|choice| {
+                    div()
+                        .text_color(muted)
+                        .child(SharedString::from(choice.name.clone()))
+                }))
+                .child(Icon::new(IconName::ChevronRight).xsmall().text_color(muted)),
+        }
+    });
+
+    let list = open_list
+        .and_then(|id| settings.iter().position(|setting| setting.id == id))
+        .filter(|&ix| !settings[ix].choices.is_empty())
+        .map(|ix| {
+            let setting = &settings[ix];
+            let current = setting.chosen().map(|choice| choice.id.as_str());
+            let rows = setting
+                .choices
+                .iter()
+                .map(|choice| {
+                    menu.choice(setting, choice, current == Some(choice.id.as_str()))
+                        .into_any_element()
+                })
+                .collect();
+            let rows_below = (settings.len() - 1 - ix) as f32;
+            menu.list(
+                rows,
+                (MENU_ROW_HEIGHT + MENU_ROW_GAP) * rows_below,
+                window,
+                cx,
+            )
+        });
+
+    let popover = menu.popover.clone();
+    div()
+        .relative()
+        .min_w(px(250.))
+        .popover_style(cx)
+        .p_1()
+        .flex()
+        .flex_col()
+        .gap(MENU_ROW_GAP)
+        .text_sm()
+        // Rows are one line tall. A list's room is reckoned from the width of what it is
+        // placed against, so its names would wrap there too.
+        .whitespace_nowrap()
+        .on_mouse_move(menu.trails())
+        .on_mouse_down_out(move |_, window, cx| {
+            let position = window.mouse_position();
+            if !list_bounds
+                .get()
+                .is_some_and(|bounds| bounds.contains(&position))
+            {
+                popover.update(cx, |state, cx| state.dismiss(window, cx));
+            }
+        })
+        .children(rows)
+        .children(list)
+}
+
+/// A row of the mode menu: the mode's icon and name, what it does below the name, and
+/// a check after the current mode. The icon and the check sit level with the name.
+fn mode_item(choice: &SettingChoice, current: bool) -> PopupMenuItem {
+    let icon = mode_icon(&choice.id);
+    let name = SharedString::from(choice.name.clone());
+    let description = choice.description.clone().map(SharedString::from);
+    PopupMenuItem::element(move |_, cx| {
+        let muted = cx.theme().muted_foreground;
+        // A box as tall as the name's line.
+        let line = || div().flex_none().h(px(20.)).flex().items_center();
+        h_flex()
+            .flex_1()
+            .items_start()
+            .gap_2()
+            .py_1p5()
+            .child(line().child(Icon::new(icon).size(px(16.))))
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .child(div().line_height(px(20.)).child(name.clone()))
+                    .children(
+                        description.clone().map(|description| {
+                            div().text_xs().text_color(muted).child(description)
+                        }),
+                    ),
+            )
+            // Kept when empty, so every row's text wraps at the same width.
+            .child(line().w(px(12.)).ml_1().when(current, |line| {
+                line.child(Icon::new(IconName::Check).xsmall())
+            }))
+    })
+}
+
+/// The icon for a mode, by the ids Claude's and Codex's adapters give their modes.
+fn mode_icon(id: &str) -> gpui_kit::assets::IconName {
+    use gpui_kit::assets::IconName;
+    match id {
+        // Asks before every change.
+        "default" => IconName::Hand,
+        "acceptEdits" => IconName::FilePen,
+        "plan" => IconName::ListChecks,
+        "read-only" => IconName::Eye,
+        "workspace-write" => IconName::FolderPen,
+        // Asks only about what the agent judges unsafe.
+        "auto" | "agent" => IconName::ShieldCheck,
+        // Never asks.
+        "bypassPermissions" | "agent-full-access" => IconName::ShieldOff,
+        _ => IconName::Shield,
+    }
+}
+
 impl ChatView {
+    /// The button for the model and how hard it thinks, named like "Opus 5.5 High",
+    /// once the agent offers either. Its menu opens upward: a switch for each of the
+    /// model's settings that are on or off, then a row for each of its others, whose
+    /// choices open beside it.
+    fn render_model_picker(&self, session: &Session, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let names: Vec<&str> = [SettingKind::Model, SettingKind::ThoughtLevel]
+            .into_iter()
+            .filter_map(|kind| {
+                session
+                    .settings
+                    .iter()
+                    .find(|setting| setting.kind == kind)?
+                    .chosen()
+            })
+            .map(|choice| choice.name.as_str())
+            .collect();
+        if names.is_empty() {
+            return None;
+        }
+        let label = names.join(" ");
+        let settings: Vec<Setting> = [
+            SettingKind::ModelConfig,
+            SettingKind::ThoughtLevel,
+            SettingKind::Model,
+        ]
+        .into_iter()
+        .flat_map(|kind| {
+            session
+                .settings
+                .iter()
+                .filter(move |setting| setting.kind == kind)
+        })
+        .cloned()
+        .collect();
+        let view = cx.entity().downgrade();
+        let key = session.key;
+        let open_list = self.model_menu.list.clone();
+        let list_bounds = self.model_menu.list_bounds.clone();
+        let trigger = InputGroupButton::new("model-picker")
+            .label(label.clone())
+            .accessibility_label(format!("Model: {label}"))
+            .dropdown_caret(true)
+            .small()
+            .cursor_pointer();
+        let picker = Popover::new("model-menu")
+            .appearance(false)
+            // The menu closes itself on a press outside it and its open lists.
+            .overlay_closable(false)
+            .anchor(Anchor::BottomLeft)
+            .trigger(trigger)
+            .on_open_change({
+                let view = view.clone();
+                move |_, _, cx| {
+                    // It opens with no list beside it, each time.
+                    let _ = view.update(cx, |this, cx| {
+                        this.model_menu = ModelMenuState::default();
+                        cx.notify();
+                    });
+                }
+            })
+            .content(move |_, window, cx| {
+                let popover = cx.entity();
+                let theme = cx.theme();
+                let menu = ModelMenu {
+                    view: &view,
+                    key,
+                    popover: &popover,
+                    list_bounds: &list_bounds,
+                    accent: *theme.tokens.accent,
+                    accent_foreground: theme.accent_foreground,
+                    muted: theme.muted_foreground,
+                    radius: theme.radius.min(px(8.)),
+                };
+                model_menu(&menu, &settings, open_list.as_deref(), window, cx)
+            });
+        Some(picker.into_any_element())
+    }
+
+    /// The mode's button, with the mode's icon, and a menu of the modes that opens
+    /// upward, each with its icon and what the agent says it does.
+    fn render_mode_picker(
+        &self,
+        key: SessionKey,
+        setting: &Setting,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let current = setting.chosen();
+        let name = current.map_or_else(|| setting.name.clone(), |choice| choice.name.clone());
+        let icon = mode_icon(current.map_or("", |choice| choice.id.as_str()));
+        let view = cx.entity().downgrade();
+        let setting = setting.clone();
+        InputGroupButton::new("mode-picker")
+            .icon(icon)
+            .label(name.clone())
+            .accessibility_label(format!("{}: {name}", setting.name))
+            .dropdown_caret(true)
+            .small()
+            .cursor_pointer()
+            .dropdown_menu_with_anchor(Anchor::BottomLeft, move |menu, _, _| {
+                // Wide enough for most descriptions on one line; longer ones wrap.
+                let menu = menu.min_w(px(260.)).max_w(px(360.));
+                setting.choices.iter().fold(menu, |menu, choice| {
+                    let current = setting.value == SettingValue::Choice(choice.id.clone());
+                    let (view, id, value) = (view.clone(), setting.id.clone(), choice.id.clone());
+                    menu.item(mode_item(choice, current).on_click(move |_, _, cx| {
+                        let _ = view.update(cx, |this, _| {
+                            this.change_setting(
+                                key,
+                                id.clone(),
+                                SettingValue::Choice(value.clone()),
+                            )
+                        });
+                    }))
+                })
+            })
+            .into_any_element()
+    }
+
     fn render_sidebar(&self, title_bar: bool, cx: &mut Context<Self>) -> Div {
         let theme = cx.theme();
         let (foreground, hover, divider) = (
@@ -700,6 +1231,16 @@ impl Render for ChatView {
         );
         let sidebar_width = SIDEBAR_WIDTH * (1. - hidden);
         let session = &self.sessions[self.active];
+        // The model and how hard it thinks, then the mode, each once the agent has said
+        // what it can be.
+        let pickers = [
+            self.render_model_picker(session, cx),
+            session
+                .settings
+                .iter()
+                .find(|setting| setting.kind == SettingKind::Mode)
+                .map(|setting| self.render_mode_picker(session.key, setting, cx)),
+        ];
         let action = if session.busy {
             InputGroupButton::new("stop")
                 .icon(IconName::Square)
@@ -739,7 +1280,8 @@ impl Render for ChatView {
                 .min_h(px(0.)),
             )
             .child(
-                // The send/stop button sits inside the input box.
+                // A row along the input box's bottom: the session's model and mode on the
+                // left, the send/stop button on the right.
                 div().p_3().child(
                     InputGroup::new("prompt")
                         .rounded_xl()
@@ -753,13 +1295,18 @@ impl Render for ChatView {
                                 .inset(),
                         ])
                         .focus_ring(false)
-                        // 129px tall until the text needs more room, with the text at the top.
-                        .input(Textarea::new(&self.input).min_h(px(129.)))
+                        // With the 44px row below it, the box is 129px tall until the
+                        // text needs more room, with the text at the top.
+                        .input(Textarea::new(&self.input).min_h(px(85.)))
                         .addon(
                             InputGroupAddon::new("prompt-actions")
-                                .align(InputGroupAddonAlignment::InlineEnd)
-                                // Keep the button in the bottom corner as the box grows.
-                                .self_end()
+                                .align(InputGroupAddonAlignment::BlockEnd)
+                                // 6px in from the box's sides and bottom, like the gap
+                                // above the buttons.
+                                .px_1p5()
+                                .pb_1p5()
+                                .children(pickers.into_iter().flatten())
+                                .child(div().flex_1())
                                 // A pointing hand over it, where the component's buttons
                                 // keep the arrow.
                                 .child(action.primary().small().rounded_full().cursor_pointer()),
@@ -845,6 +1392,38 @@ fn with_panel_colors(
     Rc::new(config)
 }
 
+// The icons `mode_icon` uses beyond those in the component library's own bundle.
+gpui_kit::assets::icon_assets!(
+    ModeIcons,
+    [
+        Hand,
+        FilePen,
+        ListChecks,
+        FolderPen,
+        ShieldCheck,
+        ShieldOff,
+        Shield
+    ]
+);
+
+/// The component library's icons, and the mode icons.
+struct AppAssets;
+
+impl AssetSource for AppAssets {
+    fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
+        match ModeIcons.load(path)? {
+            Some(icon) => Ok(Some(icon)),
+            None => gpui_kit::assets::Assets.load(path),
+        }
+    }
+
+    fn list(&self, path: &str) -> Result<Vec<SharedString>> {
+        let mut paths = gpui_kit::assets::Assets.list(path)?;
+        paths.extend(ModeIcons.list(path)?);
+        Ok(paths)
+    }
+}
+
 fn main() {
     let name = std::env::args().nth(1).unwrap_or_else(|| "claude".into());
     let agent = match acp_core::agent_for(&name) {
@@ -857,7 +1436,7 @@ fn main() {
     let cwd = std::env::current_dir().expect("no current directory");
 
     gpui_kit::application()
-        .with_assets(gpui_kit::assets::Assets)
+        .with_assets(AppAssets)
         .run(move |cx: &mut App| {
             gpui_kit::init(cx);
             Theme::update(cx, |theme| {
