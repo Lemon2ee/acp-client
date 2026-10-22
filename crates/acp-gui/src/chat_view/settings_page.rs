@@ -32,9 +32,31 @@ const SETTING_ROW_INSET: Pixels = px(16.);
 /// The rounded tile behind an agent's mark in the settings' list of agents.
 const AGENT_TILE_SIZE: Pixels = px(28.);
 
+/// What the settings keep for the window while it runs.
+pub(crate) struct SettingsPageState {
+    /// The settings take the whole window while open, in place of the sidebar and the
+    /// chat, which come back as they were.
+    pub(crate) open: bool,
+    /// The settings' page on show, kept while they are closed.
+    page: SettingsPage,
+    /// Holds keyboard focus while the settings are open, so Esc and Cmd+, reach them:
+    /// the prompt box, which has it otherwise, isn't drawn then.
+    focus: FocusHandle,
+}
+
+impl SettingsPageState {
+    pub(crate) fn new(cx: &mut App) -> Self {
+        Self {
+            open: false,
+            page: SettingsPage::General,
+            focus: cx.focus_handle(),
+        }
+    }
+}
+
 /// A page of the settings.
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SettingsPage {
+enum SettingsPage {
     General,
     Agents,
     Keyboard,
@@ -76,14 +98,14 @@ impl ChatView {
     /// Shows the settings in place of the sidebar and the chat, on the page they were
     /// last left on.
     pub(crate) fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.settings_open = true;
-        window.focus(&self.settings_focus, cx);
+        self.settings_page.open = true;
+        window.focus(&self.settings_page.focus, cx);
         cx.notify();
     }
 
     /// Brings back the sidebar and the chat as they were, the prompt box focused.
     fn close_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.settings_open = false;
+        self.settings_page.open = false;
         self.input.update(cx, |input, cx| input.focus(window, cx));
         cx.notify();
     }
@@ -109,7 +131,7 @@ impl ChatView {
         // Each side comes in on its own, as it is drawn anew; the page again for each
         // page picked. Reduced motion draws them at once.
         let fade = Animation::new(motion.duration_fast).with_easing(move |t| easing.sample(t));
-        let page = self.settings_page;
+        let page = self.settings_page.page;
 
         let page_rows = SettingsPage::ALL.map(|item| {
             div()
@@ -142,12 +164,12 @@ impl ChatView {
                 )
                 .child(item.name())
                 .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                    this.settings_page = item;
+                    this.settings_page.page = item;
                     cx.notify();
                 }))
         });
         let pages = div()
-            .w(self.sidebar_width)
+            .w(self.sidebar.width)
             .flex_none()
             .h_full()
             .relative()
@@ -279,7 +301,7 @@ impl ChatView {
             .relative()
             .flex()
             .text_color(foreground)
-            .track_focus(&self.settings_focus)
+            .track_focus(&self.settings_page.focus)
             .key_context("Settings")
             .on_action(
                 cx.listener(|this, _: &CloseSettings, window, cx| this.close_settings(window, cx)),

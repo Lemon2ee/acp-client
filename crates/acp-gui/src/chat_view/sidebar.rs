@@ -15,6 +15,29 @@ use gpui_kit::*;
 use crate::chat_view::ChatView;
 use crate::chrome::as_title_bar;
 
+/// What the sidebar keeps for the whole window, whichever session is on screen.
+pub(crate) struct SidebarState {
+    /// Shown, rather than slid away by the sidebar button.
+    pub(crate) open: bool,
+    /// The list of archived sessions is open.
+    archived_open: bool,
+    /// How wide the sidebar is while shown. Dragged at its right edge.
+    pub(crate) width: Pixels,
+    /// The session whose name is being changed on its card.
+    pub(crate) renaming: Option<Renaming>,
+}
+
+impl Default for SidebarState {
+    fn default() -> Self {
+        Self {
+            open: true,
+            archived_open: false,
+            width: SIDEBAR_WIDTH,
+            renaming: None,
+        }
+    }
+}
+
 /// A field on a session's sidebar card for changing its name.
 pub(crate) struct Renaming {
     pub(crate) key: SessionKey,
@@ -24,7 +47,7 @@ pub(crate) struct Renaming {
 
 /// How wide the sidebar starts, and how narrow or wide a drag can make it. The minimum
 /// keeps the sidebar button and the "New session" row whole.
-pub(crate) const SIDEBAR_WIDTH: Pixels = px(240.);
+const SIDEBAR_WIDTH: Pixels = px(240.);
 const SIDEBAR_MIN_WIDTH: Pixels = px(180.);
 const SIDEBAR_MAX_WIDTH: Pixels = px(480.);
 
@@ -62,7 +85,7 @@ impl ChatView {
             input.focus(window, cx);
             input.select_all(window, cx);
         });
-        self.renaming = Some(Renaming {
+        self.sidebar.renaming = Some(Renaming {
             key,
             input,
             _events: events,
@@ -74,7 +97,7 @@ impl ChatView {
     /// is blank, and a session kept for later runs keeps it there too; one its agent
     /// hasn't given an id yet is kept with it once the agent does.
     pub(crate) fn finish_rename(&mut self, keep: bool, cx: &mut Context<Self>) {
-        let Some(renaming) = self.renaming.take() else {
+        let Some(renaming) = self.sidebar.renaming.take() else {
             return;
         };
         cx.notify();
@@ -141,6 +164,7 @@ impl ChatView {
                 }
             });
         if let Some(renaming) = self
+            .sidebar
             .renaming
             .as_ref()
             .filter(|renaming| renaming.key == key)
@@ -223,7 +247,7 @@ impl ChatView {
         }
         // Closed, the list shows only that there are archived sessions.
         let archived_list = (!archived.is_empty()).then(|| {
-            let open = self.archived_open;
+            let open = self.sidebar.archived_open;
             div()
                 .id("archived")
                 .role(Role::Button)
@@ -254,12 +278,12 @@ impl ChatView {
                     .xsmall(),
                 )
                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                    this.archived_open = !this.archived_open;
+                    this.sidebar.archived_open = !this.sidebar.archived_open;
                     cx.notify();
                 }))
         });
         div()
-            .w(self.sidebar_width)
+            .w(self.sidebar.width)
             .flex_none()
             .h_full()
             .relative()
@@ -321,7 +345,7 @@ impl ChatView {
                             .overflow_y_scroll()
                             .children(cards)
                             .children(archived_list)
-                            .when(self.archived_open, |list| list.children(archived)),
+                            .when(self.sidebar.archived_open, |list| list.children(archived)),
                     )
                     .child(
                         div()
@@ -359,7 +383,7 @@ impl ChatView {
             .on_drag(ResizeSidebar, |_, _, _, cx| cx.new(|_| ResizeSidebar))
             .on_click(cx.listener(|this, event: &ClickEvent, _, cx| {
                 if event.click_count() == 2 {
-                    this.sidebar_width = SIDEBAR_WIDTH;
+                    this.sidebar.width = SIDEBAR_WIDTH;
                     cx.notify();
                 }
             }))
@@ -372,7 +396,7 @@ impl ChatView {
         cx: &mut Context<Self>,
     ) {
         let width = event.event.position.x - event.bounds.left();
-        self.sidebar_width = width.clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH);
+        self.sidebar.width = width.clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH);
         cx.notify();
     }
 }

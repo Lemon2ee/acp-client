@@ -5,7 +5,7 @@
 use std::ops::Range;
 
 use acp_core::{SessionKey, Setting, SettingChoice, SettingKind, SettingValue};
-use gpui_kit::component::input::{Input, InputGroupButton, InputState};
+use gpui_kit::component::input::{Input, InputEvent, InputGroupButton, InputState};
 use gpui_kit::component::popover::{Popover, PopoverState};
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::tooltip::Tooltip;
@@ -21,7 +21,7 @@ use crate::chat_view::pickers::{
     SURFACE_PADDING, SURFACE_RADIUS, SWITCH_ROW_HEIGHT, TAB_COLUMN_WIDTH, TAB_ICON_SIZE, TAB_SIZE,
     agent_logo, check, lead, listed_choices, picker_button, rise_in, shown_choice,
 };
-use crate::config::{Favorite, change_favorites, config_folder, kept_name};
+use crate::config::{Favorite, change_favorites, config_folder, kept_name, load_favorites};
 use crate::session::Session;
 
 /// A model's name as its row shows it: a trailing note in parentheses, such as
@@ -66,12 +66,32 @@ fn model_name(name: &str, query: &str, muted: Hsla) -> StyledText {
     StyledText::new(name.to_string()).with_highlights(highlights)
 }
 
-/// What the model panel keeps while it is open.
+/// What the model panel keeps, open or closed.
 pub(crate) struct ModelPanelState {
     /// The tab on show.
-    pub(crate) tab: ModelTab,
+    tab: ModelTab,
     /// The search box, which narrows the tab to the models named like its text.
-    pub(crate) search: Entity<InputState>,
+    search: Entity<InputState>,
+    /// The models the user starred, which the favorites tab lists. Kept on disk.
+    favorites: Vec<Favorite>,
+    _search_events: Subscription,
+}
+
+impl ModelPanelState {
+    pub(crate) fn new(window: &mut Window, cx: &mut Context<ChatView>) -> Self {
+        let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search models"));
+        let search_events = cx.subscribe(&search, |_, _, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Change) {
+                cx.notify();
+            }
+        });
+        Self {
+            tab: ModelTab::Favorites,
+            search,
+            favorites: load_favorites(),
+            _search_events: search_events,
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -544,11 +564,11 @@ impl ChatView {
             .ok_or_else(|| std::io::Error::other("there is no config folder"))
             .and_then(|folder| change_favorites(&folder, change));
         match changed {
-            Ok(favorites) => self.favorites = favorites,
+            Ok(favorites) => self.model_panel.favorites = favorites,
             Err(err) => {
                 eprintln!("couldn't save the favorite models: {err}");
                 // The list still changes for this run.
-                change(&mut self.favorites);
+                change(&mut self.model_panel.favorites);
             }
         }
         cx.notify();
@@ -622,7 +642,7 @@ impl ChatView {
             tab => tab,
         };
         let search = self.model_panel.search.clone();
-        let favorites = self.favorites.clone();
+        let favorites = self.model_panel.favorites.clone();
         let trigger = model_button(shown, &self.agents[session.agent].name, cx).cursor_pointer();
         let picker = Popover::new("model-panel")
             .appearance(false)

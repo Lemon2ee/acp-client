@@ -17,8 +17,8 @@ use gpui_kit::base::input::Copy;
 use gpui_kit::base::{TextSelection, Transition, transition};
 use gpui_kit::component::button::ButtonVariants as _;
 use gpui_kit::component::input::{
-    InputEvent, InputGroup, InputGroupAddon, InputGroupAddonAlignment, InputGroupButton,
-    InputState, Textarea, TextareaState,
+    InputEvent, InputGroup, InputGroupAddon, InputGroupAddonAlignment, InputGroupButton, Textarea,
+    TextareaState,
 };
 use gpui_kit::component::message_scroller::MessageScroller;
 use gpui_kit::component::{ActiveTheme as _, FocusableExt as _, Icon, IconName, Sizable as _};
@@ -26,16 +26,16 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::OpenSettings;
-use crate::chat_view::pickers::model_panel::{ModelPanelState, ModelTab};
-use crate::chat_view::settings_page::SettingsPage;
-use crate::chat_view::sidebar::{Renaming, ResizeSidebar, SIDEBAR_WIDTH};
+use crate::chat_view::pickers::model_panel::ModelPanelState;
+use crate::chat_view::settings_page::SettingsPageState;
+use crate::chat_view::sidebar::{ResizeSidebar, SidebarState};
 use crate::chrome::{
     BLURRED_CHAT_ALPHA, BLURRED_SIDEBAR_ALPHA, OWN_TITLE_BAR, WINDOW_BLUR, apply_appearance,
     as_title_bar, window_background,
 };
 use crate::config::{
-    AppSettings, Favorite, SavedSession, change_saved_sessions, config_folder, kept_name,
-    load_favorites, load_last_settings, load_saved_sessions, save_last_settings,
+    AppSettings, SavedSession, change_saved_sessions, config_folder, kept_name, load_last_settings,
+    load_saved_sessions, save_last_settings,
 };
 use crate::session::{Origin, Row, Session};
 
@@ -84,32 +84,15 @@ pub(crate) struct ChatView {
     title_bar_height: Pixels,
     /// Where the traffic lights end, from the window's left edge.
     traffic_lights_end: Pixels,
-    sidebar_open: bool,
-    /// The sidebar's list of archived sessions is open.
-    archived_open: bool,
-    /// How wide the sidebar is while shown. Dragged at its right edge.
-    sidebar_width: Pixels,
-    model_panel: ModelPanelState,
-    /// The models the user starred, which the model panel's favorites tab lists.
-    /// Kept on disk.
-    favorites: Vec<Favorite>,
     /// The blur is on: the desktop shows through the window, blurred, behind the sidebar
     /// and the chat, except in full screen.
     window_blur: bool,
     /// The window is blurred now, and its sidebar and chat translucent.
     blurred: bool,
-    /// The settings take the whole window while open, in place of the sidebar and the
-    /// chat, which come back as they were.
-    settings_open: bool,
-    /// The settings' page on show, kept while they are closed.
-    settings_page: SettingsPage,
-    /// Holds keyboard focus while the settings are open, so Esc and Cmd+, reach them:
-    /// the prompt box, which has it otherwise, isn't drawn then.
-    settings_focus: FocusHandle,
-    /// The session whose name is being changed on its sidebar card.
-    renaming: Option<Renaming>,
+    sidebar: SidebarState,
+    model_panel: ModelPanelState,
+    settings_page: SettingsPageState,
     _input_events: Subscription,
-    _search_events: Subscription,
     _bounds_events: Subscription,
     _settings_events: Subscription,
 }
@@ -137,12 +120,6 @@ impl ChatView {
         let input_events = cx.subscribe_in(&input, window, |this, _, event, window, cx| {
             if let InputEvent::PressEnter { shift: false, .. } = event {
                 this.send(window, cx);
-            }
-        });
-        let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search models"));
-        let search_events = cx.subscribe(&search, |_, _, event: &InputEvent, cx| {
-            if matches!(event, InputEvent::Change) {
-                cx.notify();
             }
         });
         // Going into full screen or out of it resizes the window.
@@ -216,22 +193,12 @@ impl ChatView {
             cwd,
             title_bar_height,
             traffic_lights_end,
-            sidebar_open: true,
-            archived_open: false,
-            sidebar_width: SIDEBAR_WIDTH,
-            model_panel: ModelPanelState {
-                tab: ModelTab::Favorites,
-                search,
-            },
-            favorites: load_favorites(),
             window_blur: blur,
             blurred: blur,
-            settings_open: false,
-            settings_page: SettingsPage::General,
-            settings_focus: cx.focus_handle(),
-            renaming: None,
+            sidebar: SidebarState::default(),
+            model_panel: ModelPanelState::new(window, cx),
+            settings_page: SettingsPageState::new(cx),
             _input_events: input_events,
-            _search_events: search_events,
             _bounds_events: bounds_events,
             _settings_events: settings_events,
         };
@@ -606,6 +573,7 @@ impl ChatView {
             return;
         };
         if self
+            .sidebar
             .renaming
             .as_ref()
             .is_some_and(|renaming| renaming.key == key)
@@ -926,12 +894,12 @@ impl Render for ChatView {
         // as each page does; the sidebar and the chat fade back in on this.
         let settings_shown = transition(
             "settings-shown",
-            if self.settings_open { 1. } else { 0. },
+            if self.settings_page.open { 1. } else { 0. },
             fade,
             window,
             cx,
         );
-        if self.settings_open {
+        if self.settings_page.open {
             return self.render_settings(title_bar, cx);
         }
         let chat_shown = 1. - settings_shown;
@@ -944,12 +912,12 @@ impl Render for ChatView {
         // 0 while the sidebar is shown and 1 while it is hidden, in between as it slides.
         let hidden = transition(
             "sidebar-hidden",
-            if self.sidebar_open { 0. } else { 1. },
+            if self.sidebar.open { 0. } else { 1. },
             slide,
             window,
             cx,
         );
-        let sidebar_width = self.sidebar_width * (1. - hidden);
+        let sidebar_width = self.sidebar.width * (1. - hidden);
         let session = &self.sessions[self.active];
         // The model, how hard it thinks, then the mode, each once the agent has said
         // what it can be, for this session or the last it created.
@@ -1074,7 +1042,7 @@ impl Render for ChatView {
         let toggle = div()
             .id("toggle-sidebar")
             .role(Role::Button)
-            .aria_label(if self.sidebar_open {
+            .aria_label(if self.sidebar.open {
                 "Hide sidebar"
             } else {
                 "Show sidebar"
@@ -1102,7 +1070,7 @@ impl Render for ChatView {
                     .text_color(muted),
             )
             .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                this.sidebar_open = !this.sidebar_open;
+                this.sidebar.open = !this.sidebar.open;
                 cx.notify();
             }));
 
@@ -1146,7 +1114,7 @@ impl Render for ChatView {
                     .bg(sidebar)
                     .child(
                         self.render_sidebar(title_bar, cx)
-                            .ml(sidebar_width - self.sidebar_width)
+                            .ml(sidebar_width - self.sidebar.width)
                             .opacity(chat_shown),
                     ),
             )
