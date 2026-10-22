@@ -5,7 +5,7 @@ use std::borrow::Cow;
 use std::cell::Cell;
 use std::cmp::Reverse;
 use std::collections::{HashMap, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -470,13 +470,27 @@ impl ChatView {
         }));
     }
 
-    /// Adds an older model to the model list, or takes it off again.
+    /// Adds an older model to the model list, or takes it off again. Another window may
+    /// have changed the list since this one read it, so the change is made to the list
+    /// on disk, and this window takes that list up.
     fn set_model_added(&mut self, id: String, added: bool, cx: &mut Context<Self>) {
-        self.added_models.retain(|model| *model != id);
-        if added {
-            self.added_models.push(id);
+        let change = |models: &mut Vec<String>| {
+            models.retain(|model| *model != id);
+            if added {
+                models.push(id.clone());
+            }
+        };
+        let changed = config_folder()
+            .ok_or_else(|| std::io::Error::other("there is no config folder"))
+            .and_then(|folder| change_added_models(&folder, change));
+        match changed {
+            Ok(models) => self.added_models = models,
+            Err(err) => {
+                eprintln!("couldn't save the added models: {err}");
+                // The list still changes for this run.
+                change(&mut self.added_models);
+            }
         }
-        save_added_models(&self.added_models);
         cx.notify();
     }
 
@@ -1717,38 +1731,58 @@ fn with_panel_colors(
     Rc::new(config)
 }
 
-/// Where the older models the user added to the model list are kept, an id a line.
-fn added_models_path() -> Option<PathBuf> {
-    Some(dirs::config_dir()?.join("acp-client").join("added-models"))
+/// The folder for the app's own files.
+fn config_folder() -> Option<PathBuf> {
+    Some(dirs::config_dir()?.join("acp-client"))
 }
+
+/// Holds the older models the user added to the model list, an id a line.
+const ADDED_MODELS: &str = "added-models";
 
 fn load_added_models() -> Vec<String> {
-    let text = added_models_path().and_then(|path| std::fs::read_to_string(path).ok());
-    text.map(|text| {
-        text.lines()
-            .filter(|line| !line.is_empty())
-            .map(Into::into)
-            .collect()
-    })
-    .unwrap_or_default()
+    config_folder()
+        .and_then(|folder| read_added_models(&folder.join(ADDED_MODELS)).ok())
+        .unwrap_or_default()
 }
 
-/// The list still changes for this run when saving it fails.
-fn save_added_models(models: &[String]) {
-    let Some(path) = added_models_path() else {
-        return;
-    };
-    let text: String = models.iter().map(|id| format!("{id}\n")).collect();
-    let saved = path
-        .parent()
-        .map_or(Ok(()), std::fs::create_dir_all)
-        .and_then(|()| std::fs::write(&path, text));
-    if let Err(err) = saved {
-        eprintln!(
-            "couldn't save the added models to {}: {err}",
-            path.display()
-        );
+/// An error other than a missing file is passed on, so a list that couldn't be read
+/// isn't written over.
+fn read_added_models(path: &Path) -> std::io::Result<Vec<String>> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(text
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(Into::into)
+            .collect()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(err) => Err(err),
     }
+}
+
+/// Makes `change` to the added models kept in `folder`, and returns the list as it then
+/// stands. Windows changing it at once take turns under a lock, and the new list
+/// replaces the old one whole, so a write that fails or is cut short leaves the old list.
+fn change_added_models(
+    folder: &Path,
+    change: impl Fn(&mut Vec<String>),
+) -> std::io::Result<Vec<String>> {
+    std::fs::create_dir_all(folder)?;
+    // Held until the new list is in place.
+    let lock = std::fs::File::create(folder.join(format!("{ADDED_MODELS}.lock")))?;
+    lock.lock()?;
+    let path = folder.join(ADDED_MODELS);
+    let mut models = read_added_models(&path)?;
+    change(&mut models);
+    let written = folder.join(format!("{ADDED_MODELS}.new"));
+    std::fs::write(
+        &written,
+        models
+            .iter()
+            .map(|id| format!("{id}\n"))
+            .collect::<String>(),
+    )?;
+    std::fs::rename(&written, &path)?;
+    Ok(models)
 }
 
 // The icons `mode_icon` uses beyond those in the component library's own bundle.
