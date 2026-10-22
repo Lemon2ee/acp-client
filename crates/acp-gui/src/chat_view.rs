@@ -112,6 +112,7 @@ pub(crate) struct ChatView {
     _settings_events: Subscription,
     _activation_events: Subscription,
     _recorder_keys: Subscription,
+    _card_keys: Subscription,
     _layout_events: Subscription,
     /// None where there is no system-wide shortcut.
     _shortcut_presses: Option<Task<()>>,
@@ -166,6 +167,19 @@ impl ChatView {
         let recorder_keys = cx.intercept_keystrokes(move |event, _, cx| {
             let taken = view
                 .update(cx, |this, cx| this.record_keystroke(&event.keystroke, cx))
+                .unwrap_or_default();
+            if taken {
+                cx.stop_propagation();
+            }
+        });
+        // Before the prompt's own Enter and the window's Esc, which a permission card
+        // answers to while the prompt is empty (see `card_with_keys`).
+        let view = cx.entity().downgrade();
+        let card_keys = cx.intercept_keystrokes(move |event, window, cx| {
+            let taken = view
+                .update(cx, |this, cx| {
+                    this.card_keystroke(&event.keystroke, window, cx)
+                })
                 .unwrap_or_default();
             if taken {
                 cx.stop_propagation();
@@ -268,6 +282,7 @@ impl ChatView {
             _settings_events: settings_events,
             _activation_events: activation_events,
             _recorder_keys: recorder_keys,
+            _card_keys: card_keys,
             _layout_events: layout_events,
             _shortcut_presses: shortcut_presses,
         };

@@ -221,12 +221,15 @@ impl From<ProtocolToolKind> for ToolKind {
 }
 
 /// Something a tool call shows: what it produced, or the change it makes to a file.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum ToolContent {
     /// Markdown. Claude's adapter sends a command's output and a file it read as a fenced
     /// code block, the file's lines numbered.
     Text(String),
-    /// A change to one file: its whole text before, none for a new file, and after.
+    /// A change to one file: its text before, none for a new file, and after. Agents may
+    /// send only the part that changes rather than the whole file: Claude's adapter sends
+    /// an edit's snippet, and once it is done one diff for each hunk, whose first line is
+    /// the `line` of the location at the same place.
     Diff {
         path: PathBuf,
         old: Option<String>,

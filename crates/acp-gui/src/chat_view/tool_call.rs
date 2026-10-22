@@ -23,7 +23,9 @@ use similar::ChangeTag;
 
 use crate::chat_view::ChatView;
 use crate::chat_view::pickers::MenuLook;
-use crate::session::{Answer, Ask, Code, Diff, DiffLine, Row, Shown, ToolCall, row_id};
+use crate::session::{
+    Answer, Ask, Code, Diff, DiffLine, Row, Shown, ToolCall, folded_text, row_id,
+};
 
 /// A row is as tall as the menus' rows and sits a little in from the transcript's sides,
 /// its padding putting the icon in line with the agent's text.
@@ -257,7 +259,7 @@ impl ChatView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Div {
-        self.offer_keys(ix, window, cx);
+        self.return_keys(ix, window, cx);
         let look = ToolLook::new(cx);
         let motion = cx.theme().motion_tokens();
         let (control, fast) = (motion.spring_control, motion.duration_fast);
@@ -371,8 +373,11 @@ impl ChatView {
                 .children(content);
             reveal_clip((id.clone(), "row"), 1. - asked, side, window, cx)
         });
+        let keyed = call.asking() && self.card_with_keys(window, cx) == Some(ix);
         let card = call.ask.as_ref().filter(|_| asked > 0.).map(|ask| {
-            let card = ask_card(call, ask, key, ix, &id, &folder, look, &mono, window, cx);
+            let card = ask_card(
+                call, ask, keyed, key, ix, &id, &folder, look, &mono, window, cx,
+            );
             reveal_clip((id.clone(), "card"), asked, card, window, cx)
         });
         let element = v_flex().w_full().pl(indent).children(side).children(card);
@@ -497,30 +502,127 @@ impl ChatView {
         div().px(ROW_INSET).child(header)
     }
 
-    /// The first time a permission card shows, it takes the keys with its first option
-    /// lit, so Enter allows and Esc says no. It leaves them where the user is writing,
-    /// in the prompt or anywhere else, where a key meant for the text would answer it.
-    fn offer_keys(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(Row::Tool(call)) = self.sessions[self.active].rows.get_mut(ix) else {
-            return;
-        };
-        let Some(ask) = call
-            .ask
-            .as_mut()
-            .filter(|ask| ask.answer == Answer::Open && !ask.shown)
-        else {
-            return;
-        };
-        ask.shown = true;
-        let first = ask.focus.first().cloned();
+    /// The permission card that Enter, Esc, Up and Down answer from the prompt: the
+    /// session's first open one, while the prompt holds the keys with nothing written in
+    /// it and the newest rows are in view. The card never takes the keys itself, so text
+    /// being written can't answer it, nor can a card out of sight.
+    pub(crate) fn card_with_keys(&self, window: &Window, cx: &App) -> Option<usize> {
         let prompt = self.input.read(cx);
-        let free = window
-            .focused(cx)
-            .is_none_or(|focused| focused == prompt.focus_handle(cx) && prompt.value().is_empty());
-        if let Some(first) = first.filter(|_| free) {
+        let session = &self.sessions[self.active];
+        if !prompt.focus_handle(cx).is_focused(window)
+            || !prompt.value().is_empty()
+            || session.scroller.read(cx).scrolled_up()
+        {
+            return None;
+        }
+        session
+            .rows
+            .iter()
+            .position(|row| matches!(row, Row::Tool(call) if call.asking()))
+    }
+
+    /// Takes a key pressed anywhere in the window for a permission card, before the
+    /// window's own shortcuts: from the prompt, the keys `card_with_keys` names; on a
+    /// card's option, reached with Tab, a key that types something, which goes back to
+    /// the prompt with the keys so writing there goes on. Returns whether it was taken.
+    pub(crate) fn card_keystroke(
+        &mut self,
+        keystroke: &Keystroke,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let modifiers = keystroke.modifiers;
+        // macOS sets fn on its own for the arrows.
+        if modifiers.control || modifiers.alt || modifiers.platform {
+            return false;
+        }
+        if self.option_with_keys(window).is_some() {
+            let typed = keystroke
+                .key_char
+                .clone()
+                .filter(|text| keystroke.key != "space" && !text.chars().any(char::is_control));
+            let Some(text) = typed else {
+                return false;
+            };
+            self.input.update(cx, |input, cx| {
+                input.focus(window, cx);
+                input.insert(&text, window, cx);
+            });
+            return true;
+        }
+        if modifiers.shift {
+            return false;
+        }
+        let Some(ix) = self.card_with_keys(window, cx) else {
+            return false;
+        };
+        let session = &mut self.sessions[self.active];
+        let key = session.key;
+        let Some(Row::Tool(call)) = session.rows.get_mut(ix) else {
+            return false;
+        };
+        let Some(ask) = call.ask.as_mut() else {
+            return false;
+        };
+        let options = &ask.request.options;
+        let choice = match keystroke.key.as_str() {
+            "up" | "down" if !options.is_empty() => {
+                let step = if keystroke.key == "down" {
+                    1
+                } else {
+                    options.len() - 1
+                };
+                ask.lit = (ask.lit + step) % options.len();
+                cx.notify();
+                return true;
+            }
+            "enter" => options.get(ask.lit),
+            // Only the agent's own no: answering with none tells it the turn was stopped.
+            "escape" => reject_option(options).map(|n| &options[n]),
+            _ => None,
+        };
+        let Some(choice) = choice.map(|option| option.id.clone()) else {
+            return false;
+        };
+        self.answer(key, ix, Some(choice), window, cx);
+        true
+    }
+
+    /// The card and the option whose own focus holds the keys, reached with Tab.
+    fn option_with_keys(&self, window: &Window) -> Option<(usize, usize)> {
+        self.sessions[self.active]
+            .rows
+            .iter()
+            .enumerate()
+            .find_map(|(ix, row)| match row {
+                Row::Tool(call) => {
+                    let ask = call.ask.as_ref()?;
+                    let n = ask
+                        .focus
+                        .iter()
+                        .position(|focus| focus.is_focused(window))?;
+                    Some((ix, n))
+                }
+                _ => None,
+            })
+    }
+
+    /// A card that closed with its option holding the keys, as when the turn stopped,
+    /// gives them back to the prompt rather than leave them where nothing is drawn.
+    fn return_keys(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(Row::Tool(call)) = self.sessions[self.active].rows.get(ix) else {
+            return;
+        };
+        let held = call.ask.as_ref().is_some_and(|ask| {
+            ask.answer != Answer::Open && ask.focus.iter().any(|focus| focus.is_focused(window))
+        });
+        if held {
+            let input = self.input.clone();
             // Not while the transcript draws, which would leave the frame showing the
             // keys where they were.
-            window.defer(cx, move |window, cx| window.focus(&first, cx));
+            window.defer(cx, move |window, cx| {
+                input.update(cx, |input, cx| input.focus(window, cx))
+            });
         }
     }
 
@@ -550,9 +652,10 @@ impl ChatView {
                 let counting = this.update(cx, |this, cx| {
                     let session = &this.sessions[this.active];
                     let counting = session.is_live()
-                        && session.rows.iter().any(
-                            |row| matches!(row, Row::Tool(call) if call.running_for().is_some()),
-                        );
+                        && session.rows.iter().any(|row| {
+                            matches!(row, Row::Tool(call)
+                                if call.running_for().is_some() && call.may_run())
+                        });
                     if counting {
                         cx.notify();
                     } else {
@@ -658,7 +761,8 @@ fn title(call: &ToolCall, running: bool, mono: &SharedString, id: &ElementId) ->
 }
 
 /// The row's end: the lines an edit adds and removes, that the call failed, was turned
-/// down or never got an answer, and how long it ran, or has been running.
+/// down or never got an answer, that the user's answer holds for calls like it too, and
+/// how long it ran, or has been running.
 fn notes(
     call: &ToolCall,
     time: Option<String>,
@@ -680,11 +784,17 @@ fn notes(
         .when(call.failed(), |notes| {
             notes.child(div().text_color(look.failed).child("Failed"))
         })
-        .children(call.ask.as_ref().and_then(|ask| match ask.answer {
-            Answer::Rejected => Some("Rejected"),
-            Answer::Cancelled => Some("Cancelled"),
-            Answer::Open | Answer::Allowed => None,
-        }))
+        .children(
+            call.ask
+                .as_ref()
+                .and_then(|ask| match (ask.answer, ask.always) {
+                    (Answer::Allowed, true) => Some("Always allowed"),
+                    (Answer::Rejected, true) => Some("Always rejected"),
+                    (Answer::Rejected, false) => Some("Rejected"),
+                    (Answer::Cancelled, _) => Some("Cancelled"),
+                    (Answer::Open, _) | (Answer::Allowed, false) => None,
+                }),
+        )
         .when_some(time, |notes, time| {
             notes.child(div().opacity(time_shown).child(time))
         })
@@ -790,10 +900,11 @@ fn kind_icon(kind: ToolKind) -> gpui_kit::assets::IconName {
 /// under a minute, then minutes and seconds.
 fn took_text(took: Duration) -> String {
     let secs = took.as_secs_f32();
-    if secs < 10. {
+    // What rounds to ten tenths is ten seconds.
+    if secs < 9.95 {
         format!("{secs:.1}s")
     } else {
-        count_text(took)
+        count_text(took.max(Duration::from_secs(10)))
     }
 }
 
@@ -867,11 +978,13 @@ fn content_box(
 
 /// The card asking for permission to run a call, in its row's place: the kind's
 /// question, a preview of what the call would do, and the agent's options in its own
-/// words, the one the keys are on lit, or the first while they are elsewhere.
+/// words, the one Enter picks lit. `keyed` is whether the keys in the prompt answer it
+/// (see `ChatView::card_with_keys`), which shows which keys do what.
 #[allow(clippy::too_many_arguments)]
 fn ask_card(
     call: &ToolCall,
     ask: &Ask,
+    keyed: bool,
     key: SessionKey,
     ix: usize,
     id: &ElementId,
@@ -943,7 +1056,8 @@ fn ask_card(
     }
 
     let held = ask.focus.iter().position(|focus| focus.is_focused(window));
-    let lit = held.unwrap_or(0);
+    let lit = held.unwrap_or(ask.lit);
+    let keyed = keyed || held.is_some();
     let reject = reject_option(options);
     let rows = options.iter().enumerate().map(|(n, option)| {
         let icon: gpui_kit::assets::IconName = match (option.allow, option.always) {
@@ -951,7 +1065,7 @@ fn ask_card(
             (true, true) => gpui_kit::assets::IconName::CheckCheck,
             (false, _) => IconName::Close.into(),
         };
-        let hint = held.and_then(|_| {
+        let hint = keyed.then_some(()).and_then(|_| {
             if n == lit {
                 Some("↵")
             } else if Some(n) == reject {
@@ -1027,9 +1141,12 @@ fn ask_card(
                         this.answer(key, ix, Some(ids[lit].clone()), window, cx)
                     }
                 }))
-                .on_action(cx.listener(move |this, _: &Cancel, window, cx| {
-                    this.answer(key, ix, no.clone(), window, cx)
-                }))
+        })
+        // Only the agent's own no: answering with none tells it the turn was stopped.
+        .when_some(no.filter(|_| open), |card, no| {
+            card.on_action(cx.listener(move |this, _: &Cancel, window, cx| {
+                this.answer(key, ix, Some(no.clone()), window, cx)
+            }))
         })
         .child(heading)
         .when(!preview.is_empty(), |card| {
@@ -1241,13 +1358,14 @@ fn diff_box(
     let copy = header
         .is_none()
         .then(|| floating_copy(id, &diff.copy, look));
+    let numbered = diff.numbered;
     frame(look)
         .children(header)
         .child(lines_body(
             id,
             diff.lines.clone(),
             diff.widest,
-            |line, look| match line {
+            move |line, look| match line {
                 DiffLine::Line {
                     change,
                     number,
@@ -1262,7 +1380,7 @@ fn diff_box(
                         .px(CODE_PAD)
                         .whitespace_nowrap()
                         .when_some(bg, |row, bg| row.bg(bg))
-                        .child(number_cell(number.clone(), look))
+                        .when(numbered, |row| row.child(number_cell(number.clone(), look)))
                         .child(
                             div()
                                 .w(SIGN_WIDTH)
@@ -1278,7 +1396,7 @@ fn diff_box(
                     .whitespace_nowrap()
                     .bg(look.hover)
                     .text_color(look.muted)
-                    .child(format!("⋯ {count} unchanged lines"))
+                    .child(folded_text(*count))
                     .into_any_element(),
             },
             look,
@@ -1432,6 +1550,8 @@ mod tests {
     fn times_read_as_the_design_has_them() {
         assert_eq!(took_text(Duration::from_millis(420)), "0.4s");
         assert_eq!(took_text(Duration::from_millis(8_440)), "8.4s");
+        assert_eq!(took_text(Duration::from_millis(9_940)), "9.9s");
+        assert_eq!(took_text(Duration::from_millis(9_960)), "10s");
         assert_eq!(took_text(Duration::from_millis(12_700)), "12s");
         assert_eq!(took_text(Duration::from_secs(72)), "1m 12s");
         assert_eq!(count_text(Duration::from_millis(3_900)), "3s");

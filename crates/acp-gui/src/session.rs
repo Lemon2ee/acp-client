@@ -22,7 +22,7 @@ use crate::chat_view::scroller::TranscriptScroll;
 use crate::config::TitleSource;
 use crate::debug::switches;
 use pacing::Pacer;
-pub(crate) use tool_call::{Answer, Ask, Code, Diff, DiffLine, Shown, ToolCall};
+pub(crate) use tool_call::{Answer, Ask, Code, Diff, DiffLine, Shown, ToolCall, folded_text};
 
 /// How much later each word of a streamed piece starts fading in than the one before,
 /// as in gpui-component's own `TextView::stream_fade`.
@@ -390,6 +390,13 @@ impl Session {
                 });
                 if let Row::Tool(call) = &mut self.rows[ix] {
                     call.ask(request, cx);
+                    // acp-core answers a request that comes between turns as cancelled,
+                    // having no turn to show it in, so it shows as one.
+                    if !self.live
+                        && let Some(ask) = call.ask.as_mut()
+                    {
+                        ask.answer = Answer::Cancelled;
+                    }
                 }
                 // The call's group opens for the card.
                 self.remeasure_group(ix, cx);
@@ -548,16 +555,22 @@ impl Session {
         let Some(ask) = call.ask.as_mut().filter(|ask| ask.answer == Answer::Open) else {
             return;
         };
-        let allowed = choice
+        let picked = choice
             .as_ref()
-            .and_then(|id| ask.request.options.iter().find(|option| option.id == *id))
-            .is_some_and(|option| option.allow);
+            .and_then(|id| ask.request.options.iter().find(|option| option.id == *id));
+        let (allowed, always) =
+            picked.map_or((false, false), |option| (option.allow, option.always));
         // The turn may have been stopped or ended since the card was drawn.
         ask.answer = match ask.request.answer(choice) {
             false => Answer::Cancelled,
             true if allowed => Answer::Allowed,
             true => Answer::Rejected,
         };
+        ask.always = always && ask.answer != Answer::Cancelled;
+        // It runs from now, not from when it came in to ask: the wait was the user's.
+        if ask.answer == Answer::Allowed && call.started.is_some() {
+            call.started = Some(Instant::now());
+        }
         self.remeasure_group(ix, cx);
     }
 

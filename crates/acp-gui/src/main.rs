@@ -165,8 +165,10 @@ fn main() {
                 KeyBinding::new("enter", Confirm { secondary: false }, Some("PickerMenu")),
                 KeyBinding::new("space", Confirm { secondary: false }, Some("PickerMenu")),
             ]);
-            // On a permission card holding the keys, Up and Down move between its
-            // options, Enter or Space answers with the lit one, and Esc says no.
+            // On a permission card's option, reached with Tab, Up and Down move between
+            // its options, Enter or Space answers with that one, and Esc says no. From
+            // the empty prompt the card takes the same keys but Space, which is typing
+            // (see `ChatView::card_keystroke`).
             cx.bind_keys([
                 KeyBinding::new("up", SelectUp, Some("PermissionCard")),
                 KeyBinding::new("down", SelectDown, Some("PermissionCard")),
