@@ -16,8 +16,25 @@ Three crates in one Cargo workspace (edition 2024, resolver 3):
 | `crates/acp-cli` | Minimal terminal front end over `acp-core`: one session, one prompt per stdin line. Useful for checking core changes without the GUI. |
 | `crates/acp-gui` | The real app: a gpui window with a session sidebar beside a chat, built on `gpui-kit` (a pinned gpui snapshot plus gpui-component). |
 
-Each crate is a single file today: `lib.rs` for core, `main.rs` for the two front ends.
-Keep it that way until a file clearly needs splitting.
+acp-core and acp-cli are a single file each (`lib.rs`, `main.rs`); keep them so until one
+clearly needs splitting. acp-gui is split by what each part keeps or draws:
+
+| File in `crates/acp-gui/src/` | Holds |
+| --- | --- |
+| `main.rs` | Starting the app: the agents to run, the window, key bindings, actions, the extra icons, profiling. |
+| `config.rs` | What is kept on disk between runs: `AppSettings`, the starred models, each agent's last settings, the kept sessions. |
+| `session.rs` | `Session`: one conversation's transcript rows and settings, and how each `SessionEvent` lands on it. |
+| `chrome.rs` | The window around the content: the macOS title bar row, the traffic lights, the blur, the light or dark theme. |
+| `chat_view.rs` | `ChatView`: the agents, the sessions and what happens to them, and the window's layout (`Render`). |
+| `chat_view/transcript.rs` | How each row of a transcript is drawn. |
+| `chat_view/sidebar.rs` | The session cards, renaming, the delete prompt, the Archived list, the draggable edge. |
+| `chat_view/settings_page.rs` | The settings, which take the window while open. |
+| `chat_view/pickers.rs` | What the buttons below the prompt and their menus share: `MenuLook`, sizes, `picker_button`. |
+| `chat_view/pickers/` | One file each for the model panel, the effort menu and the mode menu. |
+
+`ChatView`'s fields stay private: its parts sit under `chat_view/`, and a child module can
+read its parent's private fields. What another module needs is `pub(crate)`, and no more.
+A new screen or menu goes in a file of its own beside the others.
 
 ## Running and checking
 
