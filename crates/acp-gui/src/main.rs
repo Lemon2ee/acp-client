@@ -812,7 +812,6 @@ impl ChatView {
                 if let Some(session) = self.session_mut(key) {
                     session.busy = false;
                 }
-                self.agents[agent].spare_failed = false;
             }
             AgentEvent::SessionFailed(key, message) => {
                 let several = self.agents.len() > 1;
@@ -841,6 +840,10 @@ impl ChatView {
             AgentEvent::Session(key, event) => {
                 if let SessionEvent::Settings(settings) = &event {
                     self.remember_settings(agent, key, settings);
+                    // Every session the agent creates, by a prompt or as a spare, gets
+                    // its settings, so the agent creates sessions again and a spare
+                    // failing after this is news.
+                    self.agents[agent].spare_failed = false;
                 }
                 if let Some(session) = self.session_mut(key) {
                     session.apply(event, cx);
