@@ -359,17 +359,25 @@ struct ChatView {
     /// The models the user starred, which the model panel's favorites tab lists.
     /// Kept on disk.
     favorites: Vec<Favorite>,
+    /// The blur is on: the desktop shows through the window, blurred, behind the sidebar
+    /// and the chat, except in full screen.
+    window_blur: bool,
+    /// The window is blurred now, and its sidebar and chat translucent.
+    blurred: bool,
     _input_events: Subscription,
     _search_events: Subscription,
+    _bounds_events: Subscription,
 }
 
 impl ChatView {
     /// Starts every agent in `agents`, each by name, lists the sessions kept from
     /// earlier runs on them, and shows a session on the first that no agent creates
-    /// until its first prompt.
+    /// until its first prompt. `blur` is whether the window opened blurred (see
+    /// `window_background`).
     fn new(
         agents: Vec<(String, AcpAgent)>,
         cwd: PathBuf,
+        blur: bool,
         title_bar_height: Pixels,
         traffic_lights_end: Pixels,
         window: &mut Window,
@@ -391,6 +399,10 @@ impl ChatView {
             if matches!(event, InputEvent::Change) {
                 cx.notify();
             }
+        });
+        // Going into full screen or out of it resizes the window.
+        let bounds_events = cx.observe_window_bounds(window, |this, window, cx| {
+            this.update_window_background(window, cx)
         });
         window.on_window_should_close(cx, |_, cx| {
             cx.quit();
@@ -443,8 +455,11 @@ impl ChatView {
                 search,
             },
             favorites: load_favorites(),
+            window_blur: blur,
+            blurred: blur,
             _input_events: input_events,
             _search_events: search_events,
+            _bounds_events: bounds_events,
         };
         view.restore_sessions(cx);
         // On the first agent, whatever agent the oldest kept session is on, and even if
@@ -520,6 +535,28 @@ impl ChatView {
         if let Err(err) = changed {
             eprintln!("couldn't keep the session for later runs: {err}");
         }
+    }
+
+    /// Has the desktop show through the window, blurred, behind the sidebar and the chat,
+    /// or stop. Where gpui can't blur (see `WINDOW_BLUR`) the window stays opaque.
+    #[expect(dead_code, reason = "the settings page will turn the blur on and off")]
+    fn set_window_blur(&mut self, on: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.window_blur = on && WINDOW_BLUR;
+        self.update_window_background(window, cx);
+    }
+
+    /// Blurs the window while the blur is on and the window isn't in full screen, and
+    /// makes it opaque otherwise. In full screen the window fills a space of its own,
+    /// and being opaque there spares the window server blending it with what's behind.
+    fn update_window_background(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let blurred = self.window_blur && !window.is_fullscreen();
+        // Called on every resize, so only a change reaches the platform.
+        if blurred == self.blurred {
+            return;
+        }
+        self.blurred = blurred;
+        window.set_background_appearance(window_background(blurred));
+        cx.notify();
     }
 
     /// A session on the agent that the agent hasn't created yet: acp-core has it created
@@ -1124,6 +1161,25 @@ const SIDEBAR_BUTTON_SIZE: Pixels = px(28.);
 /// top edge, with the traffic lights in the window's top row. Elsewhere the system
 /// title bar stays.
 const OWN_TITLE_BAR: bool = cfg!(target_os = "macos");
+
+/// Whether the window can blur what is behind it. On macOS gpui puts an
+/// `NSVisualEffectView` under its Metal layer and the window server blurs; elsewhere
+/// the window stays opaque, as gpui's blur there is a guess: Windows uses an undocumented
+/// acrylic attribute, Wayland blurs only under KDE, and X11 just turns see-through.
+const WINDOW_BLUR: bool = cfg!(target_os = "macos");
+/// How much of the blur the sidebar's and the chat's colors cover while the window is
+/// blurred. The sidebar lets more of it through, as macOS sidebars do, and the chat
+/// little enough that its text reads as well as on an opaque window.
+const BLURRED_SIDEBAR_ALPHA: f32 = 0.6;
+const BLURRED_CHAT_ALPHA: f32 = 0.85;
+
+fn window_background(blurred: bool) -> WindowBackgroundAppearance {
+    if blurred {
+        WindowBackgroundAppearance::Blurred
+    } else {
+        WindowBackgroundAppearance::Opaque
+    }
+}
 
 /// Where the traffic lights go, and the top row that holds them, with as much space to
 /// the lights' left and below them as above.
@@ -1752,6 +1808,10 @@ fn model_panel(
     })
 }
 
+/// How wide a mode's name and description may run, each on one line. Codex's longest
+/// description is about 500px; anything past this is cut short with an ellipsis.
+const MODE_TEXT_MAX_WIDTH: Pixels = px(560.);
+
 /// A row of the mode menu: the mode's icon and name, what it does below the name, and
 /// a check after the current mode. The icon and the check sit level with the name.
 fn mode_item(choice: &SettingChoice, current: bool) -> PopupMenuItem {
@@ -1772,6 +1832,12 @@ fn mode_item(choice: &SettingChoice, current: bool) -> PopupMenuItem {
                 v_flex()
                     .flex_1()
                     .min_w(px(0.))
+                    // The cap has to be here, not on the menu: asked for its narrowest
+                    // width, gpui's text answers with its whole line, so a row under a
+                    // narrower menu keeps that width and runs past the menu's edge.
+                    .max_w(MODE_TEXT_MAX_WIDTH)
+                    .whitespace_nowrap()
+                    .text_ellipsis()
                     .child(div().line_height(px(20.)).child(name.clone()))
                     .children(
                         description.clone().map(|description| {
@@ -1779,7 +1845,7 @@ fn mode_item(choice: &SettingChoice, current: bool) -> PopupMenuItem {
                         }),
                     ),
             )
-            // Kept when empty, so every row's text wraps at the same width.
+            // Kept when empty, so every row leaves its text the same room.
             .child(line().w(px(12.)).ml_1().when(current, |line| {
                 line.child(Icon::new(IconName::Check).xsmall())
             }))
@@ -1991,9 +2057,10 @@ impl ChatView {
         let setting = setting.clone();
         mode_button(&setting)
             .cursor_pointer()
-            .dropdown_menu_with_anchor(Anchor::BottomLeft, move |menu, _, _| {
-                // Wide enough for most descriptions on one line; longer ones wrap.
-                let menu = menu.min_w(px(260.)).max_w(px(360.));
+            .dropdown_menu_with_anchor(Anchor::BottomLeft, move |menu, window, _| {
+                // As wide as its widest row; `mode_item` caps how wide a row gets.
+                // Left unset, gpui-component's own cap is 500px, short of a long row.
+                let menu = menu.min_w(px(260.)).max_w(window.viewport_size().width);
                 setting.choices.iter().fold(menu, |menu, choice| {
                     let current = setting.value == SettingValue::Choice(choice.id.clone());
                     let (view, id, value) = (view.clone(), setting.id.clone(), choice.id.clone());
@@ -2143,6 +2210,14 @@ impl Render for ChatView {
             theme.sidebar,
             theme.input,
         );
+        let (background, sidebar) = if self.blurred {
+            (
+                background.opacity(BLURRED_CHAT_ALPHA),
+                sidebar.opacity(BLURRED_SIDEBAR_ALPHA),
+            )
+        } else {
+            (background, sidebar)
+        };
         let (muted, hover) = (theme.muted_foreground, theme.secondary);
         let motion = theme.motion_tokens();
         let slide = Transition::new(motion.duration_slow).easing(motion.easing_move.clone());
@@ -2310,7 +2385,6 @@ impl Render for ChatView {
             .size_full()
             .relative()
             .flex()
-            .bg(sidebar)
             .text_color(foreground)
             // A drag of the sidebar's edge can leave the edge's own band within a pixel,
             // so the whole window follows it: the sidebar ends where the pointer is.
@@ -2339,11 +2413,14 @@ impl Render for ChatView {
             })
             .child(
                 // The sidebar keeps its width and slides out to the left as this narrows.
+                // Its color stops here, so that while the window is blurred it isn't
+                // also under the chat's.
                 div()
                     .flex_none()
                     .h_full()
                     .w(sidebar_width)
                     .overflow_hidden()
+                    .bg(sidebar)
                     .child(
                         self.render_sidebar(title_bar, cx)
                             .ml(sidebar_width - self.sidebar_width),
@@ -2644,6 +2721,9 @@ fn main() {
                 theme.dark_theme = with_panel_colors(&theme.dark_theme, "#111111", "#151515");
             });
             let lights = TrafficLights::new(traffic_light_size());
+            // Blurred from the start, where the platform can blur. The window opens that
+            // way, so its first frame already is.
+            let blur = WINDOW_BLUR;
             let options = WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
                     None,
@@ -2659,9 +2739,13 @@ fn main() {
                 // does it from the strip around the traffic lights, and on macOS 27 it
                 // holds back every click there while it waits for a double-click.
                 app_owns_titlebar_drag: OWN_TITLE_BAR,
+                window_background: window_background(blur),
                 ..Default::default()
             };
-            gpui_kit::open_window(options, cx, |window, cx| {
+            // What `gpui_kit::open_window` does, but the root paints no background of its
+            // own: the chat view paints every surface, and the root's opaque one under
+            // them would hide the blur.
+            cx.open_window(options, |window, cx| {
                 // Light or dark as the system is set, and again whenever that setting changes.
                 Theme::sync_system_appearance(Some(window), cx);
                 window
@@ -2670,7 +2754,10 @@ fn main() {
                     })
                     .detach();
                 let lights_end = lights.end(window);
-                cx.new(|cx| ChatView::new(agents, cwd, lights.row_height, lights_end, window, cx))
+                let view = cx.new(|cx| {
+                    ChatView::new(agents, cwd, blur, lights.row_height, lights_end, window, cx)
+                });
+                cx.new(|cx| gpui_kit::base::Root::new(view, window, cx).bg(transparent_black()))
             })
             .expect("failed to open the window");
             cx.activate(true);
