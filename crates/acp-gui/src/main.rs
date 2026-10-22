@@ -398,12 +398,14 @@ impl ChatView {
         let Some(SettingValue::Switch(on)) = shown else {
             return;
         };
-        session.flipped.insert(setting.clone(), !on);
-        let _ = self.commands.try_send(Command::ChangeSetting(
-            key,
-            setting,
-            SettingValue::Switch(!on),
-        ));
+        let change = Command::ChangeSetting(key, setting.clone(), SettingValue::Switch(!on));
+        // With the agent gone, no answer would ever put the switch right.
+        if self.commands.try_send(change).is_err() {
+            return;
+        }
+        if let Some(session) = self.session_mut(key) {
+            session.flipped.insert(setting, !on);
+        }
         cx.notify();
     }
 
@@ -518,8 +520,10 @@ impl ChatView {
             AgentEvent::Closed => {
                 for session in &mut self.sessions {
                     session.busy = true;
-                    // A turn cut off with the connection may never report its end.
+                    // A turn cut off with the connection may never report its end, nor
+                    // a setting change its answer.
                     session.cancel_open_permissions(cx);
+                    session.flipped.clear();
                 }
             }
         }
