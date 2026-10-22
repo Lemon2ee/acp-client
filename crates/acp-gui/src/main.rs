@@ -1633,10 +1633,9 @@ fn model_panel(
     })
 }
 
-/// How wide a mode's name and description run before they wrap. Most descriptions fit
-/// on one line; with the icon, the check and the menu's padding, the menu is at most
-/// about 390px wide.
-const MODE_TEXT_MAX_WIDTH: Pixels = px(320.);
+/// How wide a mode's name and description may run, each on one line. Codex's longest
+/// description is about 500px; anything past this is cut short with an ellipsis.
+const MODE_TEXT_MAX_WIDTH: Pixels = px(560.);
 
 /// A row of the mode menu: the mode's icon and name, what it does below the name, and
 /// a check after the current mode. The icon and the check sit level with the name.
@@ -1662,6 +1661,8 @@ fn mode_item(choice: &SettingChoice, current: bool) -> PopupMenuItem {
                     // width, gpui's text answers with its whole line, so a row under a
                     // narrower menu keeps that width and runs past the menu's edge.
                     .max_w(MODE_TEXT_MAX_WIDTH)
+                    .whitespace_nowrap()
+                    .text_ellipsis()
                     .child(div().line_height(px(20.)).child(name.clone()))
                     .children(
                         description.clone().map(|description| {
@@ -1669,7 +1670,7 @@ fn mode_item(choice: &SettingChoice, current: bool) -> PopupMenuItem {
                         }),
                     ),
             )
-            // Kept when empty, so every row's text wraps at the same width.
+            // Kept when empty, so every row leaves its text the same room.
             .child(line().w(px(12.)).ml_1().when(current, |line| {
                 line.child(Icon::new(IconName::Check).xsmall())
             }))
@@ -1881,9 +1882,10 @@ impl ChatView {
         let setting = setting.clone();
         mode_button(&setting)
             .cursor_pointer()
-            .dropdown_menu_with_anchor(Anchor::BottomLeft, move |menu, _, _| {
+            .dropdown_menu_with_anchor(Anchor::BottomLeft, move |menu, window, _| {
                 // As wide as its widest row; `mode_item` caps how wide a row gets.
-                let menu = menu.min_w(px(260.));
+                // Left unset, gpui-component's own cap is 500px, short of a long row.
+                let menu = menu.min_w(px(260.)).max_w(window.viewport_size().width);
                 setting.choices.iter().fold(menu, |menu, choice| {
                     let current = setting.value == SettingValue::Choice(choice.id.clone());
                     let (view, id, value) = (view.clone(), setting.id.clone(), choice.id.clone());
