@@ -14,13 +14,15 @@ use acp_core::{
 };
 use gpui_kit::base::input::Copy;
 use gpui_kit::base::{HandleEdge, SelectableText, TextSelection, Transition, transition};
-use gpui_kit::component::button::{Button, ButtonCustomVariant, ButtonVariants as _};
+use gpui_kit::component::button::{
+    Button, ButtonCustomVariant, ButtonVariant, ButtonVariants as _,
+};
 use gpui_kit::component::input::{
-    Input, InputEvent, InputGroup, InputGroupAddon, InputGroupAddonAlignment, InputGroupButton,
-    InputState, Textarea, TextareaState,
+    Escape, Input, InputEvent, InputGroup, InputGroupAddon, InputGroupAddonAlignment,
+    InputGroupButton, InputState, Textarea, TextareaState,
 };
 use gpui_kit::component::kbd::Kbd;
-use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
+use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::message_scroller::{MessageScroller, MessageScrollerState};
 use gpui_kit::component::popover::{Popover, PopoverState};
 use gpui_kit::component::switch::Switch;
@@ -29,7 +31,7 @@ use gpui_kit::component::text::{TextView, TextViewState};
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{
     ActiveTheme as _, FocusableExt as _, Icon, IconName, Sizable as _, Theme, ThemeConfig,
-    ThemeMode, h_flex, resize_handle, v_flex,
+    ThemeMode, WindowExt as _, h_flex, resize_handle, v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -83,6 +85,8 @@ struct Session {
     /// The agent's id for it, once the agent has it, which keeps it for later runs.
     id: Option<String>,
     origin: Origin,
+    /// In the sidebar's Archived list, out of the way.
+    archived: bool,
 }
 
 /// Which run a session's agent session comes from.
@@ -92,8 +96,9 @@ enum Origin {
     /// An earlier one, and the agent hasn't been asked to load it yet: the folder it
     /// was created in, which loading it needs. It loads as it first shows.
     Saved(PathBuf),
-    /// An earlier one, and the agent has been asked to load it.
-    Loaded,
+    /// An earlier one, and the agent has been asked to load it: the folder it was
+    /// created in.
+    Loaded(PathBuf),
 }
 
 /// A setting changed here, until the agent has answered every change it was asked for.
@@ -119,6 +124,7 @@ impl Session {
             asked: HashMap::new(),
             id: None,
             origin: Origin::New,
+            archived: false,
         }
     }
 
@@ -339,6 +345,13 @@ struct AgentSlot {
     _events: Task<()>,
 }
 
+/// A field on a session's sidebar card for changing its name.
+struct Renaming {
+    key: SessionKey,
+    input: Entity<InputState>,
+    _events: Subscription,
+}
+
 struct ChatView {
     /// Never empty: the window starts with the sessions kept from earlier runs, oldest
     /// first, and one new session, which its first prompt has the agent create. At most
@@ -360,6 +373,8 @@ struct ChatView {
     /// Where the traffic lights end, from the window's left edge.
     traffic_lights_end: Pixels,
     sidebar_open: bool,
+    /// The sidebar's list of archived sessions is open.
+    archived_open: bool,
     /// How wide the sidebar is while shown. Dragged at its right edge.
     sidebar_width: Pixels,
     model_panel: ModelPanelState,
@@ -379,6 +394,8 @@ struct ChatView {
     /// Holds keyboard focus while the settings are open, so Esc and Cmd+, reach them:
     /// the prompt box, which has it otherwise, isn't drawn then.
     settings_focus: FocusHandle,
+    /// The session whose name is being changed on its sidebar card.
+    renaming: Option<Renaming>,
     _input_events: Subscription,
     _search_events: Subscription,
     _bounds_events: Subscription,
@@ -488,6 +505,7 @@ impl ChatView {
             title_bar_height,
             traffic_lights_end,
             sidebar_open: true,
+            archived_open: false,
             sidebar_width: SIDEBAR_WIDTH,
             model_panel: ModelPanelState {
                 tab: ModelTab::Favorites,
@@ -499,6 +517,7 @@ impl ChatView {
             settings_open: false,
             settings_page: SettingsPage::General,
             settings_focus: cx.focus_handle(),
+            renaming: None,
             _input_events: input_events,
             _search_events: search_events,
             _bounds_events: bounds_events,
@@ -529,6 +548,7 @@ impl ChatView {
             session.title = Some(saved.title);
             session.id = Some(saved.id);
             session.origin = Origin::Saved(saved.cwd);
+            session.archived = saved.archived;
             self.sessions.push(session);
         }
     }
@@ -541,7 +561,7 @@ impl ChatView {
             return;
         };
         let load = Command::LoadSession(session.key, id.clone(), cwd.clone());
-        session.origin = Origin::Loaded;
+        session.origin = Origin::Loaded(cwd.clone());
         session.busy = true;
         let slot = &self.agents[session.agent];
         if slot.commands.try_send(load).is_err() {
@@ -571,6 +591,7 @@ impl ChatView {
             id: id.clone(),
             title: title.clone(),
             cwd: self.cwd.clone(),
+            archived: session.archived,
         };
         let changed = config_folder()
             .ok_or_else(|| std::io::Error::other("there is no config folder"))
@@ -791,6 +812,213 @@ impl ChatView {
             });
         }
         self.input.update(cx, |input, cx| input.focus(window, cx));
+        cx.notify();
+    }
+
+    /// Puts a field for the session's name on its sidebar card, with the name selected.
+    /// Enter, or focus going elsewhere, keeps what was typed; Escape drops it.
+    fn start_rename(&mut self, key: SessionKey, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(title) = self.session(key).and_then(|session| session.title.clone()) else {
+            return;
+        };
+        // Before the new field takes focus: the old one's blur would come after this
+        // returns, and close the new one instead.
+        self.finish_rename(true, cx);
+        let input = cx.new(|cx| InputState::new(window, cx).default_value(title));
+        let events = cx.subscribe_in(&input, window, |this, _, event, window, cx| match event {
+            InputEvent::PressEnter { .. } => {
+                this.finish_rename(true, cx);
+                this.input.update(cx, |input, cx| input.focus(window, cx));
+            }
+            InputEvent::Blur => this.finish_rename(true, cx),
+            _ => {}
+        });
+        input.update(cx, |input, cx| {
+            input.focus(window, cx);
+            input.select_all(window, cx);
+        });
+        self.renaming = Some(Renaming {
+            key,
+            input,
+            _events: events,
+        });
+        cx.notify();
+    }
+
+    /// Closes the name field. With `keep`, the session takes the name typed, unless it
+    /// is blank, and a session kept for later runs keeps it there too; one its agent
+    /// hasn't given an id yet is kept with it once the agent does.
+    fn finish_rename(&mut self, keep: bool, cx: &mut Context<Self>) {
+        let Some(renaming) = self.renaming.take() else {
+            return;
+        };
+        cx.notify();
+        let title = renaming.input.read(cx).value().trim().to_string();
+        let Some(session) = self.session_mut(renaming.key) else {
+            return;
+        };
+        if !keep || title.is_empty() || session.title.as_ref() == Some(&title) {
+            return;
+        }
+        session.title = Some(title.clone());
+        self.change_kept(renaming.key, |saved| saved.title = title);
+    }
+
+    /// Makes `change` to the session as kept for later runs, if it is kept already.
+    /// One whose agent hasn't given it an id yet is kept as it stands once the agent does.
+    fn change_kept(&self, key: SessionKey, change: impl FnOnce(&mut SavedSession)) {
+        let Some(session) = self.session(key) else {
+            return;
+        };
+        let (Some(id), Some(agent)) = (&session.id, kept_name(&self.agents[session.agent].name))
+        else {
+            return;
+        };
+        let changed = config_folder()
+            .ok_or_else(|| std::io::Error::other("there is no config folder"))
+            .and_then(|folder| {
+                change_saved_sessions(&folder, |sessions| {
+                    let kept = sessions
+                        .iter_mut()
+                        .find(|saved| saved.agent == agent && saved.id == *id);
+                    if let Some(saved) = kept {
+                        change(saved);
+                    }
+                })
+            });
+        if let Err(err) = changed {
+            eprintln!("couldn't change the session kept for later runs: {err}");
+        }
+    }
+
+    /// Moves the session to the sidebar's Archived list, or back out of it. On screen,
+    /// an archived session gives way as a deleted one does.
+    fn set_archived(
+        &mut self,
+        key: SessionKey,
+        archived: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(ix) = self.sessions.iter().position(|session| session.key == key) else {
+            return;
+        };
+        if self.sessions[ix].archived == archived {
+            return;
+        }
+        self.sessions[ix].archived = archived;
+        self.change_kept(key, |saved| saved.archived = archived);
+        if archived {
+            if ix == self.active {
+                let next = self.untitled_on(self.sessions[ix].agent, cx);
+                self.show(next, window, cx);
+            }
+            self.put_away(ix, cx);
+            // Its agent may have no session on show now.
+            self.make_spares(cx);
+        }
+        cx.notify();
+    }
+
+    /// Has the agent close the session at `ix`, which is kept for later runs, so it holds
+    /// nothing for it: Claude's adapter keeps a Claude Code process for each session. The
+    /// session is then as it was after a restart, and loads again as it next shows. One
+    /// not kept, or with a turn running, stays open: closing it would lose it, or stop the
+    /// turn.
+    fn put_away(&mut self, ix: usize, cx: &mut App) {
+        let session = &self.sessions[ix];
+        let folder = match &session.origin {
+            Origin::New => self.cwd.clone(),
+            Origin::Saved(_) => return,
+            Origin::Loaded(folder) => folder.clone(),
+        };
+        let kept = kept_name(&self.agents[session.agent].name).is_some();
+        if session.busy || session.id.is_none() || !kept {
+            return;
+        }
+        // Under a new key, so nothing the agent still sends for the old one lands on it.
+        let mut fresh = Session::new(SessionKey(self.next_key), session.agent, cx);
+        self.next_key += 1;
+        fresh.title = session.title.clone();
+        fresh.id = session.id.clone();
+        fresh.origin = Origin::Saved(folder);
+        fresh.archived = session.archived;
+        let old = std::mem::replace(&mut self.sessions[ix], fresh);
+        self.sessions[ix].draft = old.draft;
+        let _ = self.agents[old.agent]
+            .commands
+            .try_send(Command::CloseSession(old.key));
+    }
+
+    /// Asks before deleting the session, as nothing brings it back.
+    fn confirm_delete(&mut self, key: SessionKey, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(title) = self.session(key).and_then(|session| session.title.clone()) else {
+            return;
+        };
+        let title = SharedString::from(format!("Delete “{title}”?"));
+        let view = cx.entity().downgrade();
+        // The dialog gives focus back to what had it as it opened, which is otherwise the
+        // menu it was opened from, gone by the time the dialog closes.
+        self.input.update(cx, |input, cx| input.focus(window, cx));
+        window.open_alert_dialog(cx, move |dialog, _, _| {
+            let view = view.clone();
+            dialog
+                .title(title.clone())
+                .description("The agent is asked to delete it too. This can't be undone.")
+                .show_cancel(true)
+                .ok_text("Delete")
+                .ok_variant(ButtonVariant::Danger)
+                .on_ok(move |_, window, cx| {
+                    let _ = view.update(cx, |this, cx| this.delete_session(key, window, cx));
+                    true
+                })
+        });
+    }
+
+    /// Takes the session out of the window and out of those kept for later runs, and
+    /// has its agent close and delete it. On screen, the session with no prompt yet on
+    /// its agent takes its place.
+    fn delete_session(&mut self, key: SessionKey, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(ix) = self.sessions.iter().position(|session| session.key == key) else {
+            return;
+        };
+        if self
+            .renaming
+            .as_ref()
+            .is_some_and(|renaming| renaming.key == key)
+        {
+            self.finish_rename(false, cx);
+        }
+        if ix == self.active {
+            let next = self.untitled_on(self.sessions[ix].agent, cx);
+            self.show(next, window, cx);
+        }
+        let session = self.sessions.remove(ix);
+        if ix < self.active {
+            self.active -= 1;
+        }
+        let slot = &self.agents[session.agent];
+        let command = match session.id.clone() {
+            Some(id) => Command::DeleteSession(session.key, id),
+            // The agent is still creating it, and has nothing of it to delete: its first
+            // prompt never runs.
+            None => Command::CloseSession(session.key),
+        };
+        let _ = slot.commands.try_send(command);
+        if let (Some(id), Some(agent)) = (session.id, kept_name(&slot.name)) {
+            let changed = config_folder()
+                .ok_or_else(|| std::io::Error::other("there is no config folder"))
+                .and_then(|folder| {
+                    change_saved_sessions(&folder, |sessions| {
+                        sessions.retain(|saved| saved.agent != agent || saved.id != id)
+                    })
+                });
+            if let Err(err) = changed {
+                eprintln!("couldn't drop the deleted session from those kept: {err}");
+            }
+        }
+        // Its agent may have no session on show now.
+        self.make_spares(cx);
         cx.notify();
     }
 
@@ -2520,45 +2748,150 @@ impl ChatView {
             .into_any_element()
     }
 
+    /// A session's card in the sidebar: its name, or the field to change it. The session
+    /// on screen gets a filled card.
+    fn render_card(&self, ix: usize, title: String, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme();
+        let (accent, accent_foreground) = (theme.sidebar_accent, theme.sidebar_accent_foreground);
+        let (ring, muted) = (theme.ring, theme.muted_foreground);
+        let key = self.sessions[ix].key;
+        let archived = self.sessions[ix].archived;
+        let card = div()
+            .id(ElementId::Name(format!("session-{}", key.0).into()))
+            .h(px(32.))
+            .px_3()
+            .flex()
+            .items_center()
+            .rounded_md()
+            .text_sm()
+            .map(|card| {
+                if ix == self.active {
+                    card.bg(accent)
+                        .text_color(accent_foreground)
+                        .font_weight(FontWeight::MEDIUM)
+                } else {
+                    card.hover(|style| style.bg(accent.opacity(0.5)))
+                        .when(archived, |card| card.text_color(muted))
+                }
+            });
+        if let Some(renaming) = self
+            .renaming
+            .as_ref()
+            .filter(|renaming| renaming.key == key)
+        {
+            // The name's own text, plain and in place, inside a ring drawn within
+            // the card so nothing moves.
+            return card
+                .shadow(vec![
+                    BoxShadow::new(px(0.), px(0.), ring)
+                        .spread_radius(px(1.))
+                        .inset(),
+                ])
+                .child(Input::new(&renaming.input).appearance(false).small().p_0())
+                .on_action(cx.listener(|this, _: &Escape, window, cx| {
+                    this.finish_rename(false, cx);
+                    this.input.update(cx, |input, cx| input.focus(window, cx));
+                }))
+                // A click on the chat takes no focus from the field, so it
+                // wouldn't close it otherwise.
+                .on_mouse_down_out(
+                    cx.listener(|this, _: &MouseDownEvent, _, cx| this.finish_rename(true, cx)),
+                )
+                .into_any_element();
+        }
+        let title = SharedString::from(title);
+        let view = cx.entity().downgrade();
+        card.role(Role::Button)
+            .aria_label(title.clone())
+            .cursor_pointer()
+            .child(div().flex_1().min_w(px(0.)).truncate().child(title))
+            .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                // The first click of the two has shown the session already.
+                if event.click_count() == 2 {
+                    this.start_rename(key, window, cx)
+                } else {
+                    this.select(key, window, cx)
+                }
+            }))
+            .context_menu(move |menu, _, _| {
+                let (rename, archive, delete) = (view.clone(), view.clone(), view.clone());
+                let archive_label = if archived { "Unarchive" } else { "Archive" };
+                menu.item(PopupMenuItem::new("Rename").on_click(move |_, window, cx| {
+                    let _ = rename.update(cx, |this, cx| this.start_rename(key, window, cx));
+                }))
+                .item(
+                    PopupMenuItem::new(archive_label).on_click(move |_, window, cx| {
+                        let _ = archive
+                            .update(cx, |this, cx| this.set_archived(key, !archived, window, cx));
+                    }),
+                )
+                .item(
+                    PopupMenuItem::new("Delete…").on_click(move |_, window, cx| {
+                        let _ = delete.update(cx, |this, cx| this.confirm_delete(key, window, cx));
+                    }),
+                )
+            })
+            .into_any_element()
+    }
+
     fn render_sidebar(&self, title_bar: bool, cx: &mut Context<Self>) -> Div {
         let theme = cx.theme();
-        let (foreground, hover) = (theme.sidebar_foreground, theme.secondary);
-        let (accent, accent_foreground) = (theme.sidebar_accent, theme.sidebar_accent_foreground);
-        // Newest first; the session on screen gets a filled card. The one with no prompt
-        // yet has none: the agent hasn't created it, and it may give way to another.
-        let cards = self
-            .sessions
-            .iter()
-            .enumerate()
-            .rev()
-            .filter_map(|(ix, session)| Some((ix, session.key, session.title.clone()?)))
-            .map(|(ix, key, title)| {
-                let title = SharedString::from(title);
-                div()
-                    .id(ElementId::Name(format!("session-{}", key.0).into()))
-                    .role(Role::Button)
-                    .aria_label(title.clone())
-                    .h(px(32.))
-                    .px_3()
-                    .flex()
-                    .items_center()
-                    .rounded_md()
-                    .text_sm()
-                    .cursor_pointer()
-                    .map(|card| {
-                        if ix == self.active {
-                            card.bg(accent)
-                                .text_color(accent_foreground)
-                                .font_weight(FontWeight::MEDIUM)
-                        } else {
-                            card.hover(|style| style.bg(accent.opacity(0.5)))
-                        }
+        let (foreground, hover, muted) = (
+            theme.sidebar_foreground,
+            theme.secondary,
+            theme.muted_foreground,
+        );
+        // Newest first. The session with no prompt yet has no card: the agent hasn't
+        // created it, and it may give way to another.
+        let (mut cards, mut archived) = (Vec::new(), Vec::new());
+        for (ix, session) in self.sessions.iter().enumerate().rev() {
+            let Some(title) = session.title.clone() else {
+                continue;
+            };
+            let list = if session.archived {
+                &mut archived
+            } else {
+                &mut cards
+            };
+            list.push(self.render_card(ix, title, cx));
+        }
+        // Closed, the list shows only that there are archived sessions.
+        let archived_list = (!archived.is_empty()).then(|| {
+            let open = self.archived_open;
+            div()
+                .id("archived")
+                .role(Role::Button)
+                .aria_label(if open {
+                    "Hide archived sessions"
+                } else {
+                    "Show archived sessions"
+                })
+                .h(px(32.))
+                .mt_2()
+                .px_3()
+                .flex()
+                .flex_none()
+                .items_center()
+                .gap_1()
+                .rounded_md()
+                .text_xs()
+                .text_color(muted)
+                .cursor_pointer()
+                .hover(|style| style.bg(hover))
+                .child("Archived")
+                .child(
+                    Icon::new(if open {
+                        IconName::ChevronDown
+                    } else {
+                        IconName::ChevronRight
                     })
-                    .child(div().flex_1().min_w(px(0.)).truncate().child(title))
-                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                        this.select(key, window, cx)
-                    }))
-            });
+                    .xsmall(),
+                )
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                    this.archived_open = !this.archived_open;
+                    cx.notify();
+                }))
+        });
         div()
             .w(self.sidebar_width)
             .flex_none()
@@ -2620,7 +2953,9 @@ impl ChatView {
                             .flex_col()
                             .gap_0p5()
                             .overflow_y_scroll()
-                            .children(cards),
+                            .children(cards)
+                            .children(archived_list)
+                            .when(self.archived_open, |list| list.children(archived)),
                     )
                     .child(
                         div()
@@ -3678,6 +4013,9 @@ struct SavedSession {
     title: String,
     /// The folder the agent created it in, which loading it needs.
     cwd: PathBuf,
+    /// In the sidebar's Archived list. Missing from files written before there was one.
+    #[serde(default)]
+    archived: bool,
 }
 
 /// A file that is missing or can't be read gives none.
