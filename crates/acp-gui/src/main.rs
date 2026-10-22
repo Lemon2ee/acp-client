@@ -102,13 +102,6 @@ impl Session {
         }
     }
 
-    /// What the session is called on its card and above its chat.
-    fn name(&self) -> SharedString {
-        self.title
-            .clone()
-            .map_or("Untitled".into(), SharedString::from)
-    }
-
     /// A setting as it shows: a switch flipped here shows the value last asked for until
     /// the agent has answered all its changes.
     fn shown(&self, setting: &Setting) -> Setting {
@@ -1933,7 +1926,8 @@ impl ChatView {
         let cards =
             self.sessions.iter().enumerate().rev().map(|(ix, session)| {
                 let key = session.key;
-                let title = session.name();
+                let title =
+                    SharedString::from(session.title.clone().unwrap_or_else(|| "Untitled".into()));
                 div()
                     .id(ElementId::Name(format!("session-{}", key.0).into()))
                     .role(Role::Button)
@@ -2098,8 +2092,8 @@ impl Render for ChatView {
         } else {
             px(14.25)
         };
-        // None while the window has no session to show.
-        let name = self.sessions.get(self.active).map(Session::name);
+        // A session has no name until its first prompt, and the row stays empty till then.
+        let name = session.title.clone();
         // Level with the transcript's text, until the sidebar sliding away brings the
         // name up to the sidebar button; from there it stays 6px past the button.
         let name_left = (toggle_left + SIDEBAR_BUTTON_SIZE + px(6.) - sidebar_width).max(px(16.));
