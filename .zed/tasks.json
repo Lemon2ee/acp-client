@@ -1,5 +1,10 @@
 [
   {
+    "label": "acp-gui: claude + codex",
+    "command": "cargo",
+    "args": ["run", "-p", "acp-gui"]
+  },
+  {
     "label": "acp-gui: claude",
     "command": "cargo",
     "args": ["run", "-p", "acp-gui", "--", "claude"]

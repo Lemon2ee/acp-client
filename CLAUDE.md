@@ -22,6 +22,7 @@ Keep it that way until a file clearly needs splitting.
 ## Running and checking
 
 ```bash
+cargo run -p acp-gui                # Claude and Codex, picked between from the model menu
 cargo run -p acp-gui -- claude     # or: codex, or "<any shell-style agent command>"
 cargo run -p acp-cli -- claude
 cargo clippy --workspace --all-targets

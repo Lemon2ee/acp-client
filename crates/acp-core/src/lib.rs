@@ -46,6 +46,9 @@ pub enum Command {
     /// Sets one of the session's settings, by id, during a turn or not. Answered with
     /// `SettingChanged`, or `SettingFailed`; a prompt sent after it waits for the answer.
     ChangeSetting(SessionKey, String, SettingValue),
+    /// Drops the session: no more of its commands are taken, and no more of its events
+    /// come once its task has ended. A turn in flight is left to the agent.
+    CloseSession(SessionKey),
 }
 
 /// What the agent reports, flattened for display.
@@ -198,6 +201,34 @@ enum SessionCommand {
 const CLAUDE_ADAPTER: &str = "npx -y @agentclientprotocol/claude-agent-acp@0.94.0";
 const CODEX_ADAPTER: &str = "npx -y @agentclientprotocol/codex-acp@2.2.2";
 
+/// An agent the client knows how to start: Claude Code or Codex, through its official
+/// ACP adapter. A front end can run one of each and let the user pick between them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Harness {
+    Claude,
+    Codex,
+}
+
+impl Harness {
+    pub const ALL: [Harness; 2] = [Harness::Claude, Harness::Codex];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Harness::Claude => "Claude",
+            Harness::Codex => "Codex",
+        }
+    }
+
+    pub fn agent(self) -> AcpAgent {
+        match self {
+            Harness::Claude => CLAUDE_ADAPTER,
+            Harness::Codex => CODEX_ADAPTER,
+        }
+        .parse()
+        .expect("the adapter commands are well-formed")
+    }
+}
+
 /// `claude` and `codex` map to the official ACP adapters; anything else is run as a shell-style command.
 pub fn agent_for(name: &str) -> Result<AcpAgent, Error> {
     match name {
@@ -289,6 +320,11 @@ async fn run(
                             Command::Cancel(key) => (key, SessionCommand::Cancel),
                             Command::ChangeSetting(key, setting, value) => {
                                 (key, SessionCommand::ChangeSetting(setting, value))
+                            }
+                            Command::CloseSession(key) => {
+                                // Its task ends once it finds its queue closed.
+                                sessions.remove(&key);
+                                continue;
                             }
                         };
                         if let Some(session) = sessions.get(&key) {
