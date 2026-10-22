@@ -43,7 +43,8 @@ gpui_kit::assets::icon_assets!(
         Terminal,
         Lightbulb,
         ToggleRight,
-        Wrench
+        Wrench,
+        Layers
     ]
 );
 

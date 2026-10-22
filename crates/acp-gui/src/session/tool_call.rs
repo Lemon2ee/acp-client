@@ -32,7 +32,7 @@ pub(crate) struct ToolCall {
     pub(crate) removed: usize,
     /// When it came in, in a live turn. ACP sends no times, so a call a loaded session
     /// replays has none and shows no duration.
-    started: Option<Instant>,
+    pub(crate) started: Option<Instant>,
     /// How long it ran, from coming in to first finishing.
     pub(crate) took: Option<Duration>,
     /// The user has opened it to show its content.

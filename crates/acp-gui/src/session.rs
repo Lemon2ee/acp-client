@@ -6,6 +6,7 @@ mod pacing;
 mod tool_call;
 
 use std::collections::HashMap;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -83,6 +84,9 @@ pub(crate) struct Session {
     /// The agent's text in a live turn, held back to show at an even pace, and the
     /// transcript's events that came after it.
     pacer: Pacer,
+    /// Groups of tool calls the user opened or closed, by their first row, which keep
+    /// that rather than opening and closing with the turn.
+    groups_set: HashMap<usize, bool>,
 }
 
 /// Which run a session's agent session comes from.
@@ -126,6 +130,7 @@ impl Session {
             entering: HashMap::new(),
             changed: Instant::now(),
             pacer: Pacer::default(),
+            groups_set: HashMap::new(),
         }
     }
 
@@ -139,6 +144,10 @@ impl Session {
         self.live = live;
         if self.waiting() != waiting {
             self.remeasure(self.rows.len() - 1, cx);
+        }
+        // A group of tool calls the turn ended on closes.
+        if !live {
+            self.remeasure_tail_group(cx);
         }
     }
 
@@ -423,6 +432,57 @@ impl Session {
         }
     }
 
+    /// The run of tool calls with no other row between them that the one at `ix` is in.
+    pub(crate) fn tool_group(&self, ix: usize) -> Range<usize> {
+        let is_tool = |row: &Row| matches!(row, Row::Tool(_));
+        let start = self.rows[..ix]
+            .iter()
+            .rposition(|row| !is_tool(row))
+            .map_or(0, |before| before + 1);
+        let end = self.rows[ix..]
+            .iter()
+            .position(|row| !is_tool(row))
+            .map_or(self.rows.len(), |after| ix + after);
+        start..end
+    }
+
+    /// Whether a group of tool calls shows its calls: as the user left it, or else while
+    /// it is the latest thing in a live turn, so the calls show as they run and fold once
+    /// the agent writes again.
+    pub(crate) fn group_open(&self, group: &Range<usize>) -> bool {
+        self.groups_set
+            .get(&group.start)
+            .copied()
+            .unwrap_or(self.live && group.end == self.rows.len())
+    }
+
+    /// Opens or closes the group of tool calls that starts at `first`, for good.
+    pub(crate) fn toggle_tool_group(&mut self, first: usize, cx: &mut App) {
+        let group = self.tool_group(first);
+        let open = !self.group_open(&group);
+        self.groups_set.insert(group.start, open);
+        for ix in group {
+            self.remeasure(ix, cx);
+        }
+    }
+
+    /// Has the group of tool calls at the end measured again, as it is about to close by
+    /// itself: rows of it out of view would otherwise keep their open height.
+    fn remeasure_tail_group(&mut self, cx: &mut App) {
+        let Some(last) = self.rows.len().checked_sub(1) else {
+            return;
+        };
+        if !matches!(self.rows[last], Row::Tool(_)) {
+            return;
+        }
+        let group = self.tool_group(last);
+        if !self.groups_set.contains_key(&group.start) {
+            for ix in group {
+                self.remeasure(ix, cx);
+            }
+        }
+    }
+
     /// The folder the agent works in for it, where it comes from an earlier run; a new
     /// one works in the window's.
     pub(crate) fn folder(&self) -> Option<&Path> {
@@ -507,6 +567,10 @@ impl Session {
     }
 
     pub(crate) fn push(&mut self, row: Row, cx: &mut App) {
+        // A group of tool calls closes once the agent goes on to something else.
+        if !matches!(row, Row::Tool(_)) {
+            self.remeasure_tail_group(cx);
+        }
         let now = Instant::now();
         if self.live {
             self.entering.insert(self.rows.len(), now);

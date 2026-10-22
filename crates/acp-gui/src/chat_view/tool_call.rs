@@ -3,6 +3,7 @@
 
 use std::cell::Cell;
 use std::f32::consts::FRAC_PI_2;
+use std::ops::Range;
 use std::path::Path;
 use std::rc::Rc;
 use std::time::Duration;
@@ -28,8 +29,10 @@ const ROW_HEIGHT: Pixels = px(28.);
 const ROW_INSET: Pixels = px(10.);
 const ROW_PAD: Pixels = px(6.);
 const ROW_RADIUS: Pixels = px(6.);
-/// Between a row and the one before or after it.
+/// Between a row or a group and what comes before or after it.
 const ROW_GAP: Pixels = px(4.);
+/// How far a group's calls sit in from its header, which puts their icons under its title.
+const GROUP_INDENT: Pixels = px(22.);
 const ROW_LINE_HEIGHT: Pixels = px(20.);
 const ICON_SIZE: Pixels = px(14.);
 const CHEVRON_SIZE: Pixels = px(12.);
@@ -136,14 +139,110 @@ impl ToolLook {
 }
 
 impl ChatView {
-    /// The tool call at `ix` of the active session's transcript: its row, and the box with
-    /// what it shows, which opens and closes with the theme's control spring.
+    /// The tool call at `ix` of the active session's transcript. A call with others right
+    /// before or after it is drawn in their group: the first under the group's header, all
+    /// of them set in under it and shown only while the group is open.
     pub(crate) fn render_tool_call(
         &mut self,
         ix: usize,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let motion = cx.theme().motion_tokens();
+        let (control, normal, enter) = (
+            motion.spring_control,
+            motion.duration_normal,
+            motion.easing_enter.clone(),
+        );
+        let session = &self.sessions[self.active];
+        let key = session.key;
+        let group = session.tool_group(ix);
+        let id = row_id("tool", key, ix);
+        let grouped = group.len() > 1;
+        // The first call's row makes way for the header as the second call arrives, and
+        // each call moves in under it.
+        let headed = (ix == group.start).then(|| {
+            transition(
+                (id.clone(), "headed"),
+                if grouped { 1. } else { 0. },
+                Transition::new(normal).easing(enter.clone()),
+                window,
+                cx,
+            )
+        });
+        let indent = transition(
+            (id.clone(), "indent"),
+            if grouped { GROUP_INDENT.as_f32() } else { 0. },
+            Transition::new(normal).easing(enter),
+            window,
+            cx,
+        );
+        if !grouped {
+            return self
+                .render_call(ix, px(indent), window, cx)
+                .py(ROW_GAP)
+                .into_any_element();
+        }
+        let open = session.group_open(&group);
+        let group_id = row_id("tool-group", key, group.start);
+        let reveal = spring(
+            (group_id.clone(), "reveal"),
+            if open { 1. } else { 0. },
+            control,
+            window,
+            cx,
+        );
+        let last = ix + 1 == group.end;
+        let header = headed.map(|headed| {
+            let header = self.render_group_header(group.clone(), reveal, window, cx);
+            div()
+                .overflow_hidden()
+                .opacity(headed)
+                .when(headed < 1., |clip| clip.h(ROW_HEIGHT * headed))
+                .child(header)
+        });
+        let call = (reveal > 0. || open).then(|| {
+            let call = self.render_call(ix, px(indent), window, cx);
+            // A line down from the header's icon, along the calls, to the last one's middle.
+            let guide = div()
+                .absolute()
+                .left(ROW_INSET + ROW_PAD + ICON_SIZE / 2.)
+                .top_0()
+                .w(px(1.))
+                .bg(ToolLook::new(cx).line)
+                .map(|guide| {
+                    if last {
+                        guide.h(ROW_HEIGHT / 2.)
+                    } else {
+                        guide.bottom_0()
+                    }
+                });
+            reveal_clip(
+                (id.clone(), "in-group"),
+                reveal,
+                div().relative().child(guide).child(call),
+                window,
+                cx,
+            )
+        });
+        v_flex()
+            .w_full()
+            .when(ix == group.start, |item| item.pt(ROW_GAP))
+            .when(last, |item| item.pb(ROW_GAP))
+            .children(header)
+            .children(call)
+            .into_any_element()
+    }
+
+    /// One tool call: its row, set in by `indent`, and the box with what it shows, which
+    /// opens and closes with the theme's control spring.
+    fn render_call(
+        &mut self,
+        ix: usize,
+        indent: Pixels,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Div {
         let look = ToolLook::new(cx);
         let motion = cx.theme().motion_tokens();
         let (control, fast) = (motion.spring_control, motion.duration_fast);
@@ -151,7 +250,7 @@ impl ChatView {
         let session = &self.sessions[self.active];
         let key = session.key;
         let Some(Row::Tool(call)) = session.rows.get(ix) else {
-            return div().into_any_element();
+            return div();
         };
         let id = row_id("tool", key, ix);
         // Claude's adapter keeps a call pending until it finishes, sending in_progress only
@@ -201,15 +300,7 @@ impl ChatView {
             })
             .child(lead_icon(call, settled, look))
             .child(title(call, running, &mono, &id))
-            .when(expandable, |line| {
-                line.child(
-                    Icon::new(IconName::ChevronRight)
-                        .with_size(CHEVRON_SIZE)
-                        .flex_none()
-                        .text_color(look.faint)
-                        .rotate(radians(reveal * FRAC_PI_2)),
-                )
-            })
+            .when(expandable, |line| line.child(chevron(reveal, look)))
             .child(notes(call, time, time_shown, look, &mono));
         let row = if expandable {
             Button::new(id.clone())
@@ -240,37 +331,137 @@ impl ChatView {
                 .into_any_element()
         };
 
-        // The box's height as it last laid out, which it opens and closes to. Measured
-        // here rather than by the library's reveal, which lays a box out at no height the
-        // frame it first draws, so an open call scrolling into view would jump.
-        let height = window
-            .use_keyed_state((id.clone(), "height"), cx, |_, _| Rc::new(Cell::new(None)))
-            .read(cx)
-            .clone();
         // The box is only laid out while open or moving: closed, it stays out of the frame.
         let content = (reveal > 0. || call.open && expandable).then(|| {
             let folder = session.folder().unwrap_or(&self.cwd).to_path_buf();
-            let measured = height.clone();
-            let shown = content_box(call, &id, &folder, look, &mono, window, cx)
-                .on_prepaint(move |bounds, _, _| measured.set(Some(bounds.size.height)));
-            div()
-                .overflow_hidden()
-                .opacity(reveal)
-                .when(reveal < 1., |clip| {
-                    clip.h(height.get().unwrap_or_default() * reveal)
-                })
-                .child(shown)
+            let shown = content_box(call, &id, &folder, look, &mono, window, cx);
+            reveal_clip((id.clone(), "box"), reveal, shown, window, cx)
         });
         let element = v_flex()
             .w_full()
-            .py(ROW_GAP)
+            .pl(indent)
             .child(div().px(ROW_INSET).child(row))
-            .children(content)
-            .into_any_element();
+            .children(content);
         if counting.is_some() {
             self.keep_tool_clock(cx);
         }
         element
+    }
+
+    /// A group's header: what its calls did, as "Ran 2 commands, read 1 file", how many
+    /// failed and how long the group took. It opens and closes the group.
+    fn render_group_header(
+        &mut self,
+        group: Range<usize>,
+        reveal: f32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let look = ToolLook::new(cx);
+        let fast = cx.theme().motion_tokens().duration_fast;
+        let session = &self.sessions[self.active];
+        let key = session.key;
+        let live = session.is_live();
+        let calls: Vec<&ToolCall> = session.rows[group.clone()]
+            .iter()
+            .filter_map(|row| match row {
+                Row::Tool(call) => Some(call),
+                _ => None,
+            })
+            .collect();
+        let running = live && calls.iter().any(|call| !call.status.finished());
+        let id = row_id("tool-group", key, group.start);
+        let settled = transition(
+            (id.clone(), "settled"),
+            if running { 0. } else { 1. },
+            Transition::new(fast),
+            window,
+            cx,
+        );
+        let summary: SharedString = summary(
+            calls
+                .iter()
+                .map(|call| (call.kind, live && !call.status.finished())),
+        )
+        .into();
+        let failed = calls
+            .iter()
+            .filter(|call| call.status == ToolStatus::Failed)
+            .count();
+        let time = group_time(&calls, running);
+        let time_shown = transition(
+            (id.clone(), "time"),
+            if time.is_some() { 1. } else { 0. },
+            Transition::new(fast),
+            window,
+            cx,
+        );
+
+        let line = h_flex()
+            .w_full()
+            .min_w_0()
+            .gap(ICON_GAP)
+            .line_height(ROW_LINE_HEIGHT)
+            .text_color(look.muted)
+            .group_hover(ROW_GROUP, move |style| style.text_color(look.bright))
+            .child(lead(Icon::new(gpui_kit::assets::IconName::Layers), settled))
+            .child(div().min_w_0().flex_initial().truncate().map(|title| {
+                if running {
+                    title.child(ShimmerText::new(summary.clone()).id((id.clone(), "summary")))
+                } else {
+                    title.child(summary.clone())
+                }
+            }))
+            .child(chevron(reveal, look))
+            .child(
+                h_flex()
+                    .ml_auto()
+                    .pl_3()
+                    .flex_none()
+                    .gap_2()
+                    .text_size(NOTE_SIZE)
+                    .line_height(NOTE_LINE_HEIGHT)
+                    .text_color(look.faint)
+                    .when(failed > 0, |notes| {
+                        notes.child(
+                            div()
+                                .text_color(look.failed)
+                                .child(format!("{failed} failed")),
+                        )
+                    })
+                    .when_some(time, |notes, time| {
+                        notes.child(div().opacity(time_shown).child(time))
+                    }),
+            );
+        let first = group.start;
+        let header = Button::new(id)
+            .custom(
+                ButtonCustomVariant::new(cx)
+                    .foreground(look.muted)
+                    .hover(look.hover)
+                    .active(look.pressed),
+            )
+            .group(ROW_GROUP)
+            .w_full()
+            .h(ROW_HEIGHT)
+            .px(ROW_PAD)
+            .rounded(ROW_RADIUS)
+            .accessibility_label(summary)
+            .child(line)
+            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                this.toggle_tool_group(key, first, cx)
+            }));
+        if running {
+            self.keep_tool_clock(cx);
+        }
+        div().px(ROW_INSET).child(header)
+    }
+
+    fn toggle_tool_group(&mut self, key: SessionKey, first: usize, cx: &mut Context<Self>) {
+        if let Some(session) = self.session_mut(key) {
+            session.toggle_tool_group(first, cx);
+        }
+        cx.notify();
     }
 
     fn toggle_tool_call(&mut self, key: SessionKey, ix: usize, cx: &mut Context<Self>) {
@@ -310,6 +501,31 @@ impl ChatView {
     }
 }
 
+/// `child` cut to `reveal` of the height it last laid out at, and faded as much; whole
+/// once `reveal` is 1. Measured here rather than by the library's reveal, which lays
+/// content out at no height the frame it first draws, so an open row scrolling into view
+/// would jump.
+fn reveal_clip(
+    id: impl Into<ElementId>,
+    reveal: f32,
+    child: Div,
+    window: &mut Window,
+    cx: &mut App,
+) -> Div {
+    let height = window
+        .use_keyed_state(id, cx, |_, _| Rc::new(Cell::new(None)))
+        .read(cx)
+        .clone();
+    let measured = height.clone();
+    div()
+        .overflow_hidden()
+        .opacity(reveal)
+        .when(reveal < 1., |clip| {
+            clip.h(height.get().unwrap_or_default() * reveal)
+        })
+        .child(child.on_prepaint(move |bounds, _, _| measured.set(Some(bounds.size.height))))
+}
+
 /// The icon at the row's start: a spinner while the call runs, a cross once it failed,
 /// otherwise its kind's.
 fn lead_icon(call: &ToolCall, settled: f32, look: ToolLook) -> Div {
@@ -317,6 +533,11 @@ fn lead_icon(call: &ToolCall, settled: f32, look: ToolLook) -> Div {
         ToolStatus::Failed => Icon::new(IconName::CircleX).text_color(look.failed),
         _ => Icon::new(kind_icon(call.kind)),
     };
+    lead(icon, settled)
+}
+
+/// A row's leading icon, cross-fading with a spinner as `settled` goes from 0 to 1.
+fn lead(icon: Icon, settled: f32) -> Div {
     let layer = |opacity: f32| div().absolute().inset_0().opacity(opacity);
     div()
         .relative()
@@ -334,6 +555,15 @@ fn lead_icon(call: &ToolCall, settled: f32, look: ToolLook) -> Div {
         .when(settled > 0., |lead| {
             lead.child(layer(settled).child(icon.with_size(ICON_SIZE)))
         })
+}
+
+/// The chevron after a title, turning down as what it opens opens.
+fn chevron(reveal: f32, look: ToolLook) -> Icon {
+    Icon::new(IconName::ChevronRight)
+        .with_size(CHEVRON_SIZE)
+        .flex_none()
+        .text_color(look.faint)
+        .rotate(radians(reveal * FRAC_PI_2))
 }
 
 /// What the agent calls the call, on one line, shimmering while it runs as the waiting
@@ -392,6 +622,77 @@ fn counts(added: usize, removed: usize, look: ToolLook, mono: &SharedString) -> 
         .font_family(mono.clone())
         .child(div().text_color(look.added).child(format!("+{added}")))
         .child(div().text_color(look.removed).child(format!("−{removed}")))
+}
+
+/// What a group's calls did, a kind at a time in the order each kind first came: "Ran 2
+/// commands, read 1 file", with the calls still running as "running 1 command".
+fn summary(calls: impl Iterator<Item = (ToolKind, bool)>) -> String {
+    // Each kind with how many of its calls are done and how many still run.
+    let mut tally: Vec<(ToolKind, usize, usize)> = Vec::new();
+    for (kind, running) in calls {
+        let ix = match tally.iter().position(|(seen, ..)| *seen == kind) {
+            Some(ix) => ix,
+            None => {
+                tally.push((kind, 0, 0));
+                tally.len() - 1
+            }
+        };
+        if running {
+            tally[ix].2 += 1;
+        } else {
+            tally[ix].1 += 1;
+        }
+    }
+    let mut parts = Vec::new();
+    for (kind, done, running) in tally {
+        let (did, doing, one, many) = verbs(kind);
+        let noun = |count: usize| if count == 1 { one } else { many };
+        if done > 0 {
+            parts.push(format!("{did} {done} {}", noun(done)));
+        }
+        if running > 0 {
+            parts.push(format!("{doing} {running} {}", noun(running)));
+        }
+    }
+    let text = parts.join(", ");
+    let mut chars = text.chars();
+    chars.next().map_or_else(String::new, |first| {
+        first.to_uppercase().chain(chars).collect()
+    })
+}
+
+/// How a group's header says what calls of a kind did, are doing, and what one of them
+/// and several of them work on.
+fn verbs(kind: ToolKind) -> (&'static str, &'static str, &'static str, &'static str) {
+    match kind {
+        ToolKind::Read => ("read", "reading", "file", "files"),
+        ToolKind::Edit => ("edited", "editing", "file", "files"),
+        ToolKind::Delete => ("deleted", "deleting", "file", "files"),
+        ToolKind::Move => ("moved", "moving", "file", "files"),
+        ToolKind::Search => ("ran", "running", "search", "searches"),
+        ToolKind::Execute => ("ran", "running", "command", "commands"),
+        // Claude's adapter sorts its subagents' tasks as thinking.
+        ToolKind::Think => ("ran", "running", "task", "tasks"),
+        ToolKind::Fetch => ("fetched", "fetching", "page", "pages"),
+        ToolKind::SwitchMode => ("switched", "switching", "mode", "modes"),
+        ToolKind::Other => ("used", "using", "tool", "tools"),
+    }
+}
+
+/// How long a group took, from its first call coming in to its last one finishing, or,
+/// while it runs, how long it has been running. Calls a loaded session replays have no
+/// times.
+fn group_time(calls: &[&ToolCall], running: bool) -> Option<String> {
+    let start = calls.iter().filter_map(|call| call.started).min()?;
+    if running {
+        let ran = start.elapsed();
+        return (ran >= COUNT_AFTER).then(|| count_text(ran));
+    }
+    let end = calls
+        .iter()
+        .filter_map(|call| Some(call.started? + call.took?))
+        .max()?;
+    Some(took_text(end - start))
 }
 
 fn kind_icon(kind: ToolKind) -> gpui_kit::assets::IconName {
@@ -786,8 +1087,29 @@ fn text_box(
 #[cfg(test)]
 mod tests {
     // Not a glob: gpui's own `test` attribute would shadow the standard one.
-    use super::{count_text, took_text};
+    use super::{count_text, summary, took_text};
+    use acp_core::ToolKind;
     use std::time::Duration;
+
+    #[test]
+    fn a_group_says_what_its_calls_did_kind_by_kind() {
+        let calls = [
+            (ToolKind::Execute, false),
+            (ToolKind::Read, false),
+            (ToolKind::Execute, false),
+        ];
+        assert_eq!(summary(calls.into_iter()), "Ran 2 commands, read 1 file");
+        let running = [(ToolKind::Edit, false), (ToolKind::Execute, true)];
+        assert_eq!(
+            summary(running.into_iter()),
+            "Edited 1 file, running 1 command"
+        );
+        let searches = [(ToolKind::Search, false), (ToolKind::Search, true)];
+        assert_eq!(
+            summary(searches.into_iter()),
+            "Ran 1 search, running 1 search"
+        );
+    }
 
     #[test]
     fn times_read_as_the_design_has_them() {
