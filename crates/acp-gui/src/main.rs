@@ -366,13 +366,22 @@ impl ChatView {
     }
 
     /// Asks the agent to create a session, and returns it as it waits to be created.
+    /// With the agent gone, the session says so and stays closed to prompts.
     fn create_session(&mut self, agent: usize, cx: &mut App) -> Session {
         let key = SessionKey(self.next_key);
         self.next_key += 1;
-        let _ = self.agents[agent]
+        let mut session = Session::new(key, agent, cx);
+        let asked = self.agents[agent]
             .commands
             .try_send(Command::NewSession(key));
-        Session::new(key, agent, cx)
+        if asked.is_err() {
+            let name = &self.agents[agent].name;
+            session.push(
+                Row::Error(format!("{name} has gone; restart to use it")),
+                cx,
+            );
+        }
+        session
     }
 
     /// Makes the agent's spare session, when it has none and is still there to create it.
@@ -661,6 +670,9 @@ impl ChatView {
                     // and the next session added makes another. Its error shows where
                     // the user is.
                     *spare = None;
+                    let _ = self.agents[agent]
+                        .commands
+                        .try_send(Command::CloseSession(key));
                     let message = format!("{}: {message}", self.agents[agent].name);
                     self.sessions[self.active].push(Row::Error(message), cx);
                 } else if let Some(session) = self.session_mut(key) {
@@ -683,8 +695,9 @@ impl ChatView {
                 }
             }
             // Connection-wide failures show in the session on screen when it is the
-            // agent's, else in the agent's newest session; an agent with no session
-            // shown is named in the session on screen.
+            // agent's, else in the agent's newest session, else in the session on
+            // screen. With several agents, the message says which one failed, as a
+            // session's card doesn't.
             AgentEvent::Error(message) => {
                 let active = self.active;
                 let ix = Some(active)
@@ -693,12 +706,14 @@ impl ChatView {
                         self.sessions
                             .iter()
                             .rposition(|session| session.agent == agent)
-                    });
-                let message = match ix {
-                    Some(_) => message,
-                    None => format!("{}: {message}", self.agents[agent].name),
+                    })
+                    .unwrap_or(active);
+                let message = if self.agents.len() > 1 {
+                    format!("{}: {message}", self.agents[agent].name)
+                } else {
+                    message
                 };
-                self.sessions[ix.unwrap_or(active)].push(Row::Error(message), cx)
+                self.sessions[ix].push(Row::Error(message), cx)
             }
             AgentEvent::Closed => {
                 let spare = self.agents[agent].spare.as_mut();
@@ -1318,8 +1333,14 @@ fn model_menu(
     list_bounds.set(None);
     older_bounds.set(None);
 
+    // A model row's list holds the other agents' models too, so it opens for them
+    // even when the session's own agent offers no model.
+    let has_list = |setting: &Setting| {
+        !setting.choices.is_empty()
+            || (setting.kind == SettingKind::Model && !menu.others.is_empty())
+    };
     let rows = settings.iter().map(|setting| {
-        let list = (!setting.choices.is_empty()).then(|| setting.id.clone());
+        let list = has_list(setting).then(|| setting.id.clone());
         let row = div()
             .id(ElementId::Name(format!("model-menu-{}", setting.id).into()))
             .h(MENU_ROW_HEIGHT)
@@ -1366,7 +1387,7 @@ fn model_menu(
 
     let list = open_list
         .and_then(|id| settings.iter().position(|setting| setting.id == id))
-        .filter(|&ix| !settings[ix].choices.is_empty())
+        .filter(|&ix| has_list(&settings[ix]))
         .map(|ix| {
             let setting = &settings[ix];
             let current = shown_choice(setting).map(|choice| choice.id.as_str());
@@ -1397,7 +1418,7 @@ fn model_menu(
             };
             let grouped = setting.kind == SettingKind::Model && !menu.others.is_empty();
             let mut rows: Vec<AnyElement> = Vec::new();
-            if grouped {
+            if grouped && !own.is_empty() {
                 rows.push(menu.group_header(menu.own_name));
             }
             rows.extend(own.into_iter().map(hold));
@@ -1592,28 +1613,6 @@ impl ChatView {
         })
         .map(|setting| session.shown(setting))
         .collect();
-        if settings.is_empty() {
-            return None;
-        }
-        let names: Vec<&str> = [SettingKind::Model, SettingKind::ThoughtLevel]
-            .into_iter()
-            .filter_map(|kind| {
-                shown_choice(
-                    session
-                        .settings
-                        .iter()
-                        .find(|setting| setting.kind == kind)?,
-                )
-            })
-            .map(|choice| choice.name.as_str())
-            .collect();
-        // An agent that offers neither the model nor how hard it thinks still gets the
-        // button, for its other settings of the model.
-        let label = if names.is_empty() {
-            "Model".to_string()
-        } else {
-            names.join(" ")
-        };
         // The other agents' models, from their spare sessions, once those exist. An
         // agent that is gone can't take a session, so its models aren't offered.
         let others: Vec<OtherModels> = self
@@ -1634,6 +1633,46 @@ impl ChatView {
                 })
             })
             .collect();
+        let mut settings = settings;
+        if !settings
+            .iter()
+            .any(|setting| setting.kind == SettingKind::Model)
+        {
+            if others.is_empty() {
+                if settings.is_empty() {
+                    return None;
+                }
+            } else {
+                // A session with no model to pick, as its agent failed to create it or
+                // offers none, still gets to the other agents' models from a model row.
+                settings.push(Setting {
+                    id: "model".into(),
+                    name: "Model".into(),
+                    kind: SettingKind::Model,
+                    value: SettingValue::Choice(String::new()),
+                    choices: Vec::new(),
+                });
+            }
+        }
+        let names: Vec<&str> = [SettingKind::Model, SettingKind::ThoughtLevel]
+            .into_iter()
+            .filter_map(|kind| {
+                shown_choice(
+                    session
+                        .settings
+                        .iter()
+                        .find(|setting| setting.kind == kind)?,
+                )
+            })
+            .map(|choice| choice.name.as_str())
+            .collect();
+        // An agent that offers neither the model nor how hard it thinks still gets the
+        // button, for its other settings of the model.
+        let label = if names.is_empty() {
+            "Model".to_string()
+        } else {
+            names.join(" ")
+        };
         let own_name = self.agents[session.agent].name.clone();
         let view = cx.entity().downgrade();
         let key = session.key;

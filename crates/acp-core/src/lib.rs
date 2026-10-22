@@ -250,6 +250,9 @@ pub fn spawn(agent: AcpAgent, cwd: PathBuf) -> AgentHandle {
             if let Err(message) = smol::block_on(run(agent, &cwd, &command_rx, &event_tx)) {
                 emit(&event_tx, Event::Error(message));
             }
+            // Closed first, so by the time the front end hears `Closed` a command it
+            // sends is refused rather than lost.
+            drop(command_rx);
             emit(&event_tx, Event::Closed);
         })
         .expect("failed to spawn the ACP thread");
