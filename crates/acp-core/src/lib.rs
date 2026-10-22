@@ -41,7 +41,8 @@ pub enum Command {
     /// Stop the session's turn in flight; ignored when idle.
     Cancel(SessionKey),
     /// Sets one of the session's settings, by id, during a turn or not. Answered with
-    /// the session's `Settings`, or `SettingFailed`.
+    /// the session's `Settings`, or `SettingFailed`; a prompt sent after it waits for
+    /// the answer.
     ChangeSetting(SessionKey, String, SettingValue),
 }
 
@@ -370,7 +371,8 @@ async fn run_session(
 }
 
 /// Runs the session's prompts one at a time, as they arrive, until the front end has gone.
-/// Prompts sent during a turn wait in `waiting` for their own.
+/// Prompts sent during a turn wait in `waiting` for their own, and every prompt waits
+/// for the agent to answer the setting changes sent before it.
 async fn serve(
     key: SessionKey,
     session: &mut ActiveSession<'_, Agent>,
@@ -379,6 +381,7 @@ async fn serve(
     events: &Sender<Event>,
     login_options: &[String],
 ) {
+    let mut changing = Vec::new();
     loop {
         let text = match waiting.pop_front() {
             Some(text) => text,
@@ -388,13 +391,28 @@ async fn serve(
                 Ok(SessionCommand::Cancel) => continue,
                 Ok(SessionCommand::ChangeSetting(setting, value)) => {
                     // Only a closed connection fails this, which ends the session anyway.
-                    let _ = change_setting(key, session, setting, value, events);
+                    let _ = change_setting(key, session, setting, value, events, &mut changing);
                     continue;
                 }
                 Err(_) => return,
             },
         };
-        let outcome = match run_turn(key, session, text, commands, &mut waiting, events).await {
+        // The agent may still be applying a change, and a prompt it took first would
+        // run with the setting as it was.
+        for answer in changing.drain(..) {
+            let _ = answer.await;
+        }
+        let outcome = match run_turn(
+            key,
+            session,
+            text,
+            commands,
+            &mut waiting,
+            &mut changing,
+            events,
+        )
+        .await
+        {
             Ok(reason) => SessionEvent::TurnEnded {
                 stop_reason: format!("{reason:?}"),
             },
@@ -413,6 +431,7 @@ async fn run_turn(
     text: String,
     commands: &Receiver<SessionCommand>,
     waiting: &mut VecDeque<String>,
+    changing: &mut Vec<oneshot::Receiver<()>>,
     events: &Sender<Event>,
 ) -> Result<StopReason, Error> {
     enum Next {
@@ -480,7 +499,7 @@ async fn run_turn(
             }
             Next::Command(Some(SessionCommand::Prompt(text))) => waiting.push_back(text),
             Next::Command(Some(SessionCommand::ChangeSetting(setting, value))) => {
-                change_setting(key, session, setting, value, events)?
+                change_setting(key, session, setting, value, events, changing)?
             }
             Next::Command(None) => return Err(internal_error("the session was closed")),
         }
@@ -488,15 +507,18 @@ async fn run_turn(
 }
 
 /// Asks the agent to change one of the session's settings. Its answer, the settings
-/// as they now stand, goes to the front end whenever it comes.
+/// as they now stand, goes to the front end whenever it comes, and `changing` hears of
+/// it then, for the next prompt to wait on.
 fn change_setting(
     key: SessionKey,
     session: &ActiveSession<'_, Agent>,
     setting: String,
     value: SettingValue,
     events: &Sender<Event>,
+    changing: &mut Vec<oneshot::Receiver<()>>,
 ) -> Result<(), Error> {
     let events = events.clone();
+    let (answered, answer) = oneshot::channel();
     let value = match value {
         SettingValue::Choice(id) => SessionConfigOptionValue::value_id(id),
         SettingValue::Switch(on) => SessionConfigOptionValue::boolean(on),
@@ -514,8 +536,13 @@ fn change_setting(
                 }
             };
             emit(&events, Event::Session(key, event));
+            let _ = answered.send(());
             Ok(())
-        })
+        })?;
+    // Changes made while idle pile up until a prompt; the answered ones need no wait.
+    changing.retain_mut(|answer| matches!(answer.try_recv(), Ok(None)));
+    changing.push(answer);
+    Ok(())
 }
 
 async fn handle(
