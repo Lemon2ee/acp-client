@@ -1,13 +1,19 @@
 //! Runs one ACP agent connection on its own thread and exposes it as two channels,
 //! so a front end (CLI, gpui window) never touches the ACP runtime directly.
 //! The connection can hold several sessions, each running as its own task.
+//!
+//! How long the agent takes to answer each request is sent to `tracing` as an info
+//! event with millisecond fields. Nothing is recorded unless a front end subscribes,
+//! as acp-gui does with its `profile` feature. They are events rather than spans
+//! because the time goes to waiting on the agent, and Tracy draws a span of an async
+//! task only while the task is being polled.
 
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
@@ -272,6 +278,7 @@ async fn run(
     commands: &Receiver<Command>,
     events: &Sender<Event>,
 ) -> Result<(), String> {
+    let started = Instant::now();
     let mut login_options = Vec::new();
     Client
         .builder()
@@ -291,13 +298,11 @@ async fn run(
                 )
                 .block_task()
                 .await?;
+            let agent = describe(init.agent_info.as_ref());
+            // From starting the process, so an `npx` install or a slow agent start shows.
+            tracing::info!(%agent, took_ms = millis(started), "initialize");
             login_options = init.auth_methods.iter().map(login_option).collect();
-            emit(
-                events,
-                Event::Connected {
-                    agent: describe(init.agent_info.as_ref()),
-                },
-            );
+            emit(events, Event::Connected { agent });
 
             // Each session runs as a task on this thread: turns in different sessions
             // overlap, and a slow `session/new` never holds up other sessions' commands.
@@ -387,10 +392,12 @@ async fn run_session(
         // `run_until` sends `session/new` from this task, so a refusal comes back here;
         // `start_session` sends it from a connection task, where an error ends the
         // whole connection.
+        let asked = Instant::now();
         let created = cx
             .build_session(&cwd)
             .block_task()
             .run_until(async |mut session| {
+                tracing::info!(session = key.0, took_ms = millis(asked), "session/new");
                 let settings = settings_of(session.config_options().unwrap_or_default());
                 emit(
                     &events,
@@ -416,6 +423,12 @@ async fn run_session(
         // `serve` returns only once the front end has gone.
         let Err(err) = created else { return };
         let message = describe_error(err, &login_options);
+        tracing::warn!(
+            session = key.0,
+            took_ms = millis(asked),
+            error = %message,
+            "session/new failed"
+        );
         let failed = match retry {
             None => Event::SessionFailed(key, message),
             Some(_) => Event::Session(key, SessionEvent::TurnFailed(message)),
@@ -536,6 +549,12 @@ async fn run_turn(
     // Permission requests are answered from this loop, so the turn keeps reading
     // updates and can still be cancelled while the user decides.
     let mut permissions: Vec<PendingPermission> = Vec::new();
+    // For the timing sent once the agent answers: when its first update came, how many
+    // came, and when the user stopped the turn, if they did.
+    let sent = Instant::now();
+    let mut first_update_ms = None;
+    let mut updates: u64 = 0;
+    let mut stopped = None;
     loop {
         let update = async { Next::Update(session.read_update().await) };
         let answered = async { Next::Answered((&mut answer).await) };
@@ -560,16 +579,37 @@ async fn run_turn(
         match next {
             Next::Update(update) => {
                 if let SessionMessage::SessionMessage(dispatch) = update? {
+                    first_update_ms.get_or_insert_with(|| millis(sent));
+                    updates += 1;
                     handle(dispatch, key, events, &mut permissions).await?;
                 }
             }
             Next::Answered(answer) => {
+                // `took_ms` includes the time spent on the user's permission answers,
+                // which `session/request_permission` reports one by one.
+                tracing::info!(
+                    session = key.0,
+                    took_ms = millis(sent),
+                    first_update_ms,
+                    updates,
+                    after_stop_ms = stopped.map(millis),
+                    "session/prompt"
+                );
                 return answer
                     .map_err(|_| internal_error("the prompt was dropped"))?
                     .map(|response| response.stop_reason);
             }
-            Next::Chosen(ix, choice) => permissions.remove(ix).answer(choice)?,
+            Next::Chosen(ix, choice) => {
+                let permission = permissions.remove(ix);
+                tracing::info!(
+                    session = key.0,
+                    waited_ms = millis(permission.asked),
+                    "session/request_permission"
+                );
+                permission.answer(choice)?
+            }
             Next::Command(Some(SessionCommand::Cancel)) => {
+                stopped.get_or_insert_with(Instant::now);
                 let id = session.session_id().clone();
                 session
                     .connection()
@@ -757,18 +797,32 @@ fn send_change(
         SettingValue::Switch(on) => SessionConfigOptionValue::boolean(on),
     };
     let request = SetSessionConfigOptionRequest::new(session_id.clone(), setting.clone(), value);
+    let asked = Instant::now();
     let callback = {
         let (connection, queue) = (connection.clone(), queue.clone());
         async move |result: Result<SetSessionConfigOptionResponse, Error>| {
+            let took_ms = millis(asked);
             let event = match result {
-                Ok(response) => SessionEvent::SettingChanged {
-                    settings: settings_of(&response.config_options),
-                    setting,
-                },
-                Err(err) => SessionEvent::SettingFailed {
-                    message: format!("couldn't change {setting}: {err}"),
-                    setting,
-                },
+                Ok(response) => {
+                    tracing::info!(session = key.0, took_ms, %setting, "session/set_config_option");
+                    SessionEvent::SettingChanged {
+                        settings: settings_of(&response.config_options),
+                        setting,
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        session = key.0,
+                        took_ms,
+                        %setting,
+                        error = %err,
+                        "session/set_config_option failed"
+                    );
+                    SessionEvent::SettingFailed {
+                        message: format!("couldn't change {setting}: {err}"),
+                        setting,
+                    }
+                }
             };
             emit(&events, Event::Session(key, event));
             // A late answer to a change given up on leaves the queue to the changes
@@ -828,6 +882,8 @@ async fn handle(
 /// A permission request the user has not answered yet. Dropped unanswered, as when
 /// its session is closed, it answers the agent with a cancellation.
 struct PendingPermission {
+    /// When the user was asked, to report how long the turn waited on them.
+    asked: Instant,
     options: Vec<PermissionOption>,
     /// Taken by the answer.
     responder: Option<Responder<RequestPermissionResponse>>,
@@ -901,6 +957,7 @@ fn ask_permission(
         ),
     );
     PendingPermission {
+        asked: Instant::now(),
         options: request.options,
         responder: Some(responder),
         choice,
@@ -1029,6 +1086,11 @@ fn describe_error(err: Error, login_options: &[String]) -> String {
          (`claude` then /login, or `codex login`), then try again. Agent offers: {}",
         login_options.join(", ")
     )
+}
+
+/// Whole milliseconds since `since`, for the timings sent to `tracing`.
+fn millis(since: Instant) -> u64 {
+    since.elapsed().as_millis() as u64
 }
 
 fn emit(events: &Sender<Event>, event: Event) {

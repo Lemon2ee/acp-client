@@ -10,3 +10,5 @@ futures.workspace = true
 # Lets a front end keep settings between runs.
 serde.workspace = true
 smol.workspace = true
+# How long the agent takes to answer each request, for a front end that listens.
+tracing = "0.1"

@@ -15,6 +15,11 @@
     "args": ["run", "-p", "acp-gui", "--", "codex"]
   },
   {
+    "label": "acp-gui: claude + codex, profiled",
+    "command": "cargo",
+    "args": ["run", "--release", "-p", "acp-gui", "--features", "profile"]
+  },
+  {
     "label": "acp-cli: claude",
     "command": "cargo",
     "args": ["run", "-p", "acp-cli", "--", "claude"]

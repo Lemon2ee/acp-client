@@ -25,6 +25,7 @@ Keep it that way until a file clearly needs splitting.
 cargo run -p acp-gui                # Claude and Codex, picked between from the model menu
 cargo run -p acp-gui -- claude     # or: codex, or "<any shell-style agent command>"
 cargo run -p acp-cli -- claude
+cargo run --release -p acp-gui --features profile   # see "Profiling" below
 cargo clippy --workspace --all-targets
 cargo fmt --all
 ```
@@ -35,9 +36,28 @@ cargo fmt --all
   iCloud, which skips `.nosync` names. Do not change the target dir.
 - There are no tests yet. "Verified" means `cargo build`, `cargo clippy` and `cargo fmt`
   are clean, plus a run of the affected front end when the change is user-visible.
+- `profile` is off by default, so clippy also needs a run with `-p acp-gui --features profile`
+  when a change touches it.
 - Do not start `ACPClient.app` or run `.claude/hooks/run-latest-app.sh` unless the user asks.
   Several sessions launching their own builds kept replacing each other's running app.
   If a check needs the running app, say what could not be checked instead.
+
+## Profiling
+
+acp-gui's `profile` feature turns on three things. Run it with `--release`; debug frame times
+mean little.
+
+- Cmd+Option+F (also in the app menu) cycles gpui's frame-time overlay: hidden, the last
+  draw time, then the slowest 1% and 10%, the worst, and a frame count.
+- acp-core's request timings print to stderr: `initialize` (from starting the agent
+  process), `session/new`, `session/set_config_option`, and `session/prompt` with its first
+  update, update count and time after a stop. `session/request_permission` is the time the
+  user took, which `session/prompt` includes.
+- Tracy sees all of it plus gpui's draw, present and input zones and a frame mark per
+  present. The viewer must be Tracy 0.14, the version the locked tracy-client-sys 0.29 builds,
+  and it only records while connected (`ondemand`, localhost only).
+
+In debug builds, gpui-component already binds Cmd+Option+I to gpui's element inspector.
 
 ## Architecture rules
 
@@ -50,6 +70,8 @@ cargo fmt --all
   queue in order, so a cancel never overtakes the prompt it is meant to stop.
 - **Never take down the connection for one session.** Send prompts by hand (see
   `run_turn`) rather than through helpers whose failure ends every session.
+- **Timings go to `tracing`, not `Event`.** acp-core sends how long each request took as
+  info events with `_ms` fields; nothing is recorded unless a front end subscribes.
 - **Credentials are never handled here.** `auth_required` surfaces as a message that points
   at the agent's own login command.
 - **New `SessionEvent` variants must be handled in both front ends.** The CLI may ignore
