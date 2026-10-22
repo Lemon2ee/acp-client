@@ -25,8 +25,8 @@ use gpui_kit::component::switch::Switch;
 use gpui_kit::component::text::{TextView, TextViewState};
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{
-    ActiveTheme as _, FocusableExt as _, Icon, IconName, Sizable as _, Theme, ThemeConfig,
-    ThemeStyled as _, h_flex, resize_handle, v_flex,
+    ActiveTheme as _, Disableable as _, FocusableExt as _, Icon, IconName, Sizable as _, Theme,
+    ThemeConfig, ThemeStyled as _, h_flex, resize_handle, v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -68,6 +68,8 @@ struct Session {
     /// What the agent lets the user choose for this session, such as its model; none
     /// until the agent has created it.
     settings: Vec<Setting>,
+    /// The agent has created it and given its settings, if any.
+    created: bool,
     /// Switches flipped here whose changes the agent hasn't all answered, by setting id.
     flipped: HashMap<String, Flip>,
 }
@@ -91,6 +93,7 @@ impl Session {
             busy: true,
             draft: SharedString::default(),
             settings: Vec::new(),
+            created: false,
             flipped: HashMap::new(),
         }
     }
@@ -173,7 +176,10 @@ impl Session {
                 self.cancel_open_permissions(cx);
                 self.push(Row::Error(message), cx);
             }
-            SessionEvent::Settings(settings) => self.settings = settings,
+            SessionEvent::Settings(settings) => {
+                self.settings = settings;
+                self.created = true;
+            }
             SessionEvent::SettingChanged { setting, settings } => {
                 self.settings = settings;
                 self.answered(&setting);
@@ -274,6 +280,11 @@ struct AgentSlot {
     /// The spare couldn't be created, and the user has been told; said once, as each
     /// session added tries the spare again.
     spare_failed: bool,
+    /// The settings the agent last created a session with, in this run or, for Claude
+    /// and Codex, one before, which a session on it shows while the agent creates it.
+    /// Creating one takes the agent seconds: Claude's adapter starts the Claude Code
+    /// CLI for it.
+    last_settings: Vec<Setting>,
     _events: Task<()>,
 }
 
@@ -335,6 +346,7 @@ impl ChatView {
             true
         });
 
+        let mut last_settings = load_last_settings();
         let agents = agents
             .into_iter()
             .enumerate()
@@ -352,6 +364,9 @@ impl ChatView {
                     }
                 });
                 AgentSlot {
+                    last_settings: kept_name(&name)
+                        .and_then(|kept| last_settings.remove(kept))
+                        .unwrap_or_default(),
                     name,
                     commands: handle.commands,
                     spare: None,
@@ -637,6 +652,29 @@ impl ChatView {
         cx.notify();
     }
 
+    /// Keeps the settings the agent created the session with as its last, here and on
+    /// disk, unless they are the ones kept already. Only a session's first settings are
+    /// those: later ones carry the changes made to it.
+    fn remember_settings(&mut self, agent: usize, key: SessionKey, settings: &[Setting]) {
+        let first = self
+            .session_mut(key)
+            .is_some_and(|session| !session.created);
+        let slot = &mut self.agents[agent];
+        if !first || slot.last_settings == settings {
+            return;
+        }
+        slot.last_settings = settings.to_vec();
+        let Some(kept) = kept_name(&slot.name) else {
+            return;
+        };
+        let saved = config_folder()
+            .ok_or_else(|| std::io::Error::other("there is no config folder"))
+            .and_then(|folder| save_last_settings(&folder, kept, settings));
+        if let Err(err) = saved {
+            eprintln!("couldn't save {}'s settings: {err}", slot.name);
+        }
+    }
+
     /// Takes an event from the agent at `agent`.
     fn apply(&mut self, agent: usize, event: AgentEvent, cx: &mut Context<Self>) {
         match event {
@@ -672,6 +710,9 @@ impl ChatView {
                 }
             }
             AgentEvent::Session(key, event) => {
+                if let SessionEvent::Settings(settings) = &event {
+                    self.remember_settings(agent, key, settings);
+                }
                 if let Some(session) = self.session_mut(key) {
                     session.apply(event, cx);
                 }
@@ -1249,6 +1290,27 @@ impl ModelPanel<'_> {
     }
 }
 
+/// `surface`, a panel with the popover style, fading in on `animation` as it moves the
+/// last of the way into place: `place` puts it `rest` of the way back, from 1 down to 0.
+/// GPUI has no transform for a whole panel, so it moves by its offsets, and fades each
+/// thing it paints alone rather than the panel as one, so a half-faded panel would show
+/// its own shadow through it. The shadow comes in by the cube of the fade instead, out
+/// of sight until the panel covers it, as the component library's dropdowns do. With
+/// reduced motion on, GPUI draws the panel in place at once.
+fn come_in<E: Styled + IntoElement + 'static>(
+    surface: E,
+    id: impl Into<ElementId>,
+    animation: Animation,
+    place: impl Fn(E, f32) -> E + 'static,
+) -> AnimationElement<E> {
+    surface.with_animation(id, animation, move |mut surface, delta| {
+        for shadow in surface.style().box_shadow.iter_mut().flatten() {
+            shadow.color.a *= delta.powi(3);
+        }
+        place(surface, 1. - delta).opacity(delta)
+    })
+}
+
 /// The models of `group` named like `query`, with whether each is the session's model.
 fn listed_models<'a>(group: &'a ModelGroup, query: &str) -> Vec<(&'a SettingChoice, bool)> {
     let current = group
@@ -1277,7 +1339,7 @@ fn model_panel(
     favorites: &[Favorite],
     window: &Window,
     cx: &App,
-) -> Div {
+) -> AnimationElement<Div> {
     let (border, muted) = (cx.theme().border, panel.muted);
     let query = panel.search.read(cx).value().trim().to_lowercase();
     let starred = |group: &ModelGroup, choice: &SettingChoice| {
@@ -1410,7 +1472,8 @@ fn model_panel(
             }))
     });
 
-    div()
+    let surface = div()
+        .relative()
         .w(PANEL_WIDTH)
         .h(PANEL_HEIGHT)
         .max_h(window.viewport_size().height * 0.8)
@@ -1430,7 +1493,16 @@ fn model_panel(
                 .child(search)
                 .child(list)
                 .children(footer),
-        )
+        );
+    // It opens upward, so it rises out of the button below it as it fades in. The
+    // popover is drawn only while open, so each open plays this afresh.
+    let motion = cx.theme().motion_tokens();
+    let travel = motion.distance_short.to_pixels(window.rem_size());
+    let easing = motion.easing_enter.clone();
+    let enter = Animation::new(motion.duration_normal).with_easing(move |t| easing.sample(t));
+    come_in(surface, "model-panel-in", enter, move |surface, rest| {
+        surface.top(travel * rest)
+    })
 }
 
 /// A row of the mode menu: the mode's icon and name, what it does below the name, and
@@ -1485,6 +1557,69 @@ fn mode_icon(id: &str) -> gpui_kit::assets::IconName {
     }
 }
 
+/// The kinds of the model's settings the model button stands for: the model, and
+/// the switches along the bottom of its panel.
+const MODEL_KINDS: [SettingKind; 2] = [SettingKind::Model, SettingKind::ModelConfig];
+
+/// The model's button, named for the model. An agent that offers no model still gets
+/// the button, for the other agents' models and its switches.
+fn model_button(settings: &[Setting]) -> InputGroupButton {
+    let label = settings
+        .iter()
+        .find(|setting| setting.kind == SettingKind::Model)
+        .and_then(shown_choice)
+        .map_or_else(|| "Model".to_string(), |choice| choice.name.clone());
+    InputGroupButton::new("model-picker")
+        .label(label.clone())
+        .accessibility_label(format!("Model: {label}"))
+        .dropdown_caret(true)
+        .small()
+}
+
+/// The button for how hard the model thinks, named for the level.
+fn effort_button(setting: &Setting) -> InputGroupButton {
+    let name =
+        shown_choice(setting).map_or_else(|| setting.name.clone(), |choice| choice.name.clone());
+    InputGroupButton::new("effort-picker")
+        .label(name.clone())
+        .accessibility_label(format!("{}: {name}", setting.name))
+        .dropdown_caret(true)
+        .small()
+}
+
+/// The mode's button, with the mode's icon.
+fn mode_button(setting: &Setting) -> InputGroupButton {
+    let current = setting.chosen();
+    let name = current.map_or_else(|| setting.name.clone(), |choice| choice.name.clone());
+    let icon = mode_icon(current.map_or("", |choice| choice.id.as_str()));
+    InputGroupButton::new("mode-picker")
+        .icon(icon)
+        .label(name.clone())
+        .accessibility_label(format!("{}: {name}", setting.name))
+        .dropdown_caret(true)
+        .small()
+}
+
+/// The model's, the effort's and the mode's buttons as `settings` have them, dimmed and
+/// without menus, for a session the agent is still creating: until it has, there is
+/// nothing to change. They stand where the session's own buttons will, so nothing
+/// moves when those come.
+fn starting_pickers(settings: &[Setting]) -> [Option<AnyElement>; 3] {
+    let model = settings
+        .iter()
+        .any(|setting| MODEL_KINDS.contains(&setting.kind))
+        .then(|| model_button(settings).disabled(true).into_any_element());
+    let effort = settings
+        .iter()
+        .find(|setting| setting.kind == SettingKind::ThoughtLevel)
+        .map(|setting| effort_button(setting).disabled(true).into_any_element());
+    let mode = settings
+        .iter()
+        .find(|setting| setting.kind == SettingKind::Mode)
+        .map(|setting| mode_button(setting).disabled(true).into_any_element());
+    [model, effort, mode]
+}
+
 impl ChatView {
     /// The model's button, named for the session's model, and the panel of models that
     /// opens upward from it: the favorites, the session's own agent's models, and the
@@ -1525,11 +1660,6 @@ impl ChatView {
             return None;
         }
         let own = groups.iter().find(|group| group.own);
-        // An agent that offers no model still gets the button, for the other agents'
-        // models and its switches.
-        let label = own
-            .and_then(|group| shown_choice(&group.setting))
-            .map_or_else(|| "Model".to_string(), |choice| choice.name.clone());
         // The panel opens on the session's own agent's tab, so its model is in view, or
         // on the first agent's when the session has no model to pick.
         let first_tab = own
@@ -1540,12 +1670,7 @@ impl ChatView {
         let tab = self.model_panel.tab;
         let search = self.model_panel.search.clone();
         let favorites = self.favorites.clone();
-        let trigger = InputGroupButton::new("model-picker")
-            .label(label.clone())
-            .accessibility_label(format!("Model: {label}"))
-            .dropdown_caret(true)
-            .small()
-            .cursor_pointer();
+        let trigger = model_button(&session.settings).cursor_pointer();
         let picker = Popover::new("model-panel")
             .appearance(false)
             .anchor(Anchor::BottomLeft)
@@ -1589,15 +1714,9 @@ impl ChatView {
         setting: &Setting,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let name = shown_choice(setting)
-            .map_or_else(|| setting.name.clone(), |choice| choice.name.clone());
         let view = cx.entity().downgrade();
         let setting = setting.clone();
-        InputGroupButton::new("effort-picker")
-            .label(name.clone())
-            .accessibility_label(format!("{}: {name}", setting.name))
-            .dropdown_caret(true)
-            .small()
+        effort_button(&setting)
             .cursor_pointer()
             .dropdown_menu_with_anchor(Anchor::BottomLeft, move |menu, _, _| {
                 let current = shown_choice(&setting).map(|choice| choice.id.clone());
@@ -1635,17 +1754,9 @@ impl ChatView {
         setting: &Setting,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let current = setting.chosen();
-        let name = current.map_or_else(|| setting.name.clone(), |choice| choice.name.clone());
-        let icon = mode_icon(current.map_or("", |choice| choice.id.as_str()));
         let view = cx.entity().downgrade();
         let setting = setting.clone();
-        InputGroupButton::new("mode-picker")
-            .icon(icon)
-            .label(name.clone())
-            .accessibility_label(format!("{}: {name}", setting.name))
-            .dropdown_caret(true)
-            .small()
+        mode_button(&setting)
             .cursor_pointer()
             .dropdown_menu_with_anchor(Anchor::BottomLeft, move |menu, _, _| {
                 // Wide enough for most descriptions on one line; longer ones wrap.
@@ -1807,21 +1918,29 @@ impl Render for ChatView {
         );
         let sidebar_width = self.sidebar_width * (1. - hidden);
         let session = &self.sessions[self.active];
+        let slot = &self.agents[session.agent];
         // The model, how hard it thinks, then the mode, each once the agent has said
-        // what it can be.
-        let pickers = [
-            self.render_model_picker(session, cx),
-            session
-                .settings
-                .iter()
-                .find(|setting| setting.kind == SettingKind::ThoughtLevel)
-                .map(|setting| self.render_effort_picker(session.key, &session.shown(setting), cx)),
-            session
-                .settings
-                .iter()
-                .find(|setting| setting.kind == SettingKind::Mode)
-                .map(|setting| self.render_mode_picker(session.key, setting, cx)),
-        ];
+        // what it can be. Until then, as the agent's last new session had them.
+        let starting = !session.created && session.busy && !slot.commands.is_closed();
+        let pickers = if starting && !slot.last_settings.is_empty() {
+            starting_pickers(&slot.last_settings)
+        } else {
+            [
+                self.render_model_picker(session, cx),
+                session
+                    .settings
+                    .iter()
+                    .find(|setting| setting.kind == SettingKind::ThoughtLevel)
+                    .map(|setting| {
+                        self.render_effort_picker(session.key, &session.shown(setting), cx)
+                    }),
+                session
+                    .settings
+                    .iter()
+                    .find(|setting| setting.kind == SettingKind::Mode)
+                    .map(|setting| self.render_mode_picker(session.key, setting, cx)),
+            ]
+        };
         let action = if session.busy {
             InputGroupButton::new("stop")
                 .icon(IconName::Square)
@@ -2063,6 +2182,51 @@ fn change_favorites(
     Ok(favorites)
 }
 
+/// Holds the settings each agent last created a session with, by `kept_name`, as JSON.
+const LAST_SETTINGS: &str = "last-settings";
+
+/// The name an agent's settings are kept under on disk: its harness's, whether the
+/// window started it as that or by the `claude` or `codex` argument. None for any other
+/// command, which is all that names such an agent and may carry a secret, such as a key.
+fn kept_name(name: &str) -> Option<&'static str> {
+    Harness::ALL
+        .into_iter()
+        .map(Harness::name)
+        .find(|kept| kept.eq_ignore_ascii_case(name))
+}
+
+/// A file that is missing or can't be read gives none, and the buttons wait for the
+/// agent as they did before there was one.
+fn load_last_settings() -> HashMap<String, Vec<Setting>> {
+    config_folder()
+        .map(|folder| read_last_settings(&folder.join(LAST_SETTINGS)))
+        .unwrap_or_default()
+}
+
+fn read_last_settings(path: &Path) -> HashMap<String, Vec<Setting>> {
+    std::fs::read(path)
+        .ok()
+        .and_then(|json| serde_json::from_slice(&json).ok())
+        .unwrap_or_default()
+}
+
+/// Keeps `settings` as the agent's last in `folder`, beside the other agents'. Windows
+/// saving at once take turns under a lock, and the new file replaces the old one whole.
+fn save_last_settings(folder: &Path, agent: &str, settings: &[Setting]) -> std::io::Result<()> {
+    std::fs::create_dir_all(folder)?;
+    // Held until the new file is in place.
+    let lock = std::fs::File::create(folder.join(format!("{LAST_SETTINGS}.lock")))?;
+    lock.lock()?;
+    let path = folder.join(LAST_SETTINGS);
+    // Unlike the added models, nothing is lost by starting a file that can't be read
+    // over: the agents give their settings again on the next run.
+    let mut all = read_last_settings(&path);
+    all.insert(agent.to_string(), settings.to_vec());
+    let written = folder.join(format!("{LAST_SETTINGS}.new"));
+    std::fs::write(&written, serde_json::to_vec(&all)?)?;
+    std::fs::rename(&written, &path)
+}
+
 // The icons `mode_icon` uses beyond those in the component library's own bundle.
 gpui_kit::assets::icon_assets!(
     ModeIcons,
@@ -2095,6 +2259,8 @@ impl AssetSource for AppAssets {
     }
 }
 
+actions!(acp_gui, [Quit]);
+
 fn main() {
     // One agent by name, or both harnesses to pick between from the model menu.
     let name = std::env::args().nth(1);
@@ -2121,6 +2287,13 @@ fn main() {
         .with_assets(AppAssets)
         .run(move |cx: &mut App| {
             gpui_kit::init(cx);
+            // Nothing quits on Cmd+Q unless the app says so: gpui-kit leaves the shortcut
+            // to the app, and with no menus set AppKit has no Quit item to match it to.
+            cx.on_action(|_: &Quit, cx| cx.quit());
+            cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
+            cx.set_menus([
+                Menu::new("ACP client").items([MenuItem::action("Quit ACP client", Quit)])
+            ]);
             Theme::update(cx, |theme| {
                 theme.light_theme = with_panel_colors(&theme.light_theme, "#f7f7f7", "#fcfcfc");
                 theme.dark_theme = with_panel_colors(&theme.dark_theme, "#111111", "#151515");
