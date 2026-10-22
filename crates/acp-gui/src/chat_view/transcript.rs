@@ -11,6 +11,7 @@ use gpui_kit::component::text::TextView;
 use gpui_kit::*;
 
 use crate::chat_view::ChatView;
+use crate::debug::switches;
 use crate::session::{Row, Session, row_id};
 
 /// How long a live turn waits on the agent before the waiting line shows, so a reply that
@@ -37,7 +38,7 @@ impl ChatView {
         let travel = motion.distance_short.to_pixels(window.rem_size());
         let muted = cx.theme().muted_foreground;
         let session = &mut self.sessions[self.active];
-        let row = if session.waiting() && ix + 1 == session.rows.len() {
+        let row = if session.waiting() && switches().thinking && ix + 1 == session.rows.len() {
             div()
                 .flex()
                 .flex_col()

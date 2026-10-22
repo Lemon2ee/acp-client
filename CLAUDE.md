@@ -23,6 +23,7 @@ clearly needs splitting. acp-gui is split by what each part keeps or draws:
 | --- | --- |
 | `main.rs` | Starting the app: the agents to run, the window, key bindings, actions, the extra icons, profiling. |
 | `config.rs` | What is kept on disk between runs: `AppSettings`, the starred models, each agent's last settings, the kept sessions. |
+| `debug.rs` | `ACP_GUI_DEBUG`: switches that turn a live reply's effects off one by one, and a log of each transcript frame. |
 | `hotkey.rs` | The system-wide shortcut that brings the window to the front: what it can't be, holding it with macOS through Carbon, and what a press does. |
 | `launch.rs` | What an app opened from Finder lacks (macOS only): PATH from the user's login shell, so `npx` is found, and the home folder instead of `/` for new sessions. |
 | `session.rs` | `Session`: one conversation's transcript rows and settings, and how each `SessionEvent` lands on it. |
@@ -86,6 +87,11 @@ mean little.
 - Tracy sees all of it plus gpui's draw, present and input zones and a frame mark per
   present. The viewer must be Tracy 0.14, the version the locked tracy-client-sys 0.29 builds,
   and it only records while connected (`ondemand`, localhost only).
+
+To find which of a live reply's effects makes it look wrong, `ACP_GUI_DEBUG` turns them
+off one at a time and logs each transcript frame to stderr, in any build, e.g.
+`ACP_GUI_DEBUG=no-pace,log cargo run --release -p acp-gui 2> frames.log`. The words are
+`no-pace`, `no-fade`, `no-enter`, `no-thinking`, `no-follow` and `log` (see `debug.rs`).
 
 In debug builds, gpui-component already binds Cmd+Option+I to gpui's element inspector.
 

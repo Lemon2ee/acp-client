@@ -20,6 +20,7 @@ use gpui_kit::*;
 
 use crate::chat_view::scroller::TranscriptScroll;
 use crate::config::TitleSource;
+use crate::debug::switches;
 use pacing::Pacer;
 pub(crate) use tool_call::{Answer, Ask, Code, Diff, DiffLine, Shown, ToolCall};
 
@@ -209,6 +210,10 @@ impl Session {
         } else {
             self.pacer.after.push_back(event);
         }
+        if !switches().pace {
+            // Shows as it arrives, still in order and fading in.
+            self.flush(cx);
+        }
     }
 
     /// An update to a tool call whose row shows already. It changes a row above any text
@@ -221,6 +226,11 @@ impl Session {
         self.rows
             .iter()
             .any(|row| matches!(row, Row::Tool(call) if call.id == *id))
+    }
+
+    /// How much of the streaming row's text shows, and how much has arrived, in bytes.
+    pub(crate) fn paced_text(&self) -> (usize, usize) {
+        self.pacer.progress()
     }
 
     /// Whether any text or event is held back, for `pace` to show.
@@ -607,7 +617,7 @@ impl Session {
             self.remeasure_tail_group(cx);
         }
         let now = Instant::now();
-        if self.live {
+        if self.live && switches().enter {
             self.entering.insert(self.rows.len(), now);
         }
         self.changed = now;
@@ -663,6 +673,9 @@ fn echoes(prompt: &str, title: &str) -> bool {
 /// light up within one fade, such as one after a stall, fades as a whole. gpui-component
 /// draws it at once while macOS's Reduce motion is on.
 fn stream_fade(cx: &App) -> TextViewMotion {
+    if !switches().fade {
+        return TextViewMotion::default();
+    }
     TextViewMotion::default()
         .with_stream_fade(cx.theme().motion_tokens().duration_slow)
         .with_stream_fade_stagger(STREAM_FADE_STAGGER)
