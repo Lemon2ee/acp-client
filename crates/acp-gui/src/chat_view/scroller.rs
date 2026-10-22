@@ -290,7 +290,7 @@ impl ChatView {
         );
 
         // The first and last rows carry the list's padding (see the module's doc). Tool
-        // calls in a row sit close together.
+        // calls sit close to each other and to the agent's text around them.
         let count = state.item_count();
         let render_row = cx.processor(move |this, ix: usize, window, cx| {
             let joined = this.joins_next(ix);
