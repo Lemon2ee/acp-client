@@ -4,6 +4,7 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
@@ -13,7 +14,7 @@ use acp_core::{
 };
 use gpui_kit::base::input::Copy;
 use gpui_kit::base::{HandleEdge, SelectableText, TextSelection, Transition, transition};
-use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::button::{Button, ButtonCustomVariant, ButtonVariants as _};
 use gpui_kit::component::input::{
     Input, InputEvent, InputGroup, InputGroupAddon, InputGroupAddonAlignment, InputGroupButton,
     InputState, Textarea, TextareaState,
@@ -25,8 +26,8 @@ use gpui_kit::component::switch::Switch;
 use gpui_kit::component::text::{TextView, TextViewState};
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{
-    ActiveTheme as _, FocusableExt as _, Icon, IconName, Sizable as _, Theme, ThemeConfig,
-    ThemeStyled as _, h_flex, resize_handle, v_flex,
+    ActiveTheme as _, FocusableExt as _, Icon, IconName, Sizable as _, Theme, ThemeConfig, h_flex,
+    resize_handle, v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -1092,28 +1093,281 @@ fn as_title_bar(strip: Div) -> Div {
     })
 }
 
-/// How tall the model panel's switch rows are, and the gap between rows.
-const MENU_ROW_HEIGHT: Pixels = px(36.);
-const MENU_ROW_GAP: Pixels = px(2.);
-/// How tall a model's row in the panel is.
-const LIST_ROW_HEIGHT: Pixels = px(32.);
-/// How tall the line naming an agent above its models is, in the favorites.
-const LIST_HEADER_HEIGHT: Pixels = px(24.);
+/// The text of the model panel, the effort menu and the buttons that open them, and of
+/// the small headings in them. 13px text on 28px rows is the density of macOS's menus.
+const MENU_TEXT_SIZE: Pixels = px(13.);
+const MENU_LINE_HEIGHT: Pixels = px(16.);
+const MENU_HEADING_SIZE: Pixels = px(11.);
+/// How tall a model's or an effort level's row is, a switch's row, and the line naming
+/// an agent above its models in the favorites, which gets more room above it after the
+/// first agent's.
+const LIST_ROW_HEIGHT: Pixels = px(28.);
+const SWITCH_ROW_HEIGHT: Pixels = px(30.);
+const LIST_HEADER_HEIGHT: Pixels = px(26.);
+const LIST_HEADER_GAP: Pixels = px(6.);
+/// The heading over the effort menu's levels.
+const MENU_HEADING_HEIGHT: Pixels = px(24.);
+/// A row's padding. The right is narrower, as the star's button has room of its own.
+const ROW_PAD_LEFT: Pixels = px(6.);
+const ROW_PAD_RIGHT: Pixels = px(4.);
+/// The column every row starts with, for a check, an agent's mark or the magnifier, so
+/// that names, headings and the search text all start on one line, 32px into the list.
+const LEAD_WIDTH: Pixels = px(16.);
+const LEAD_ICON_SIZE: Pixels = px(14.);
+const LEAD_GAP: Pixels = px(6.);
+/// The agent's mark beside its name in the favorites.
+const HEADING_ICON_SIZE: Pixels = px(12.);
 /// The model panel's size. Its models scroll inside it, so a tab with few models is
 /// as tall as one with many.
-const PANEL_WIDTH: Pixels = px(340.);
-const PANEL_HEIGHT: Pixels = px(420.);
+const PANEL_WIDTH: Pixels = px(320.);
+const PANEL_HEIGHT: Pixels = px(380.);
+/// How wide the effort menu is.
+const EFFORT_MENU_WIDTH: Pixels = px(196.);
+/// How round the panel and the effort menu are, and the rows and tabs in them. The rows
+/// sit 4px in from the edge, so their corners follow the surface's.
+const SURFACE_RADIUS: Pixels = px(10.);
+const ROW_RADIUS: Pixels = px(6.);
+const SURFACE_PADDING: Pixels = px(4.);
+/// How far above its button the panel or the effort menu opens.
+const MENU_OFFSET: Pixels = px(6.);
 /// How wide the panel's column of tabs is, and how big each tab is.
-const TAB_COLUMN_WIDTH: Pixels = px(56.);
-const TAB_SIZE: Pixels = px(40.);
+const TAB_COLUMN_WIDTH: Pixels = px(44.);
+const TAB_SIZE: Pixels = px(32.);
 /// The agent's mark inside its tab.
-const TAB_ICON_SIZE: Pixels = px(20.);
+const TAB_ICON_SIZE: Pixels = px(16.);
 /// How tall the search box's row along the top of the panel is.
-const SEARCH_ROW_HEIGHT: Pixels = px(44.);
-/// The magnifier before the search box.
-const SEARCH_ICON_SIZE: Pixels = px(16.);
+const SEARCH_ROW_HEIGHT: Pixels = px(40.);
+/// The star's button on a model's row.
+const STAR_BUTTON_SIZE: Pixels = px(20.);
+/// The buttons below the prompt for the model, the effort and the mode: their height,
+/// the icon before the name, and the caret after it.
+const PICKER_HEIGHT: Pixels = px(28.);
+const PICKER_ICON_SIZE: Pixels = px(14.);
+const PICKER_CARET_SIZE: Pixels = px(12.);
+/// The effort meter's tallest bar, and each bar's width and the gap between bars.
+const METER_HEIGHT: Pixels = px(12.);
+const METER_BAR_WIDTH: Pixels = px(2.);
 /// Groups a model's row with its star, which shows while the row is pointed at.
 const MODEL_ROW_GROUP: &str = "model-panel-row";
+
+/// The colors of the model panel and the effort menu. In dark mode the surface is a step
+/// lighter than the window (#1f1f1f over #151515): the theme's popover color, #0a0a0a,
+/// is darker than the window and made the panel look sunk into it.
+#[derive(Clone, Copy)]
+struct MenuLook {
+    dark: bool,
+    surface: Hsla,
+    /// Behind the panel's column of tabs.
+    rail: Hsla,
+    /// Between the panel's search box, its list and its switches.
+    line: Hsla,
+    /// Under the pointer.
+    hover: Hsla,
+    /// The tab on show, a button whose menu is open, the star's button being pressed.
+    pressed: Hsla,
+    foreground: Hsla,
+    muted: Hsla,
+    /// A starred model's star.
+    star: Hsla,
+    /// The effort meter's bars above the level.
+    meter_off: Hsla,
+}
+
+impl MenuLook {
+    fn new(cx: &App) -> Self {
+        let theme = cx.theme();
+        let foreground = theme.foreground;
+        if theme.is_dark() {
+            Self {
+                dark: true,
+                surface: rgb(0x1f1f1f).into(),
+                rail: rgb(0x1a1a1a).into(),
+                line: white().opacity(0.08),
+                hover: white().opacity(0.07),
+                pressed: white().opacity(0.11),
+                foreground,
+                muted: theme.muted_foreground,
+                star: rgb(0xF5B83D).into(),
+                meter_off: white().opacity(0.18),
+            }
+        } else {
+            Self {
+                dark: false,
+                surface: white(),
+                rail: rgb(0xf6f6f6).into(),
+                line: black().opacity(0.08),
+                hover: black().opacity(0.05),
+                pressed: black().opacity(0.08),
+                foreground,
+                // A shade darker than the theme's #737373, which is under 4.5:1 on the
+                // tab column's gray.
+                muted: rgb(0x6b6b6b).into(),
+                // Darker than the dark mode's amber, to stay 3:1 on white.
+                star: rgb(0xB07800).into(),
+                meter_off: black().opacity(0.16),
+            }
+        }
+    }
+
+    /// A 1px ring around the surface and two soft shadows below it. GPUI's blur is the
+    /// gaussian's deviation, half of CSS's blur radius, so 18 and 6 here are CSS's 36
+    /// and 12.
+    fn shadow(&self) -> Vec<BoxShadow> {
+        let ink = |alpha| black().opacity(alpha);
+        let (ring, far, near, far_spread, near_spread) = if self.dark {
+            (0.6, 0.6, 0.4, -8., -2.)
+        } else {
+            (0.09, 0.2, 0.1, -10., -4.)
+        };
+        vec![
+            BoxShadow::new(px(0.), px(0.), ink(ring)).spread_radius(px(1.)),
+            BoxShadow::new(px(0.), px(16.), ink(far))
+                .blur_radius(px(18.))
+                .spread_radius(px(far_spread)),
+            BoxShadow::new(px(0.), px(4.), ink(near))
+                .blur_radius(px(6.))
+                .spread_radius(px(near_spread)),
+        ]
+    }
+
+    /// The surface of the panel or the effort menu, rounded and lifted off the window.
+    fn surface(&self) -> Div {
+        div()
+            .relative()
+            .bg(self.surface)
+            .text_color(self.foreground)
+            .text_size(MENU_TEXT_SIZE)
+            .line_height(MENU_LINE_HEIGHT)
+            .rounded(SURFACE_RADIUS)
+            .shadow(self.shadow())
+    }
+
+    /// In dark mode, a hairline just inside the surface's edge, as macOS's menus have.
+    /// It goes last, over the surface's content, so the tab column's gray can't hide it.
+    fn edge(&self) -> Option<Div> {
+        self.dark.then(|| {
+            div()
+                .absolute()
+                .inset_0()
+                .rounded(SURFACE_RADIUS)
+                .border_1()
+                .border_color(white().opacity(0.07))
+        })
+    }
+
+    /// A row of the panel or the effort menu, which lights up under the pointer.
+    fn row(&self, id: impl Into<ElementId>) -> Stateful<Div> {
+        let hover = self.hover;
+        div()
+            .id(id)
+            .h(LIST_ROW_HEIGHT)
+            .flex_none()
+            .pl(ROW_PAD_LEFT)
+            .pr(ROW_PAD_RIGHT)
+            .flex()
+            .items_center()
+            .gap(LEAD_GAP)
+            .rounded(ROW_RADIUS)
+            .hover(move |style| style.bg(hover))
+    }
+
+    /// The ghost look of the buttons below the prompt: a gray under the pointer and a
+    /// stronger one while the button's menu is open.
+    fn button(&self, cx: &App) -> ButtonCustomVariant {
+        ButtonCustomVariant::new(cx)
+            .foreground(self.foreground)
+            .hover(self.hover)
+            .active(self.pressed)
+    }
+}
+
+/// The column a row starts with, for its check or mark.
+fn lead() -> Div {
+    div()
+        .w(LEAD_WIDTH)
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_center()
+}
+
+/// A check in a row's `lead`, before the model or level in use.
+fn check() -> Icon {
+    Icon::new(IconName::Check).size(LEAD_ICON_SIZE)
+}
+
+/// A meter of how hard the model thinks: one bar for each of `levels` levels, rising to
+/// the right, with those up to `level` in `on` and the rest in `off`.
+fn effort_meter(level: usize, levels: usize, on: Hsla, off: Hsla) -> Div {
+    div()
+        .flex_none()
+        .h(METER_HEIGHT)
+        .flex()
+        .items_end()
+        .gap(METER_BAR_WIDTH)
+        .children((0..levels).map(|bar| {
+            // The last bar is full height and each one before it 2px shorter.
+            let height = (METER_HEIGHT - px(2.) * (levels - 1 - bar) as f32).max(px(2.));
+            div()
+                .w(METER_BAR_WIDTH)
+                .h(height)
+                .rounded(px(1.))
+                .bg(if bar <= level { on } else { off })
+        }))
+}
+
+/// Where `choice` stands among the setting's levels, and how many there are, for the
+/// effort meter. A "default" level has no place of its own, so it gets no meter, and
+/// neither does a setting of fewer than two levels.
+fn effort_level(setting: &Setting, choice: &SettingChoice) -> Option<(usize, usize)> {
+    let levels: Vec<&SettingChoice> = listed_choices(setting)
+        .filter(|level| level.id != "default")
+        .collect();
+    let at = levels.iter().position(|level| level.id == choice.id)?;
+    (levels.len() >= 2).then_some((at, levels.len()))
+}
+
+/// A model's name as its row shows it: a trailing note in parentheses, such as
+/// "(1M context)", in `muted`, and the part `query` matched in semibold.
+fn model_name(name: &str, query: &str, muted: Hsla) -> StyledText {
+    let note = name
+        .rfind(" (")
+        .filter(|_| name.ends_with(')'))
+        .unwrap_or(name.len());
+    // The list matches the lowercased name, whose letters can take another number of
+    // bytes than the name's own. Then the match is left unmarked.
+    let found = (!query.is_empty())
+        .then(|| name.to_lowercase())
+        .filter(|lower| lower.len() == name.len())
+        .and_then(|lower| lower.find(query))
+        .map(|start| start..start + query.len())
+        .filter(|found| name.is_char_boundary(found.start) && name.is_char_boundary(found.end));
+    let mut edges = vec![0, note, name.len()];
+    if let Some(found) = &found {
+        edges.extend([found.start, found.end]);
+    }
+    edges.sort_unstable();
+    edges.dedup();
+    let highlights: Vec<(Range<usize>, HighlightStyle)> = edges
+        .windows(2)
+        .filter_map(|pair| {
+            let range = pair[0]..pair[1];
+            let in_note = range.start >= note;
+            let matched = found
+                .as_ref()
+                .is_some_and(|found| range.start >= found.start && range.end <= found.end);
+            (in_note || matched).then(|| {
+                let style = HighlightStyle {
+                    color: in_note.then_some(muted),
+                    font_weight: matched.then_some(FontWeight::SEMIBOLD),
+                    ..Default::default()
+                };
+                (range, style)
+            })
+        })
+        .collect();
+    StyledText::new(name.to_string()).with_highlights(highlights)
+}
 
 /// The harnesses' marks, for the panel's tabs.
 const CLAUDE_LOGO: &[u8] = include_bytes!("../assets/claude.svg");
@@ -1219,25 +1473,14 @@ struct ModelPanel<'a> {
     key: SessionKey,
     popover: &'a Entity<PopoverState>,
     search: &'a Entity<InputState>,
-    accent: Hsla,
-    accent_foreground: Hsla,
-    muted: Hsla,
-    /// How the component library's menus round their rows.
-    radius: Pixels,
+    look: MenuLook,
 }
 
 impl ModelPanel<'_> {
     /// A tab in the panel's left column, which shows `tab` when pressed.
-    fn tab(
-        &self,
-        tab: ModelTab,
-        icon: Icon,
-        name: SharedString,
-        selected: bool,
-        cx: &App,
-    ) -> Stateful<Div> {
+    fn tab(&self, tab: ModelTab, icon: Icon, name: SharedString, selected: bool) -> Stateful<Div> {
         let view = self.view.clone();
-        let (selected_bg, foreground) = (cx.theme().secondary, cx.theme().foreground);
+        let look = self.look;
         let tooltip = name.clone();
         div()
             .id(ElementId::Name(format!("model-tab-{name}").into()))
@@ -1246,11 +1489,16 @@ impl ModelPanel<'_> {
             .flex()
             .items_center()
             .justify_center()
-            .rounded(self.radius)
+            .rounded(ROW_RADIUS)
             .cursor_pointer()
-            .text_color(self.muted)
-            .hover(move |style| style.bg(selected_bg).text_color(foreground))
-            .when(selected, |tab| tab.bg(selected_bg).text_color(foreground))
+            .map(|tab| {
+                if selected {
+                    tab.bg(look.pressed).text_color(look.foreground)
+                } else {
+                    tab.text_color(look.muted)
+                        .hover(move |style| style.bg(look.hover).text_color(look.foreground))
+                }
+            })
             .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
             .child(icon.size(TAB_ICON_SIZE))
             .on_click(move |_, _, cx| {
@@ -1258,49 +1506,39 @@ impl ModelPanel<'_> {
             })
     }
 
-    /// A model's row: its name, its star, and a check after the session's model. A
+    /// A model's row: a check before the session's model, the name, and its star. A
     /// press sets the session's model, or goes on to a session on the model's agent,
-    /// and closes the panel.
+    /// and closes the panel. `query` is the search, which the name shows in bold.
     fn model_row(
         &self,
         group: &ModelGroup,
         choice: &SettingChoice,
         current: bool,
         starred: bool,
+        query: &str,
     ) -> Stateful<Div> {
         let (view, popover, key) = (self.view.clone(), self.popover.clone(), self.key);
         let (agent, own) = (group.agent, group.own);
         let (setting, model) = (group.setting.id.clone(), choice.id.clone());
-        let (accent, accent_foreground) = (self.accent, self.accent_foreground);
-        div()
-            .id(ElementId::Name(
+        self.look
+            .row(ElementId::Name(
                 format!("model-row-{agent}-{}", choice.id).into(),
             ))
             .group(MODEL_ROW_GROUP)
-            .h(LIST_ROW_HEIGHT)
-            .flex_none()
-            .px_2()
-            .flex()
-            .items_center()
-            .gap_2()
-            .rounded(self.radius)
-            .hover(move |style| style.bg(accent).text_color(accent_foreground))
+            .child(lead().when(current, |lead| lead.child(check())))
             .child(
                 div()
                     .flex_1()
                     .min_w(px(0.))
                     .overflow_hidden()
                     .text_ellipsis()
-                    .child(SharedString::from(choice.name.clone())),
+                    .child(model_name(&choice.name, query, self.look.muted)),
             )
             .children(
                 group
                     .kept
                     .map(|kept| self.star(kept, group.agent, choice, starred)),
             )
-            .when(current, |row| {
-                row.child(Icon::new(IconName::Check).xsmall())
-            })
             .on_click(move |_, window, cx| {
                 let _ = view.update(cx, |this, cx| {
                     if own {
@@ -1314,67 +1552,83 @@ impl ModelPanel<'_> {
             })
     }
 
-    /// The star on a model's row, which stars the model or takes its star off. A
-    /// starred model's star is filled and always shows; the others show while their
-    /// row is pointed at. `kept` is the agent's name in the favorites.
+    /// The star at the end of a model's row, which stars the model or takes its star
+    /// off. A starred model's star is filled in amber and always shows; the others show
+    /// while their row is pointed at. `kept` is the agent's name in the favorites.
     fn star(
         &self,
         kept: &'static str,
         agent: usize,
         choice: &SettingChoice,
         starred: bool,
-    ) -> AnyElement {
+    ) -> Stateful<Div> {
         let view = self.view.clone();
+        let look = self.look;
         let favorite = Favorite {
             agent: kept.to_string(),
             model: choice.id.clone(),
         };
+        let label = if starred {
+            "Remove from favorites"
+        } else {
+            "Add to favorites"
+        };
         div()
+            .id(ElementId::Name(
+                format!("model-star-{agent}-{}", choice.id).into(),
+            ))
+            .role(Role::Button)
+            .aria_label(label)
+            .size(STAR_BUTTON_SIZE)
             .flex_none()
-            // The button draws its icon 4px in from its edge. This puts the icon against
-            // the row's padding, where a row's check goes.
-            .mr(px(-4.))
-            .when(!starred, |star| {
-                star.opacity(0.)
-                    .group_hover(MODEL_ROW_GROUP, |style| style.opacity(1.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(ROW_RADIUS - px(1.))
+            .map(|star| {
+                if starred {
+                    star.text_color(look.star)
+                        .hover(move |style| style.bg(look.pressed))
+                } else {
+                    star.text_color(look.muted)
+                        .hover(move |style| style.bg(look.pressed).text_color(look.foreground))
+                        .opacity(0.)
+                        .group_hover(MODEL_ROW_GROUP, |style| style.opacity(1.))
+                }
             })
+            .tooltip(move |window, cx| Tooltip::new(label).build(window, cx))
             .child(
-                Button::new(ElementId::Name(
-                    format!("model-star-{agent}-{}", choice.id).into(),
-                ))
-                .ghost()
-                .xsmall()
-                .icon(if starred {
+                Icon::new(if starred {
                     IconName::StarFill
                 } else {
                     IconName::Star
                 })
-                .tooltip(if starred {
-                    "Remove from favorites"
-                } else {
-                    "Add to favorites"
-                })
-                .on_click(move |_, _, cx| {
-                    // Doesn't pick the model, as a press elsewhere on its row does.
-                    cx.stop_propagation();
-                    let _ = view.update(cx, |this, cx| {
-                        this.set_favorite(favorite.clone(), !starred, cx)
-                    });
-                }),
+                .size(LEAD_ICON_SIZE),
             )
-            .into_any_element()
+            .on_click(move |_, _, cx| {
+                // Doesn't pick the model, as a press elsewhere on its row does.
+                cx.stop_propagation();
+                let _ = view.update(cx, |this, cx| {
+                    this.set_favorite(favorite.clone(), !starred, cx)
+                });
+            })
     }
 
-    /// A line in the favorites naming the agent whose models follow it.
-    fn group_header(&self, name: &str) -> AnyElement {
+    /// A line in the favorites naming the agent whose models follow it, with its mark
+    /// where the models' checks go.
+    fn group_header(&self, name: &str, first: bool) -> AnyElement {
         div()
             .h(LIST_HEADER_HEIGHT)
             .flex_none()
-            .px_2()
+            .when(!first, |header| header.mt(LIST_HEADER_GAP))
+            .pl(ROW_PAD_LEFT)
             .flex()
             .items_center()
-            .text_xs()
-            .text_color(self.muted)
+            .gap(LEAD_GAP)
+            .text_size(MENU_HEADING_SIZE)
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_color(self.look.muted)
+            .child(lead().child(agent_logo(name).size(HEADING_ICON_SIZE)))
             .child(SharedString::from(name.to_string()))
             .into_any_element()
     }
@@ -1383,22 +1637,20 @@ impl ModelPanel<'_> {
     /// The switch only shows the value: a press anywhere on the row flips it.
     fn switch_row(&self, setting: &Setting, on: bool) -> Stateful<Div> {
         let (view, key, id) = (self.view.clone(), self.key, setting.id.clone());
-        let (accent, accent_foreground) = (self.accent, self.accent_foreground);
-        div()
-            .id(ElementId::Name(
+        self.look
+            .row(ElementId::Name(
                 format!("model-switch-{}", setting.id).into(),
             ))
-            .h(MENU_ROW_HEIGHT)
-            .flex_none()
-            .px_2()
-            .flex()
-            .items_center()
-            .gap_2()
-            .rounded(self.radius)
-            .hover(move |style| style.bg(accent).text_color(accent_foreground))
+            .h(SWITCH_ROW_HEIGHT)
+            .pr(ROW_PAD_LEFT)
+            // Empty, so the name starts where the models' names do.
+            .child(lead())
             .child(
                 div()
                     .flex_1()
+                    .min_w(px(0.))
+                    .overflow_hidden()
+                    .text_ellipsis()
                     .child(SharedString::from(setting.name.clone())),
             )
             .child(
@@ -1406,6 +1658,7 @@ impl ModelPanel<'_> {
                     format!("model-switch-value-{}", setting.id).into(),
                 ))
                 .checked(on)
+                .small()
                 .tab_stop(false),
             )
             .on_click(move |_, _, cx| {
@@ -1435,6 +1688,24 @@ fn come_in<E: Styled + IntoElement + 'static>(
     })
 }
 
+/// `surface`, the model panel or the effort menu, coming in as it opens upward: it
+/// rises out of the button below it as it fades in. The popover is drawn only while
+/// open, so each open plays this afresh.
+fn rise_in(
+    surface: Div,
+    id: impl Into<ElementId>,
+    window: &Window,
+    cx: &App,
+) -> AnimationElement<Div> {
+    let motion = cx.theme().motion_tokens();
+    let travel = motion.distance_short.to_pixels(window.rem_size());
+    let easing = motion.easing_enter.clone();
+    let enter = Animation::new(motion.duration_normal).with_easing(move |t| easing.sample(t));
+    come_in(surface, id, enter, move |surface, rest| {
+        surface.top(travel * rest)
+    })
+}
+
 /// The models of `group` that pass `only` and are named like `query`, with whether
 /// each is the session's model. `only` goes first, as it is the cheaper test.
 fn listed_models<'a>(
@@ -1454,6 +1725,30 @@ fn listed_models<'a>(
         .collect()
 }
 
+/// What the panel shows in place of its list when the tab has no models to show: an
+/// icon, what is missing, and for the empty favorites, how to fill them.
+fn empty_list(icon: Icon, title: String, hint: Option<&str>, look: MenuLook) -> Div {
+    div()
+        .flex_1()
+        .flex()
+        .flex_col()
+        .items_center()
+        .justify_center()
+        .gap(px(6.))
+        .p(px(24.))
+        .whitespace_normal()
+        .text_center()
+        .child(icon.size(px(18.)).text_color(look.muted).mb(px(2.)))
+        .child(title)
+        .children(hint.map(|hint| {
+            div()
+                .text_xs()
+                .line_height(px(16.))
+                .text_color(look.muted)
+                .child(SharedString::from(hint.to_string()))
+        }))
+}
+
 /// The model panel: a column of tabs on the left, the favorites and then one for each
 /// agent, and on the right a search box over the tab's models. The session's settings
 /// of the model that are on or off, such as a fast mode, are switches along the bottom.
@@ -1466,8 +1761,9 @@ fn model_panel(
     window: &Window,
     cx: &App,
 ) -> AnimationElement<Div> {
-    let (border, muted) = (cx.theme().border, panel.muted);
-    let query = panel.search.read(cx).value().trim().to_lowercase();
+    let look = panel.look;
+    let typed = panel.search.read(cx).value().trim().to_string();
+    let query = typed.to_lowercase();
     let is_starred = |group: &ModelGroup, choice: &SettingChoice| {
         group.kept.is_some_and(|kept| {
             favorites
@@ -1484,49 +1780,64 @@ fn model_panel(
                 if starred.is_empty() {
                     continue;
                 }
-                rows.push(panel.group_header(&group.name));
+                rows.push(panel.group_header(&group.name, rows.is_empty()));
                 rows.extend(starred.into_iter().map(|(choice, current)| {
                     panel
-                        .model_row(group, choice, current, true)
+                        .model_row(group, choice, current, true, &query)
                         .into_any_element()
                 }));
             }
             if query.is_empty() {
-                "No favorites yet. Star a model to keep it here."
+                (
+                    Icon::new(IconName::Star),
+                    "No favorites yet".to_string(),
+                    Some("Star a model to keep it here."),
+                )
             } else {
-                "No favorites match."
+                (
+                    Icon::new(gpui_kit::assets::IconName::SearchX),
+                    format!("No favorites match \u{201c}{typed}\u{201d}"),
+                    None,
+                )
             }
         }
         ModelTab::Agent(agent) => {
             for group in groups.iter().filter(|group| group.agent == agent) {
                 rows.extend(listed_models(group, |_| true, &query).into_iter().map(
                     |(choice, current)| {
+                        let starred = is_starred(group, choice);
                         panel
-                            .model_row(group, choice, current, is_starred(group, choice))
+                            .model_row(group, choice, current, starred, &query)
                             .into_any_element()
                     },
                 ));
             }
-            "No models match."
+            let title = if query.is_empty() {
+                "No models".to_string()
+            } else {
+                format!("No models match \u{201c}{typed}\u{201d}")
+            };
+            (Icon::new(gpui_kit::assets::IconName::SearchX), title, None)
         }
     };
 
+    // Set apart from the list by its gray alone, with no line between them.
     let tabs = div()
         .w(TAB_COLUMN_WIDTH)
         .flex_none()
-        .py_2()
+        .py(px(6.))
         .flex()
         .flex_col()
         .items_center()
-        .gap_1()
-        .border_r_1()
-        .border_color(border)
+        .gap(SURFACE_PADDING)
+        .bg(look.rail)
+        // GPUI clips the panel's content to its box, not its rounded corners.
+        .rounded_l(SURFACE_RADIUS)
         .child(panel.tab(
             ModelTab::Favorites,
             Icon::new(IconName::Star),
             "Favorites".into(),
             tab == ModelTab::Favorites,
-            cx,
         ))
         .children(groups.iter().map(|group| {
             panel.tab(
@@ -1534,22 +1845,23 @@ fn model_panel(
                 agent_logo(&group.name),
                 group.name.clone().into(),
                 tab == ModelTab::Agent(group.agent),
-                cx,
             )
         }));
+    // The magnifier sits in the rows' lead column and the text where their names start.
     let search = div()
         .h(SEARCH_ROW_HEIGHT)
         .flex_none()
-        .px_3()
+        .pl(SURFACE_PADDING + ROW_PAD_LEFT)
+        .pr(px(12.))
         .flex()
         .items_center()
-        .gap_2()
+        .gap(LEAD_GAP)
         .border_b_1()
-        .border_color(border)
+        .border_color(look.line)
         .child(
-            Icon::new(IconName::Search)
-                .size(SEARCH_ICON_SIZE)
-                .text_color(muted),
+            lead()
+                .text_color(look.muted)
+                .child(Icon::new(IconName::Search).size(LEAD_ICON_SIZE)),
         )
         .child(
             Input::new(panel.search)
@@ -1557,58 +1869,46 @@ fn model_panel(
                 .bordered(false)
                 .focus_bordered(false)
                 .small()
+                .px_0()
+                .text_size(MENU_TEXT_SIZE)
                 .flex_1(),
         );
     let list = if rows.is_empty() {
-        div()
-            .flex_1()
-            .flex()
-            .items_center()
-            .justify_center()
-            .p_4()
-            .text_xs()
-            .text_color(muted)
-            .whitespace_normal()
-            .text_center()
-            .child(empty)
-            .into_any_element()
+        let (icon, title, hint) = empty;
+        empty_list(icon, title, hint, look).into_any_element()
     } else {
         div()
             .id("model-panel-rows")
             .flex_1()
             .min_h(px(0.))
             .overflow_y_scroll()
-            .p_1()
+            .p(SURFACE_PADDING)
             .flex()
             .flex_col()
-            .gap(MENU_ROW_GAP)
             .children(rows)
             .into_any_element()
     };
     let footer = (!switches.is_empty()).then(|| {
         div()
             .flex_none()
-            .p_1()
+            .p(SURFACE_PADDING)
             .border_t_1()
-            .border_color(border)
+            .border_color(look.line)
             .flex()
             .flex_col()
-            .gap(MENU_ROW_GAP)
             .children(switches.iter().map(|setting| {
                 let on = matches!(setting.value, SettingValue::Switch(true));
                 panel.switch_row(setting, on)
             }))
     });
 
-    let surface = div()
-        .relative()
+    let surface = look
+        .surface()
         .w(PANEL_WIDTH)
         .h(PANEL_HEIGHT)
         .max_h(window.viewport_size().height * 0.8)
-        .popover_style(cx)
         .overflow_hidden()
         .flex()
-        .text_sm()
         // Rows are one line tall; a long name is cut short instead of wrapping.
         .whitespace_nowrap()
         .child(tabs)
@@ -1621,16 +1921,71 @@ fn model_panel(
                 .child(search)
                 .child(list)
                 .children(footer),
-        );
-    // It opens upward, so it rises out of the button below it as it fades in. The
-    // popover is drawn only while open, so each open plays this afresh.
-    let motion = cx.theme().motion_tokens();
-    let travel = motion.distance_short.to_pixels(window.rem_size());
-    let easing = motion.easing_enter.clone();
-    let enter = Animation::new(motion.duration_normal).with_easing(move |t| easing.sample(t));
-    come_in(surface, "model-panel-in", enter, move |surface, rest| {
-        surface.top(travel * rest)
-    })
+        )
+        .children(look.edge());
+    rise_in(surface, "model-panel-in", window, cx)
+}
+
+/// The effort menu: the setting's name over its levels, each with a check before the
+/// level in use and the meter after it. A press sets the level and closes the menu.
+fn effort_menu(
+    setting: &Setting,
+    view: &WeakEntity<ChatView>,
+    key: SessionKey,
+    popover: &Entity<PopoverState>,
+    window: &Window,
+    cx: &App,
+) -> AnimationElement<Div> {
+    let look = MenuLook::new(cx);
+    let current = shown_choice(setting).map(|choice| choice.id.as_str());
+    let heading = div()
+        .h(MENU_HEADING_HEIGHT)
+        .flex_none()
+        // Level with the levels' names.
+        .pl(ROW_PAD_LEFT + LEAD_WIDTH + LEAD_GAP)
+        .flex()
+        .items_center()
+        .text_size(MENU_HEADING_SIZE)
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(look.muted)
+        .child(SharedString::from(setting.name.clone()));
+    let rows = listed_choices(setting).map(|choice| {
+        let (view, popover) = (view.clone(), popover.clone());
+        let (id, value) = (setting.id.clone(), choice.id.clone());
+        look.row(ElementId::Name(format!("effort-{}", choice.id).into()))
+            .child(lead().when(current == Some(choice.id.as_str()), |lead| {
+                lead.child(check())
+            }))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .child(SharedString::from(choice.name.clone())),
+            )
+            .children(effort_level(setting, choice).map(|(level, levels)| {
+                effort_meter(level, levels, look.muted, look.meter_off).mr(px(4.))
+            }))
+            .on_click(move |_, window, cx| {
+                let _ = view.update(cx, |this, cx| {
+                    let value = SettingValue::Choice(value.clone());
+                    this.change_setting(key, id.clone(), value, cx)
+                });
+                popover.update(cx, |state, cx| state.dismiss(window, cx));
+            })
+    });
+    let surface = look
+        .surface()
+        .w(EFFORT_MENU_WIDTH)
+        .p(SURFACE_PADDING)
+        .flex()
+        .flex_col()
+        .whitespace_nowrap()
+        .child(heading)
+        .children(rows)
+        .children(look.edge());
+    rise_in(surface, "effort-menu-in", window, cx)
 }
 
 /// How wide a mode's name and description may run, each on one line. Codex's longest
@@ -1695,43 +2050,79 @@ fn mode_icon(id: &str) -> gpui_kit::assets::IconName {
     }
 }
 
-/// The model's button, named for the model. An agent that offers no model still gets
-/// the button, for the other agents' models and its switches.
-fn model_button(settings: &[Setting]) -> InputGroupButton {
-    let label = settings
+/// A button below the prompt: an icon, a name and a caret, in 13px text on a 28px
+/// row, a step smaller than the component library's own, to match the menus they open.
+/// It grays under the pointer and stays gray while its menu is open.
+fn picker_button(
+    id: &'static str,
+    icon: Option<AnyElement>,
+    name: String,
+    accessibility_label: String,
+    cx: &App,
+) -> InputGroupButton {
+    let look = MenuLook::new(cx);
+    InputGroupButton::new(id)
+        .custom(look.button(cx))
+        .small()
+        .accessibility_label(accessibility_label)
+        .h(PICKER_HEIGHT)
+        .pl(px(10.))
+        .pr(px(8.))
+        .rounded(ROW_RADIUS)
+        .children(icon)
+        .child(
+            // The button's own 14px text is set on the row the name sits in.
+            div()
+                .min_w(px(0.))
+                .text_size(MENU_TEXT_SIZE)
+                .line_height(MENU_LINE_HEIGHT)
+                .text_ellipsis()
+                .child(SharedString::from(name)),
+        )
+        .child(
+            Icon::new(IconName::ChevronDown)
+                .size(PICKER_CARET_SIZE)
+                .text_color(look.muted),
+        )
+}
+
+/// The model's button, named for the model, with the mark of the session's agent. An
+/// agent that offers no model still gets the button, for the other agents' models and
+/// its switches.
+fn model_button(settings: &[Setting], agent: &str, cx: &App) -> InputGroupButton {
+    let name = settings
         .iter()
         .find(|setting| setting.kind == SettingKind::Model)
         .and_then(shown_choice)
         .map_or_else(|| "Model".to_string(), |choice| choice.name.clone());
-    InputGroupButton::new("model-picker")
-        .label(label.clone())
-        .accessibility_label(format!("Model: {label}"))
-        .dropdown_caret(true)
-        .small()
+    let icon = agent_logo(agent).size(PICKER_ICON_SIZE).into_any_element();
+    let label = format!("Model: {name}");
+    picker_button("model-picker", Some(icon), name, label, cx)
 }
 
-/// The button for how hard the model thinks, named for the level.
-fn effort_button(setting: &Setting) -> InputGroupButton {
-    let name =
-        shown_choice(setting).map_or_else(|| setting.name.clone(), |choice| choice.name.clone());
-    InputGroupButton::new("effort-picker")
-        .label(name.clone())
-        .accessibility_label(format!("{}: {name}", setting.name))
-        .dropdown_caret(true)
-        .small()
+/// The button for how hard the model thinks, named for the level, with its meter.
+fn effort_button(setting: &Setting, cx: &App) -> InputGroupButton {
+    let look = MenuLook::new(cx);
+    let shown = shown_choice(setting);
+    let name = shown.map_or_else(|| setting.name.clone(), |choice| choice.name.clone());
+    let meter = shown
+        .and_then(|choice| effort_level(setting, choice))
+        .map(|(level, levels)| {
+            effort_meter(level, levels, look.foreground, look.meter_off).into_any_element()
+        });
+    let label = format!("{}: {name}", setting.name);
+    picker_button("effort-picker", meter, name, label, cx)
 }
 
 /// The mode's button, with the mode's icon.
-fn mode_button(setting: &Setting) -> InputGroupButton {
+fn mode_button(setting: &Setting, cx: &App) -> InputGroupButton {
     let current = setting.chosen();
     let name = current.map_or_else(|| setting.name.clone(), |choice| choice.name.clone());
-    let icon = mode_icon(current.map_or("", |choice| choice.id.as_str()));
-    InputGroupButton::new("mode-picker")
-        .icon(icon)
-        .label(name.clone())
-        .accessibility_label(format!("{}: {name}", setting.name))
-        .dropdown_caret(true)
-        .small()
+    let icon = Icon::new(mode_icon(current.map_or("", |choice| choice.id.as_str())))
+        .size(PICKER_ICON_SIZE)
+        .into_any_element();
+    let label = format!("{}: {name}", setting.name);
+    picker_button("mode-picker", Some(icon), name, label, cx)
 }
 
 impl ChatView {
@@ -1798,10 +2189,11 @@ impl ChatView {
         };
         let search = self.model_panel.search.clone();
         let favorites = self.favorites.clone();
-        let trigger = model_button(shown).cursor_pointer();
+        let trigger = model_button(shown, &self.agents[session.agent].name, cx).cursor_pointer();
         let picker = Popover::new("model-panel")
             .appearance(false)
             .anchor(Anchor::BottomLeft)
+            .offset(MENU_OFFSET)
             .trigger(trigger)
             // Opening the panel focuses the search box, so typing narrows the list at once.
             .track_focus(&search.read(cx).focus_handle(cx))
@@ -1818,16 +2210,12 @@ impl ChatView {
             })
             .content(move |_, window, cx| {
                 let popover = cx.entity();
-                let theme = cx.theme();
                 let panel = ModelPanel {
                     view: &view,
                     key,
                     popover: &popover,
                     search: &search,
-                    accent: *theme.tokens.accent,
-                    accent_foreground: theme.accent_foreground,
-                    muted: theme.muted_foreground,
-                    radius: theme.radius.min(px(8.)),
+                    look: MenuLook::new(cx),
                 };
                 model_panel(&panel, &groups, &switches, tab, &favorites, window, cx)
             });
@@ -1835,7 +2223,9 @@ impl ChatView {
     }
 
     /// The button for how hard the model thinks, and a menu of the levels that opens
-    /// upward. A "default" level that stands for one of the others is left out.
+    /// upward. A "default" level that stands for one of the others is left out. The menu
+    /// is a popover of its own rather than the component library's menu, whose surface
+    /// and rows can't take the model panel's look.
     fn render_effort_picker(
         &self,
         key: SessionKey,
@@ -1844,28 +2234,14 @@ impl ChatView {
     ) -> AnyElement {
         let view = cx.entity().downgrade();
         let setting = setting.clone();
-        effort_button(&setting)
-            .cursor_pointer()
-            .dropdown_menu_with_anchor(Anchor::BottomLeft, move |menu, _, _| {
-                let current = shown_choice(&setting).map(|choice| choice.id.clone());
-                listed_choices(&setting).fold(menu, |menu, choice| {
-                    let checked = current.as_deref() == Some(choice.id.as_str());
-                    let (view, id, value) = (view.clone(), setting.id.clone(), choice.id.clone());
-                    menu.item(
-                        PopupMenuItem::new(choice.name.clone())
-                            .checked(checked)
-                            .on_click(move |_, _, cx| {
-                                let _ = view.update(cx, |this, cx| {
-                                    this.change_setting(
-                                        key,
-                                        id.clone(),
-                                        SettingValue::Choice(value.clone()),
-                                        cx,
-                                    )
-                                });
-                            }),
-                    )
-                })
+        Popover::new("effort-menu")
+            .appearance(false)
+            .anchor(Anchor::BottomLeft)
+            .offset(MENU_OFFSET)
+            .trigger(effort_button(&setting, cx).cursor_pointer())
+            .content(move |_, window, cx| {
+                let popover = cx.entity();
+                effort_menu(&setting, &view, key, &popover, window, cx)
             })
             .into_any_element()
     }
@@ -1880,7 +2256,7 @@ impl ChatView {
     ) -> AnyElement {
         let view = cx.entity().downgrade();
         let setting = setting.clone();
-        mode_button(&setting)
+        mode_button(&setting, cx)
             .cursor_pointer()
             .dropdown_menu_with_anchor(Anchor::BottomLeft, move |menu, window, _| {
                 // As wide as its widest row; `mode_item` caps how wide a row gets.
@@ -2142,7 +2518,7 @@ impl Render for ChatView {
                                 .min_h(px(85.))
                                 // On top of the textarea's own 10px and 8px, so the
                                 // text starts 17px in from the left, level with the
-                                // model button's label, and its capitals 17px down.
+                                // model button's mark, and its capitals 17px down.
                                 .px(px(6.))
                                 .pt(px(4.)),
                         )
