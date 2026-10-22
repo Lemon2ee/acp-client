@@ -86,6 +86,15 @@ mean little.
 
 In debug builds, gpui-component already binds Cmd+Option+I to gpui's element inspector.
 
+## Releasing
+
+Pushing a `v*` tag runs `.github/workflows/release.yml`: it builds the `dist` profile on an
+Apple Silicon runner, wraps it in `ACPClient.app` and attaches
+`ACPClient-<version>-macos-arm64.zip` to a GitHub release of that tag. The version comes from
+the tag, not from `Cargo.toml`, and becomes the bundle's version, which macOS wants as plain
+numbers (`v0.2.0`, not `v0.2.0-beta`). The app is signed ad hoc, not notarized, so a
+downloaded copy needs allowing once in System Settings > Privacy & Security.
+
 ## Architecture rules
 
 - **Core owns the protocol; front ends own display.** Anything that talks to

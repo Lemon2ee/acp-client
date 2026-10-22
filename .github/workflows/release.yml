@@ -1,0 +1,60 @@
+name: release
+
+# Pushing a tag such as `v0.2.0` builds acp-gui with the `dist` profile on an Apple Silicon
+# runner, wraps it in ACPClient.app and attaches a zip of it to a GitHub release of that tag.
+# The app is signed ad hoc, not with a Developer ID, so macOS blocks its first launch after a
+# download: allow it under System Settings > Privacy & Security, or run
+# `xattr -dr com.apple.quarantine ACPClient.app`.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  macos:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v5
+
+      # The runner's preinstalled Rust can lag behind; edition 2024 needs 1.85 or later.
+      - run: rustup update stable && rustup default stable
+
+      - run: cargo build --profile dist -p acp-gui --locked
+
+      - name: Bundle ACPClient.app
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          app=ACPClient.app
+          mkdir -p "$app/Contents/MacOS"
+          cp target.nosync/dist/acp-gui "$app/Contents/MacOS/acp-gui"
+          cat > "$app/Contents/Info.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleName</key><string>ACPClient</string>
+            <key>CFBundleIdentifier</key><string>io.github.lemon2ee.acp-client</string>
+            <key>CFBundleExecutable</key><string>acp-gui</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+            <key>CFBundleShortVersionString</key><string>$version</string>
+            <key>CFBundleVersion</key><string>$version</string>
+            <key>LSMinimumSystemVersion</key><string>11.0</string>
+            <key>LSApplicationCategoryType</key><string>public.app-category.developer-tools</string>
+            <key>NSHighResolutionCapable</key><true/>
+          </dict>
+          </plist>
+          PLIST
+          plutil -lint "$app/Contents/Info.plist"
+          # Signing the whole bundle, not only the binary the linker already signed, seals
+          # Info.plist too; without that a downloaded copy is reported as damaged.
+          codesign --force --sign - "$app"
+          codesign --verify --strict "$app"
+          ditto -c -k --keepParent "$app" "ACPClient-$version-macos-arm64.zip"
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" ACPClient-*-macos-arm64.zip --title "$GITHUB_REF_NAME" --generate-notes
