@@ -18,8 +18,8 @@ use std::time::{Duration, Instant};
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
     AuthMethod, BooleanConfigOptionCapabilities, CancelNotification, ClientCapabilities,
-    ClientSessionCapabilities, ContentBlock, ErrorCode, Implementation, InitializeRequest,
-    PermissionOption, PermissionOptionKind, PromptRequest, PromptResponse,
+    ClientSessionCapabilities, CloseSessionRequest, ContentBlock, ErrorCode, Implementation,
+    InitializeRequest, PermissionOption, PermissionOptionKind, PromptRequest, PromptResponse,
     RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
     SelectedPermissionOutcome, SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory,
     SessionConfigOptionValue, SessionConfigOptionsCapabilities, SessionConfigSelectOptions,
@@ -55,10 +55,10 @@ pub enum Command {
     /// `SettingChanged`, or `SettingFailed`; a prompt sent after it waits for the answer.
     /// A session not created yet gets the change once its first prompt creates it.
     ChangeSetting(SessionKey, String, SettingValue),
-    /// Drops the session: its task is cancelled, whether it is still creating the
-    /// session or running a turn, so no more of its events come. A permission request
-    /// the turn was waiting on is answered as cancelled; the agent is left to finish
-    /// the turn by itself.
+    /// Drops the session: commands still queued for it never run, a turn in flight is
+    /// stopped and its open permission requests answered as cancelled, and the agent is
+    /// asked to close it where the agent can, once it exists if the agent is still
+    /// creating it. No more of its events come.
     CloseSession(SessionKey),
 }
 
@@ -209,6 +209,35 @@ enum SessionCommand {
     ChangeSetting(String, SettingValue),
 }
 
+/// What a session's task needs to know of its agent, from `initialize`.
+#[derive(Clone)]
+struct AgentInfo {
+    /// The ways the agent offers to log in, for the message when the login is missing.
+    login_options: Vec<String>,
+    /// The agent takes `session/close`.
+    closes: bool,
+}
+
+/// A session's task and the queue it reads its commands from.
+struct SessionTask {
+    queue: Sender<SessionCommand>,
+    /// The queue's own end, to empty it when the session is closed.
+    unread: Receiver<SessionCommand>,
+    task: smol::Task<()>,
+}
+
+impl SessionTask {
+    /// Has the task close the session: the commands it hasn't read yet are dropped, and
+    /// it sees its queue closed at the next one it waits for. It then runs on alone
+    /// until it has told the agent; dropping it would cancel it where it is, and a
+    /// `session/new` still out would leave the agent a session nobody can close.
+    fn close(self) {
+        while self.unread.try_recv().is_ok() {}
+        self.queue.close();
+        self.task.detach();
+    }
+}
+
 /// Pinned rather than `@latest`, so each adapter runs the CLI it bundles and was tested with
 /// (claude-agent-acp pins Agent SDK 0.3.303 exactly; codex-acp takes @openai/codex 0.160.x).
 const CLAUDE_ADAPTER: &str = "npx -y @agentclientprotocol/claude-agent-acp@0.94.0";
@@ -304,27 +333,32 @@ async fn run(
             // From starting the process, so an `npx` install or a slow agent start shows.
             tracing::info!(%agent, took_ms = millis(started), "initialize");
             login_options = init.auth_methods.iter().map(login_option).collect();
+            let info = AgentInfo {
+                login_options: login_options.clone(),
+                closes: init.agent_capabilities.session_capabilities.close.is_some(),
+            };
             emit(events, Event::Connected { agent });
 
             // Each session runs as a task on this thread: turns in different sessions
             // overlap, and a slow `session/new` never holds up other sessions' commands.
             let tasks = smol::LocalExecutor::new();
-            // Each session's queue and its task, which dropping cancels.
-            let mut sessions: HashMap<SessionKey, (Sender<SessionCommand>, smol::Task<()>)> =
-                HashMap::new();
+            let mut sessions: HashMap<SessionKey, SessionTask> = HashMap::new();
             // A session's task, created now or by its first prompt.
             let start = |key, create_now| {
-                let (command_tx, command_rx) = smol::channel::unbounded();
-                let task = tasks.spawn(run_session(
-                    key,
-                    cx.clone(),
-                    cwd.to_path_buf(),
-                    command_rx,
-                    events.clone(),
-                    login_options.clone(),
-                    create_now,
-                ));
-                (command_tx, task)
+                let (queue, commands) = smol::channel::unbounded();
+                SessionTask {
+                    queue,
+                    unread: commands.clone(),
+                    task: tasks.spawn(run_session(
+                        key,
+                        cx.clone(),
+                        cwd.to_path_buf(),
+                        commands,
+                        events.clone(),
+                        info.clone(),
+                        create_now,
+                    )),
+                }
             };
             tasks
                 .run(async {
@@ -342,13 +376,13 @@ async fn run(
                                 (key, SessionCommand::ChangeSetting(setting, value))
                             }
                             Command::CloseSession(key) => {
-                                // Dropping the task cancels it where it is, so neither
-                                // a `session/new` still out nor a queued prompt goes on.
-                                sessions.remove(&key);
+                                if let Some(session) = sessions.remove(&key) {
+                                    session.close();
+                                }
                                 continue;
                             }
                         };
-                        let (session, _) = match sessions.entry(key) {
+                        let session = match sessions.entry(key) {
                             Entry::Occupied(entry) => entry.into_mut(),
                             // No session, so nothing is running to stop.
                             Entry::Vacant(_) if matches!(command, SessionCommand::Cancel) => {
@@ -357,7 +391,7 @@ async fn run(
                             // Waits for its first prompt to create the session.
                             Entry::Vacant(entry) => entry.insert(start(key, false)),
                         };
-                        let _ = session.try_send(command);
+                        let _ = session.queue.try_send(command);
                     }
                     Ok(())
                 })
@@ -388,15 +422,15 @@ async fn next_command(
 }
 
 /// Creates the session, now or once its first prompt comes, then runs its prompts one
-/// at a time, as they arrive. A session the agent failed to create is created again by
-/// its next prompt.
+/// at a time, as they arrive, until the front end closes it. A session the agent failed
+/// to create is created again by its next prompt.
 async fn run_session(
     key: SessionKey,
     cx: ConnectionTo<Agent>,
     cwd: PathBuf,
     commands: Receiver<SessionCommand>,
     events: Sender<Event>,
-    login_options: Vec<String>,
+    agent: AgentInfo,
     create_now: bool,
 ) {
     // The prompt to run once the session exists, when a prompt is creating it.
@@ -420,6 +454,11 @@ async fn run_session(
             .block_task()
             .run_until(async |mut session| {
                 tracing::info!(session = key.0, took_ms = millis(asked), "session/new");
+                if commands.is_closed() {
+                    // Closed while the agent was creating it.
+                    close(key, &session, agent.closes);
+                    return Ok(());
+                }
                 let settings = settings_of(session.config_options().unwrap_or_default());
                 // A level the front end picked before the session existed goes out below.
                 let reported = reported_thought_level(&settings)
@@ -448,15 +487,19 @@ async fn run_session(
                     changes,
                     &commands,
                     &events,
-                    &login_options,
+                    &agent.login_options,
                 )
                 .await;
+                close(key, &session, agent.closes);
                 Ok(())
             })
             .await;
-        // `serve` returns only once the front end has gone.
+        // `serve` returns only once the front end has closed the session.
         let Err(err) = created else { return };
-        let message = describe_error(err, &login_options);
+        if commands.is_closed() {
+            return;
+        }
+        let message = describe_error(err, &agent.login_options);
         tracing::warn!(
             session = key.0,
             took_ms = millis(asked),
@@ -492,10 +535,10 @@ async fn creating_prompt(
     }
 }
 
-/// Runs the session's prompts one at a time, as they arrive, until the front end has gone.
-/// Prompts sent during a turn wait in `waiting` for their own, and every prompt waits
-/// for the agent to answer the setting changes sent before it, those already in
-/// `changes` included.
+/// Runs the session's prompts one at a time, as they arrive, until the front end closes
+/// the session. Prompts sent during a turn wait in `waiting` for their own, and every
+/// prompt waits for the agent to answer the setting changes sent before it, those
+/// already in `changes` included.
 async fn serve(
     key: SessionKey,
     session: &mut ActiveSession<'_, Agent>,
@@ -553,8 +596,39 @@ async fn serve(
             },
             Err(err) => SessionEvent::TurnFailed(describe_error(err, login_options)),
         };
+        // Closed during the turn, which was stopped; prompts sent during it never run.
+        if commands.is_closed() {
+            return;
+        }
         emit(events, Event::Session(key, outcome));
     }
+}
+
+/// Asks the agent to close the session, if `closes` says it can, so it frees what it
+/// holds for it: Claude's adapter keeps a Claude Code process for each session until
+/// then. The answer is only logged, as nothing more of the session is read.
+fn close(key: SessionKey, session: &ActiveSession<'_, Agent>, closes: bool) {
+    if !closes {
+        return;
+    }
+    let asked = Instant::now();
+    let request = CloseSessionRequest::new(session.session_id().clone());
+    // Only a closed connection fails this, and then the agent has let go of everything.
+    let _ = session
+        .connection()
+        .prepare_request(request)
+        .on_receiving_result(async move |result| {
+            match result {
+                Ok(_) => tracing::info!(session = key.0, took_ms = millis(asked), "session/close"),
+                Err(err) => tracing::warn!(
+                    session = key.0,
+                    took_ms = millis(asked),
+                    error = %err,
+                    "session/close failed"
+                ),
+            }
+            Ok(())
+        });
 }
 
 /// Sends one prompt and forwards the session's updates until the agent answers it.
@@ -663,7 +737,16 @@ async fn run_turn(
             Next::Command(Some(SessionCommand::ChangeSetting(setting, value))) => {
                 change_setting(key, session, setting, value, events, changes)?
             }
-            Next::Command(None) => return Err(internal_error("the session was closed")),
+            Next::Command(None) => {
+                // Closed. An agent that takes `session/close` stops the turn on it too,
+                // but one that doesn't hears of it only this way. The open permission
+                // requests are answered as cancelled as `permissions` drops.
+                let id = session.session_id().clone();
+                let _ = session
+                    .connection()
+                    .send_notification(CancelNotification::new(id));
+                return Err(internal_error("the session was closed"));
+            }
         }
     }
 }
@@ -691,6 +774,19 @@ struct ChangeQueue(Arc<Mutex<Queue>>);
 struct Queue {
     changes: VecDeque<Change>,
     next_id: u64,
+    /// The session was closed: no more changes go out, and the answer to one still out
+    /// goes unreported.
+    closed: bool,
+}
+
+impl Drop for Changes {
+    /// Dropped as the session's `serve` ends, which only closing the session, or the
+    /// connection, does.
+    fn drop(&mut self) {
+        let mut queue = self.queue.lock();
+        queue.closed = true;
+        queue.changes.clear();
+    }
 }
 
 struct Change {
@@ -901,7 +997,9 @@ fn send_change(
                     })
                 }
             };
-            if let Some(event) = event {
+            if let Some(event) = event
+                && !queue.lock().closed
+            {
                 emit(&events, Event::Session(key, event));
             }
             // A late answer to a change given up on leaves the queue to the changes
