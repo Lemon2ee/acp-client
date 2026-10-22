@@ -111,6 +111,7 @@ dependencies = [
  "objc2-app-kit 0.3.2",
  "profiling",
  "raw-window-handle",
+ "serde",
  "serde_json",
  "tracing-subscriber",
  "tracing-tracy",

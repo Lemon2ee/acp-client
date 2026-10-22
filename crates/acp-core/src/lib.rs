@@ -31,6 +31,7 @@ pub use agent_client_protocol::{AcpAgent, Error};
 use agent_client_protocol::{
     ActiveSession, Agent, Client, ConnectionTo, Dispatch, Responder, SessionMessage,
 };
+use futures::FutureExt as _;
 use futures::channel::oneshot;
 use serde::{Deserialize, Serialize};
 pub use smol::channel::{Receiver, Sender};
@@ -46,6 +47,11 @@ pub enum Command {
     /// or `SessionFailed`. A key already in use keeps its session, and the repeated
     /// command is ignored.
     NewSession(SessionKey),
+    /// Loads a session the agent created in an earlier run, by the id
+    /// `SessionEvent::Created` gave, in the folder it was created in. Its transcript
+    /// comes back as session events, then `SessionReady`, or `SessionFailed` after which
+    /// its next prompt tries again. A key already in use keeps its session.
+    LoadSession(SessionKey, String, PathBuf),
     /// Runs after the session's earlier prompts. A session not created yet, or that the
     /// agent failed to create, is created first; if that fails, so does the prompt.
     Prompt(SessionKey, String),
@@ -80,6 +86,12 @@ pub enum Event {
 
 /// Something that happened inside one session.
 pub enum SessionEvent {
+    /// The agent has the session under this id, which `Command::LoadSession` takes to
+    /// load it in a later run. Comes first, each time the agent creates or loads it.
+    Created(String),
+    /// Part of a message the user sent, as the agent replays a session it loads. A
+    /// prompt sent in this run doesn't come back this way.
+    UserText(String),
     AgentText(String),
     AgentThought(String),
     ToolCall {
@@ -216,6 +228,8 @@ struct AgentInfo {
     login_options: Vec<String>,
     /// The agent takes `session/close`.
     closes: bool,
+    /// The agent takes `session/load`.
+    loads: bool,
 }
 
 /// A session's task and the queue it reads its commands from.
@@ -363,6 +377,7 @@ async fn run(
             info = AgentInfo {
                 login_options: init.auth_methods.iter().map(login_option).collect(),
                 closes: init.agent_capabilities.session_capabilities.close.is_some(),
+                loads: init.agent_capabilities.load_session,
             };
             emit(events, Event::Connected { agent });
 
@@ -370,8 +385,7 @@ async fn run(
             // overlap, and a slow `session/new` never holds up other sessions' commands.
             let tasks = smol::LocalExecutor::new();
             let mut sessions: HashMap<SessionKey, SessionTask> = HashMap::new();
-            // A session's task, created now or by its first prompt.
-            let start = |key, create_now| {
+            let start = |key, open| {
                 let (queue, commands) = smol::channel::unbounded();
                 let to_front_end = SessionEvents {
                     key,
@@ -387,7 +401,7 @@ async fn run(
                         commands,
                         to_front_end,
                         &info,
-                        create_now,
+                        open,
                     )),
                 }
             };
@@ -397,7 +411,13 @@ async fn run(
                         let (key, command) = match command {
                             Command::NewSession(key) => {
                                 if let Entry::Vacant(entry) = sessions.entry(key) {
-                                    entry.insert(start(key, true));
+                                    entry.insert(start(key, Open::New { now: true }));
+                                }
+                                continue;
+                            }
+                            Command::LoadSession(key, id, cwd) => {
+                                if let Entry::Vacant(entry) = sessions.entry(key) {
+                                    entry.insert(start(key, Open::Load(id.into(), cwd)));
                                 }
                                 continue;
                             }
@@ -420,7 +440,9 @@ async fn run(
                                 continue;
                             }
                             // Waits for its first prompt to create the session.
-                            Entry::Vacant(entry) => entry.insert(start(key, false)),
+                            Entry::Vacant(entry) => {
+                                entry.insert(start(key, Open::New { now: false }))
+                            }
                         };
                         let _ = session.queue.try_send(command);
                     }
@@ -452,16 +474,35 @@ async fn next_command(
     }
 }
 
-/// Creates the session, now or once its first prompt comes, then runs its prompts one
-/// at a time, as they arrive, until the front end closes it. A session the agent failed
-/// to create is created again by its next prompt.
+/// How a session's task has the agent make its session.
+enum Open {
+    /// With `session/new`, at once, or once its first prompt comes.
+    New { now: bool },
+    /// With `session/load`, at once: one the agent created in an earlier run, by its
+    /// id, in the folder it was created in.
+    Load(SessionId, PathBuf),
+}
+
+impl Open {
+    /// The request that makes the session, for the timings.
+    fn request(&self) -> &'static str {
+        match self {
+            Open::New { .. } => "session/new",
+            Open::Load(..) => "session/load",
+        }
+    }
+}
+
+/// Has the agent make the session as `open` says, then runs its prompts one at a time,
+/// as they arrive, until the front end closes it. A session the agent failed to make is
+/// made again, the same way, by its next prompt.
 async fn run_session(
     cx: ConnectionTo<Agent>,
     cwd: PathBuf,
     commands: Receiver<SessionCommand>,
     events: SessionEvents,
     agent: &AgentInfo,
-    create_now: bool,
+    open: Open,
 ) {
     let key = events.key;
     // The prompt to run once the session exists, when a prompt is creating it.
@@ -469,66 +510,63 @@ async fn run_session(
     // Setting changes made while there was no session to make them to, which the
     // session gets before the prompt that creates it.
     let mut changes_waiting = Vec::new();
-    if !create_now {
+    if let Open::New { now: false } = open {
         let Some(text) = creating_prompt(&commands, &mut changes_waiting).await else {
             return;
         };
         retry = Some(text);
     }
     loop {
-        // `run_until` sends `session/new` from this task, so a refusal comes back here;
-        // `start_session` sends it from a connection task, where an error ends the
-        // whole connection.
         let asked = Instant::now();
-        let created = cx
-            .build_session(&cwd)
-            .block_task()
-            .run_until(async |mut session| {
-                tracing::info!(session = key.0, took_ms = millis(asked), "session/new");
-                if commands.is_closed() {
-                    // Closed while the agent was creating it.
-                    close(key, &session, agent.closes);
-                    return Ok(());
+        let opened = match &open {
+            // `run_until` sends `session/new` from this task, so a refusal comes back
+            // here; `SessionBuilder::start_session` sends it from a connection task,
+            // where an error ends the whole connection.
+            Open::New { .. } => {
+                cx.build_session(&cwd)
+                    .block_task()
+                    .run_until(async |mut session| {
+                        tracing::info!(session = key.0, took_ms = millis(asked), "session/new");
+                        let (prompt, changes) = (retry.take(), &mut changes_waiting);
+                        run_opened(&mut session, prompt, changes, &commands, &events, agent).await;
+                        Ok(())
+                    })
+                    .await
+            }
+            Open::Load(..) if !agent.loads => Err(Error::new(
+                ErrorCode::MethodNotFound.into(),
+                "the agent can't load sessions from earlier runs",
+            )),
+            // Unlike `SessionBuilder::start_session`, this sends `session/load` from this
+            // task.
+            Open::Load(id, folder) => {
+                match cx
+                    .load_session(id.clone(), folder)
+                    .block_task()
+                    .start_session()
+                    .await
+                {
+                    Ok(loaded) => {
+                        tracing::info!(session = key.0, took_ms = millis(asked), "session/load");
+                        let mut session = loaded.into_session();
+                        replay(&mut session, &events).await;
+                        let (prompt, changes) = (retry.take(), &mut changes_waiting);
+                        run_opened(&mut session, prompt, changes, &commands, &events, agent).await;
+                        Ok(())
+                    }
+                    Err(err) => Err(err),
                 }
-                let settings = settings_of(session.config_options().unwrap_or_default());
-                // A level the front end picked before the session existed goes out below.
-                let reported = reported_thought_level(&settings)
-                    .filter(|(id, _)| !changes_waiting.iter().any(|(setting, _)| setting == id));
-                events.emit(SessionEvent::Settings(settings));
-                let waiting: VecDeque<String> = retry.take().into_iter().collect();
-                if waiting.is_empty() {
-                    events.send(Event::SessionReady(key));
-                }
-                // Only a closed connection fails these, which ends the session anyway.
-                let mut changes = Changes::default();
-                if let Some((setting, value)) = reported {
-                    let by = AskedBy::Core;
-                    let _ = queue_change(&session, setting, value, by, &events, &mut changes);
-                }
-                for (setting, value) in std::mem::take(&mut changes_waiting) {
-                    let _ = change_setting(&session, setting, value, &events, &mut changes);
-                }
-                serve(
-                    &mut session,
-                    waiting,
-                    changes,
-                    &commands,
-                    &events,
-                    &agent.login_options,
-                )
-                .await;
-                close(key, &session, agent.closes);
-                Ok(())
-            })
-            .await;
-        // `serve` returns only once the front end has closed the session.
-        let Err(err) = created else { return };
+            }
+        };
+        // `run_opened` returns only once the front end has closed the session.
+        let Err(err) = opened else { return };
         let message = describe_error(err, &agent.login_options);
         tracing::warn!(
             session = key.0,
             took_ms = millis(asked),
             error = %message,
-            "session/new failed"
+            "{} failed",
+            open.request()
         );
         let failed = match retry {
             None => Event::SessionFailed(key, message),
@@ -540,6 +578,68 @@ async fn run_session(
             return;
         };
         retry = Some(text);
+    }
+}
+
+/// Runs the session the agent has just created or loaded until the front end closes
+/// it, then has the agent close it. `prompt` is the one that had it made, if one did,
+/// and `changes_waiting` the setting changes made while it didn't exist.
+async fn run_opened(
+    session: &mut ActiveSession<'_, Agent>,
+    prompt: Option<String>,
+    changes_waiting: &mut Vec<(String, SettingValue)>,
+    commands: &Receiver<SessionCommand>,
+    events: &SessionEvents,
+    agent: &AgentInfo,
+) {
+    let key = events.key;
+    if commands.is_closed() {
+        // Closed while the agent was making it.
+        close(key, session, agent.closes);
+        return;
+    }
+    events.emit(SessionEvent::Created(session.session_id().0.to_string()));
+    let settings = settings_of(session.config_options().unwrap_or_default());
+    // A level the front end picked before the session existed goes out below.
+    let reported = reported_thought_level(&settings)
+        .filter(|(id, _)| !changes_waiting.iter().any(|(setting, _)| setting == id));
+    events.emit(SessionEvent::Settings(settings));
+    let waiting: VecDeque<String> = prompt.into_iter().collect();
+    if waiting.is_empty() {
+        events.send(Event::SessionReady(key));
+    }
+    // Only a closed connection fails these, which ends the session anyway.
+    let mut changes = Changes::default();
+    if let Some((setting, value)) = reported {
+        let by = AskedBy::Core;
+        let _ = queue_change(session, setting, value, by, events, &mut changes);
+    }
+    for (setting, value) in std::mem::take(changes_waiting) {
+        let _ = change_setting(session, setting, value, events, &mut changes);
+    }
+    serve(
+        session,
+        waiting,
+        changes,
+        commands,
+        events,
+        &agent.login_options,
+    )
+    .await;
+    close(key, session, agent.closes);
+}
+
+/// Sends on the transcript the agent replayed as it loaded the session. The replay
+/// comes before the answer to `session/load`, so by now it has all come in.
+async fn replay(session: &mut ActiveSession<'_, Agent>, events: &SessionEvents) {
+    // None is expected while loading; any that came is answered as cancelled as this drops.
+    let mut permissions = Vec::new();
+    while let Some(update) = session.read_update().now_or_never() {
+        // Only a closed connection fails these, which ends the session anyway.
+        let Ok(message) = update else { break };
+        if let SessionMessage::SessionMessage(dispatch) = message {
+            let _ = handle(dispatch, events, &mut permissions, true).await;
+        }
     }
 }
 
@@ -729,7 +829,7 @@ async fn run_turn(
                 if let SessionMessage::SessionMessage(dispatch) = update? {
                     first_update_ms.get_or_insert_with(|| millis(sent));
                     updates += 1;
-                    handle(dispatch, events, &mut permissions).await?;
+                    handle(dispatch, events, &mut permissions, false).await?;
                 }
             }
             Next::Answered(answer) => {
@@ -1038,14 +1138,16 @@ fn send_change(
     sent
 }
 
+/// Takes one message the agent sent for the session; `replaying` while it loads.
 async fn handle(
     dispatch: Dispatch,
     events: &SessionEvents,
     permissions: &mut Vec<PendingPermission>,
+    replaying: bool,
 ) -> Result<(), Error> {
     MatchDispatch::new(dispatch)
         .if_notification(async |notification: SessionNotification| {
-            if let Some(event) = flatten(notification.update) {
+            if let Some(event) = flatten(notification.update, replaying) {
                 events.emit(event);
             }
             Ok(())
@@ -1144,8 +1246,13 @@ fn ask_permission(
     }
 }
 
-fn flatten(update: SessionUpdate) -> Option<SessionEvent> {
+fn flatten(update: SessionUpdate, replaying: bool) -> Option<SessionEvent> {
     Some(match update {
+        // During a turn the front end has the prompt already, and an echo of it would
+        // show twice.
+        SessionUpdate::UserMessageChunk(chunk) if replaying => {
+            SessionEvent::UserText(text_of(&chunk.content))
+        }
         SessionUpdate::AgentMessageChunk(chunk) => SessionEvent::AgentText(text_of(&chunk.content)),
         SessionUpdate::AgentThoughtChunk(chunk) => {
             SessionEvent::AgentThought(text_of(&chunk.content))
@@ -1176,8 +1283,8 @@ fn flatten(update: SessionUpdate) -> Option<SessionEvent> {
     })
 }
 
-/// The thought level the agent reports for a session it has just created, for acp-core
-/// to set it to that same value. claude-agent-acp 0.94.0 only shows this value to a
+/// The thought level the agent reports for a session it has just created or loaded, for
+/// acp-core to set it to that same value. claude-agent-acp 0.94.0 only shows this value to a
 /// client without JetBrains' `recommendedValue` extension: it reads it from Claude
 /// Code's settings files, down to the old top-level `effortLevel`, which the CLI it
 /// starts no longer reads. So the button said "Xhigh" while turns ran at the model's
