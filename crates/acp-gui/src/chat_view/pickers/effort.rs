@@ -1,16 +1,15 @@
 //! The effort menu: how hard the model thinks, each level with its meter.
 
-use acp_core::{SessionKey, Setting, SettingChoice, SettingValue};
+use acp_core::{SessionKey, Setting, SettingChoice};
 use gpui_kit::component::input::InputGroupButton;
-use gpui_kit::component::popover::{Popover, PopoverState};
-use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::component::popover::PopoverState;
 use gpui_kit::*;
 
 use crate::chat_view::ChatView;
 use crate::chat_view::pickers::{
-    EFFORT_MENU_WIDTH, LEAD_GAP, LEAD_WIDTH, MENU_HEADING_HEIGHT, MENU_HEADING_SIZE, MENU_OFFSET,
-    METER_BAR_WIDTH, METER_HEIGHT, MenuLook, ROW_PAD_LEFT, SURFACE_PADDING, check, lead,
-    listed_choices, picker_button, rise_in, shown_choice,
+    EFFORT_MENU_WIDTH, LIST_ROW_HEIGHT, METER_BAR_WIDTH, METER_HEIGHT, MenuLook, MenuNav,
+    MenuParts, ROW_PAD, check_column, lead, listed_choices, menu_popover, pick_choice,
+    picker_button, rise_in, shown_choice,
 };
 
 /// A meter of how hard the model thinks: one bar for each of `levels` levels, rising to
@@ -44,65 +43,79 @@ fn effort_level(setting: &Setting, choice: &SettingChoice) -> Option<(usize, usi
     (levels.len() >= 2).then_some((at, levels.len()))
 }
 
-/// The effort menu: the setting's name over its levels, each with a check before the
-/// level in use and the meter after it. A press sets the level and closes the menu.
+/// A level's row in the effort menu: its meter in the lead column, as the button shows
+/// it before the name, the name, and a check at the end of the level in use. The meter
+/// is muted but for the level in use. A "default" level has no meter of its own.
+fn level_row(
+    menu: &MenuParts,
+    setting: &Setting,
+    choice: &SettingChoice,
+    row: usize,
+    current: bool,
+) -> Stateful<Div> {
+    let look = &menu.look;
+    let ink = if current { look.foreground } else { look.muted };
+    // Five levels' meter is 18px wide: centered, it runs a pixel past the column on
+    // either side.
+    let meter = effort_level(setting, choice)
+        .map(|(level, levels)| effort_meter(level, levels, ink, look.meter_off));
+    menu.row(
+        ElementId::Name(format!("effort-{}", choice.id).into()),
+        row,
+        current,
+    )
+    .aria_label(SharedString::from(choice.name.clone()))
+    .h(LIST_ROW_HEIGHT)
+    .px(ROW_PAD)
+    .items_center()
+    .child(lead().children(meter))
+    .child(
+        div()
+            .flex_1()
+            .min_w(px(0.))
+            .overflow_hidden()
+            .text_ellipsis()
+            .child(SharedString::from(choice.name.clone())),
+    )
+    .child(check_column(current))
+}
+
+/// The effort menu: the setting's name over its levels. A press or Enter sets the level
+/// and closes the menu.
 fn effort_menu(
     setting: &Setting,
+    nav: &MenuNav,
     view: &WeakEntity<ChatView>,
     key: SessionKey,
     popover: &Entity<PopoverState>,
     window: &Window,
     cx: &App,
-) -> AnimationElement<Div> {
-    let look = MenuLook::new(cx);
+) -> AnimationElement<Stateful<Div>> {
+    let levels: Vec<&SettingChoice> = listed_choices(setting).collect();
+    let values = levels.iter().map(|choice| choice.id.clone());
+    let pick = pick_choice(&setting.id, values.collect(), key, view, popover);
+    let menu = MenuParts {
+        look: MenuLook::new(cx),
+        nav,
+        view,
+        pick,
+    };
     let current = shown_choice(setting).map(|choice| choice.id.as_str());
-    let heading = div()
-        .h(MENU_HEADING_HEIGHT)
-        .flex_none()
-        // Level with the levels' names.
-        .pl(ROW_PAD_LEFT + LEAD_WIDTH + LEAD_GAP)
-        .flex()
-        .items_center()
-        .text_size(MENU_HEADING_SIZE)
-        .font_weight(FontWeight::SEMIBOLD)
-        .text_color(look.muted)
-        .child(SharedString::from(setting.name.clone()));
-    let rows = listed_choices(setting).map(|choice| {
-        let (view, popover) = (view.clone(), popover.clone());
-        let (id, value) = (setting.id.clone(), choice.id.clone());
-        look.row(ElementId::Name(format!("effort-{}", choice.id).into()))
-            .child(lead().when(current == Some(choice.id.as_str()), |lead| {
-                lead.child(check())
-            }))
-            .child(
-                div()
-                    .flex_1()
-                    .min_w(px(0.))
-                    .overflow_hidden()
-                    .text_ellipsis()
-                    .child(SharedString::from(choice.name.clone())),
-            )
-            .children(effort_level(setting, choice).map(|(level, levels)| {
-                effort_meter(level, levels, look.muted, look.meter_off).mr(px(4.))
-            }))
-            .on_click(move |_, window, cx| {
-                let _ = view.update(cx, |this, cx| {
-                    let value = SettingValue::Choice(value.clone());
-                    this.change_setting(key, id.clone(), value, cx)
-                });
-                popover.update(cx, |state, cx| state.dismiss(window, cx));
-            })
+    let rows = levels.iter().enumerate().map(|(row, choice)| {
+        level_row(
+            &menu,
+            setting,
+            choice,
+            row,
+            current == Some(choice.id.as_str()),
+        )
     });
-    let surface = look
-        .surface()
+    let surface = menu
+        .surface("effort-menu", &setting.name, levels.len())
         .w(EFFORT_MENU_WIDTH)
-        .p(SURFACE_PADDING)
-        .flex()
-        .flex_col()
-        .whitespace_nowrap()
-        .child(heading)
+        .child(menu.heading(&setting.name))
         .children(rows)
-        .children(look.edge());
+        .children(menu.look.edge());
     rise_in(surface, "effort-menu-in", window, cx)
 }
 
@@ -133,14 +146,12 @@ impl ChatView {
     ) -> AnyElement {
         let view = cx.entity().downgrade();
         let setting = setting.clone();
-        Popover::new("effort-menu")
-            .appearance(false)
-            .anchor(Anchor::BottomLeft)
-            .offset(MENU_OFFSET)
+        let nav = self.menu_nav.clone();
+        menu_popover("effort-menu", &nav, &view)
             .trigger(effort_button(&setting, cx).cursor_pointer())
             .content(move |_, window, cx| {
                 let popover = cx.entity();
-                effort_menu(&setting, &view, key, &popover, window, cx)
+                effort_menu(&setting, &nav, &view, key, &popover, window, cx)
             })
             .into_any_element()
     }

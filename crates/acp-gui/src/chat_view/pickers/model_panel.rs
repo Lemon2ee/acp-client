@@ -17,9 +17,9 @@ use crate::chat_view::ChatView;
 use crate::chat_view::pickers::{
     HEADING_ICON_SIZE, LEAD_GAP, LEAD_ICON_SIZE, LIST_HEADER_GAP, LIST_HEADER_HEIGHT,
     MENU_HEADING_SIZE, MENU_OFFSET, MENU_TEXT_SIZE, MODEL_ROW_GROUP, MenuLook, PANEL_HEIGHT,
-    PANEL_WIDTH, PICKER_ICON_SIZE, ROW_PAD_LEFT, ROW_RADIUS, SEARCH_ROW_HEIGHT, STAR_BUTTON_SIZE,
+    PANEL_WIDTH, PICKER_ICON_SIZE, ROW_PAD, ROW_RADIUS, SEARCH_ROW_HEIGHT, STAR_BUTTON_SIZE,
     SURFACE_PADDING, SURFACE_RADIUS, SWITCH_ROW_HEIGHT, TAB_COLUMN_WIDTH, TAB_ICON_SIZE, TAB_SIZE,
-    agent_logo, check, lead, listed_choices, picker_button, rise_in, shown_choice,
+    agent_logo, check_column, lead, listed_choices, picker_button, rise_in, shown_choice,
 };
 use crate::config::{Favorite, change_favorites, config_folder, kept_name, load_favorites};
 use crate::session::Session;
@@ -154,9 +154,10 @@ impl ModelPanel<'_> {
             })
     }
 
-    /// A model's row: a check before the session's model, the name, and its star. A
-    /// press sets the session's model, or goes on to a session on the model's agent,
-    /// and closes the panel. `query` is the search, which the name shows in bold.
+    /// A model's row: the name, after an empty lead column so it starts where the search
+    /// text does, its star, and a check at the end of the session's model. A press sets
+    /// the session's model, or goes on to a session on the model's agent, and closes the
+    /// panel. `query` is the search, which the name shows in bold.
     fn model_row(
         &self,
         group: &ModelGroup,
@@ -173,7 +174,7 @@ impl ModelPanel<'_> {
                 format!("model-row-{agent}-{}", choice.id).into(),
             ))
             .group(MODEL_ROW_GROUP)
-            .child(lead().when(current, |lead| lead.child(check())))
+            .child(lead())
             .child(
                 div()
                     .flex_1()
@@ -187,6 +188,7 @@ impl ModelPanel<'_> {
                     .kept
                     .map(|kept| self.star(kept, group.agent, choice, starred)),
             )
+            .child(check_column(current))
             .on_click(move |_, window, cx| {
                 let _ = view.update(cx, |this, cx| {
                     if own {
@@ -200,9 +202,10 @@ impl ModelPanel<'_> {
             })
     }
 
-    /// The star at the end of a model's row, which stars the model or takes its star
-    /// off. A starred model's star is filled in amber and always shows; the others show
-    /// while their row is pointed at. `kept` is the agent's name in the favorites.
+    /// The star near the end of a model's row, before its check, which stars the model
+    /// or takes its star off. A starred model's star is filled in amber and always shows;
+    /// the others show while their row is pointed at. `kept` is the agent's name in the
+    /// favorites.
     fn star(
         &self,
         kept: &'static str,
@@ -263,13 +266,13 @@ impl ModelPanel<'_> {
     }
 
     /// A line in the favorites naming the agent whose models follow it, with its mark
-    /// where the models' checks go.
+    /// in the lead column.
     fn group_header(&self, name: &str, first: bool) -> AnyElement {
         div()
             .h(LIST_HEADER_HEIGHT)
             .flex_none()
             .when(!first, |header| header.mt(LIST_HEADER_GAP))
-            .pl(ROW_PAD_LEFT)
+            .pl(ROW_PAD)
             .flex()
             .items_center()
             .gap(LEAD_GAP)
@@ -290,7 +293,6 @@ impl ModelPanel<'_> {
                 format!("model-switch-{}", setting.id).into(),
             ))
             .h(SWITCH_ROW_HEIGHT)
-            .pr(ROW_PAD_LEFT)
             // Empty, so the name starts where the models' names do.
             .child(lead())
             .child(
@@ -460,7 +462,7 @@ fn model_panel(
     let search = div()
         .h(SEARCH_ROW_HEIGHT)
         .flex_none()
-        .pl(SURFACE_PADDING + ROW_PAD_LEFT)
+        .pl(SURFACE_PADDING + ROW_PAD)
         .pr(px(12.))
         .flex()
         .items_center()
