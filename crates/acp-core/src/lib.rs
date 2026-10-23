@@ -11,20 +11,21 @@
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
 use agent_client_protocol::schema::v1::{
-    AuthMethod, BooleanConfigOptionCapabilities, CancelNotification, ClientCapabilities,
-    ClientSessionCapabilities, CloseSessionRequest, ContentBlock, DeleteSessionRequest, ErrorCode,
-    Implementation, InitializeRequest, PermissionOption, PermissionOptionKind, PromptRequest,
-    PromptResponse, RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
-    SelectedPermissionOutcome, SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory,
-    SessionConfigOptionValue, SessionConfigOptionsCapabilities, SessionConfigSelectOptions,
-    SessionId, SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
-    SetSessionConfigOptionResponse, StopReason, ToolCallContent, ToolCallLocation, ToolCallStatus,
-    ToolKind as ProtocolToolKind,
+    AuthMethod, AvailableCommand, BooleanConfigOptionCapabilities, CancelNotification,
+    ClientCapabilities, ClientSessionCapabilities, CloseSessionRequest, ContentBlock,
+    DeleteSessionRequest, ErrorCode, Implementation, InitializeRequest, PermissionOption,
+    PermissionOptionKind, PromptRequest, PromptResponse, RequestPermissionOutcome,
+    RequestPermissionRequest, RequestPermissionResponse, SelectedPermissionOutcome,
+    SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory, SessionConfigOptionValue,
+    SessionConfigOptionsCapabilities, SessionConfigSelectOptions, SessionId, SessionNotification,
+    SessionUpdate, SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, StopReason,
+    ToolCallContent, ToolCallLocation, ToolCallStatus, ToolKind as ProtocolToolKind, Usage,
 };
 use agent_client_protocol::schema::{MaybeUndefined, ProtocolVersion};
 use agent_client_protocol::util::{MatchDispatch, internal_error};
@@ -59,6 +60,11 @@ pub enum Command {
     Prompt(SessionKey, String),
     /// Stop the session's turn in flight; ignored when idle.
     Cancel(SessionKey),
+    /// Asks the agent what fills the session's context window, with its `/context`
+    /// command. Answered with `ContextReport`, never in the transcript, and no `TurnEnded`
+    /// follows. It runs once no prompt is waiting, and a prompt sent while it runs stops
+    /// it, so it never holds one up. A session the agent hasn't created yet ignores it.
+    ReadContext(SessionKey),
     /// Sets one of the session's settings, by id, during a turn or not. Answered with
     /// `SettingChanged`, or `SettingFailed`; a prompt sent after it waits for the answer.
     /// A session not created yet gets the change once its first prompt creates it.
@@ -148,12 +154,45 @@ pub enum SessionEvent {
     /// make one a few seconds after the first turn, so it can come between turns, and the
     /// same title can come again.
     Title(String),
+    /// How much of its context window the session takes up, each time the agent counts:
+    /// Claude's adapter as it replies, at the end of each turn and after compacting;
+    /// Codex's after each request to the model. Neither sends it as it loads a session.
+    ContextUsage(ContextUsage),
+    /// The tokens the turn took, just before its `TurnEnded`, from an agent that counts
+    /// them, as both adapters do.
+    TurnUsage(TurnUsage),
+    /// What fills the context window, as the agent's Markdown, answering `ReadContext`.
+    /// `None` when the agent offers no `/context` command, or its answer failed or was
+    /// stopped by a prompt.
+    ContextReport(Option<String>),
     /// The agent refused a `ChangeSetting`, or hadn't answered it by the time a prompt
     /// stopped waiting; the setting keeps its value.
     SettingFailed {
         setting: String,
         message: String,
     },
+}
+
+/// How full a session's context window is, in tokens.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextUsage {
+    /// What the agent last sent the model.
+    pub used: u64,
+    /// The most the model takes.
+    pub size: u64,
+}
+
+/// The tokens one turn took, as the agent answered its prompt. A count the agent left
+/// out is 0.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnUsage {
+    /// Input the model read afresh: both adapters count the cached part apart.
+    pub input: u64,
+    pub cached_read: u64,
+    pub cached_write: u64,
+    pub output: u64,
+    /// Of the output, how much was thinking, where the agent says (Codex's does).
+    pub thought: u64,
 }
 
 /// Where a tool call stands. Shown as ACP names it: `Pending`, `InProgress`, `Completed`,
@@ -363,7 +402,38 @@ enum SessionCommand {
     Cancel,
     /// A setting's id and its new value.
     ChangeSetting(String, SettingValue),
+    ReadContext,
 }
+
+/// One turn of a session: a prompt, or a `ReadContext`.
+enum Turn {
+    Prompt(String),
+    /// `/context`, whose answer goes to the front end as a `ContextReport` instead of
+    /// the transcript.
+    ReadContext,
+}
+
+/// What waits for a session's turn in flight to end.
+struct Waiting {
+    /// Prompts, oldest first.
+    prompts: VecDeque<String>,
+    /// A `ReadContext`, which runs once no prompt waits.
+    read_context: bool,
+}
+
+impl Waiting {
+    fn next(&mut self) -> Option<Turn> {
+        match self.prompts.pop_front() {
+            Some(text) => Some(Turn::Prompt(text)),
+            None => std::mem::take(&mut self.read_context).then_some(Turn::ReadContext),
+        }
+    }
+}
+
+/// Claude Code's command that says what fills the context window. claude-agent-acp
+/// 0.94.0 runs it without the model (its `LOCAL_ONLY_COMMANDS`), so it costs nothing and
+/// leaves the conversation as it was, and leaves it out when it replays a session.
+const CONTEXT_COMMAND: &str = "context";
 
 /// What a session's task needs to know of its agent, from `initialize`.
 #[derive(Default)]
@@ -408,6 +478,8 @@ struct SessionEvents {
     events: Sender<Event>,
     /// The session's command queue, which `SessionTask::close` closes.
     commands: Receiver<SessionCommand>,
+    /// The agent's last list of the session's commands has `/context` in it.
+    offers_context: Arc<AtomicBool>,
 }
 
 impl SessionEvents {
@@ -424,6 +496,19 @@ impl SessionEvents {
 
     fn emit(&self, event: SessionEvent) {
         self.send(Event::Session(self.key, event));
+    }
+
+    /// Takes the agent's list of the session's commands, which it sends again whenever
+    /// they change.
+    fn note_commands(&self, commands: &[AvailableCommand]) {
+        let offers = commands
+            .iter()
+            .any(|command| command.name == CONTEXT_COMMAND);
+        self.offers_context.store(offers, Ordering::Relaxed);
+    }
+
+    fn offers_context(&self) -> bool {
+        self.offers_context.load(Ordering::Relaxed)
     }
 }
 
@@ -561,6 +646,7 @@ async fn run(
                     key,
                     events: events.clone(),
                     commands: commands.clone(),
+                    offers_context: Arc::default(),
                 };
                 SessionTask {
                     queue,
@@ -593,6 +679,7 @@ async fn run(
                             }
                             Command::Prompt(key, text) => (key, SessionCommand::Prompt(text)),
                             Command::Cancel(key) => (key, SessionCommand::Cancel),
+                            Command::ReadContext(key) => (key, SessionCommand::ReadContext),
                             Command::ChangeSetting(key, setting, value) => {
                                 (key, SessionCommand::ChangeSetting(setting, value))
                             }
@@ -621,8 +708,13 @@ async fn run(
                         };
                         let session = match sessions.entry(key) {
                             Entry::Occupied(entry) => entry.into_mut(),
-                            // No session, so nothing is running to stop.
-                            Entry::Vacant(_) if matches!(command, SessionCommand::Cancel) => {
+                            // No session, so nothing is running to stop, nor a context to read.
+                            Entry::Vacant(_)
+                                if matches!(
+                                    command,
+                                    SessionCommand::Cancel | SessionCommand::ReadContext
+                                ) =>
+                            {
                                 continue;
                             }
                             // Waits for its first prompt to create the session.
@@ -790,8 +882,11 @@ async fn run_opened(
     let reported = reported_thought_level(&settings)
         .filter(|(id, _)| !changes_waiting.iter().any(|(setting, _)| setting == id));
     events.emit(SessionEvent::Settings(settings));
-    let waiting: VecDeque<String> = prompt.into_iter().collect();
-    if waiting.is_empty() {
+    let waiting = Waiting {
+        prompts: prompt.into_iter().collect(),
+        read_context: false,
+    };
+    if waiting.prompts.is_empty() {
         events.send(Event::SessionReady(key));
     }
     // Only a closed connection fails these, which ends the session anyway.
@@ -824,7 +919,7 @@ async fn replay(session: &mut ActiveSession<'_, Agent>, events: &SessionEvents) 
         // Only a closed connection fails these, which ends the session anyway.
         let Ok(message) = update else { break };
         if let SessionMessage::SessionMessage(dispatch) = message {
-            let _ = handle(dispatch, events, &mut permissions, true).await;
+            let _ = handle(dispatch, events, &mut permissions, true, None).await;
         }
     }
 }
@@ -838,8 +933,8 @@ async fn creating_prompt(
     loop {
         match commands.recv().await {
             Ok(SessionCommand::Prompt(text)) => return Some(text),
-            // No session, so nothing is running to stop.
-            Ok(SessionCommand::Cancel) => {}
+            // No session, so nothing is running to stop, nor a context to read.
+            Ok(SessionCommand::Cancel | SessionCommand::ReadContext) => {}
             Ok(SessionCommand::ChangeSetting(setting, value)) => changes.push((setting, value)),
             Err(_) => return None,
         }
@@ -847,12 +942,12 @@ async fn creating_prompt(
 }
 
 /// Runs the session's prompts one at a time, as they arrive, until the front end closes
-/// the session. Prompts sent during a turn wait in `waiting` for their own, and every
-/// prompt waits for the agent to answer the setting changes sent before it, those
-/// already in `changes` included.
+/// the session. Prompts sent during a turn wait in `waiting` for their own, as does a
+/// `ReadContext`, and every prompt waits for the agent to answer the setting changes sent
+/// before it, those already in `changes` included.
 async fn serve(
     session: &mut ActiveSession<'_, Agent>,
-    mut waiting: VecDeque<String>,
+    mut waiting: Waiting,
     mut changes: Changes,
     commands: &Receiver<SessionCommand>,
     events: &SessionEvents,
@@ -861,10 +956,11 @@ async fn serve(
     // Off once the connection has gone, which the next prompt then reports.
     let mut reading = true;
     loop {
-        let text = match waiting.pop_front() {
-            Some(text) => text,
+        let turn = match waiting.next() {
+            Some(turn) => turn,
             None => match between_turns(session, commands, events, &mut reading).await {
-                Some(SessionCommand::Prompt(text)) => text,
+                Some(SessionCommand::Prompt(text)) => Turn::Prompt(text),
+                Some(SessionCommand::ReadContext) => Turn::ReadContext,
                 // Nothing is running, so there is nothing to stop.
                 Some(SessionCommand::Cancel) => continue,
                 Some(SessionCommand::ChangeSetting(setting, value)) => {
@@ -875,31 +971,88 @@ async fn serve(
                 None => return,
             },
         };
+        let reads_context = matches!(turn, Turn::ReadContext);
+        // Sent to an agent without the command, it would go to the model as a prompt.
+        if reads_context && !events.offers_context() {
+            events.emit(SessionEvent::ContextReport(None));
+            continue;
+        }
         // The agent may still be applying a change, and a prompt it took first would
         // run with the setting as it was.
         let waited = wait_for_changes(session, &mut waiting, commands, events, &mut changes).await;
         match waited {
             Waited::Answered => {}
-            // Stopped before it was sent, so it never runs.
+            // Stopped before it was sent, so it never runs. Before a context read, the
+            // stop is meant for a prompt sent meanwhile, if one was.
             Waited::Stopped => {
-                let stop_reason = format!("{:?}", StopReason::Cancelled);
-                events.emit(SessionEvent::TurnEnded { stop_reason });
+                let stops_prompt = match turn {
+                    Turn::Prompt(_) => true,
+                    Turn::ReadContext => {
+                        events.emit(SessionEvent::ContextReport(None));
+                        waiting.prompts.pop_front().is_some()
+                    }
+                };
+                if stops_prompt {
+                    let stop_reason = format!("{:?}", StopReason::Cancelled);
+                    events.emit(SessionEvent::TurnEnded { stop_reason });
+                }
                 continue;
             }
             Waited::Gone => return,
         }
-        let outcome =
-            match run_turn(session, text, commands, &mut waiting, &mut changes, events).await {
-                Ok(reason) => SessionEvent::TurnEnded {
-                    stop_reason: format!("{reason:?}"),
-                },
-                Err(err) => SessionEvent::TurnFailed(describe_error(err, login_options)),
-            };
+        let text = match turn {
+            Turn::Prompt(text) => text,
+            // A prompt sent meanwhile goes first.
+            Turn::ReadContext if !waiting.prompts.is_empty() => {
+                waiting.read_context = true;
+                continue;
+            }
+            Turn::ReadContext => format!("/{CONTEXT_COMMAND}"),
+        };
+        let mut report = String::new();
+        let into = reads_context.then_some(&mut report);
+        let answer = run_turn(
+            session,
+            text,
+            into,
+            commands,
+            &mut waiting,
+            &mut changes,
+            events,
+        )
+        .await;
         // Closed during the turn, which was stopped; prompts sent during it never run.
         if commands.is_closed() {
             return;
         }
-        events.emit(outcome);
+        if reads_context {
+            let report = match answer {
+                Ok(response) if response.stop_reason == StopReason::EndTurn => {
+                    Some(report).filter(|report| !report.trim().is_empty())
+                }
+                // Stopped for a prompt.
+                Ok(_) => None,
+                Err(err) => {
+                    tracing::warn!(session = events.key.0, error = %err, "/context failed");
+                    None
+                }
+            };
+            events.emit(SessionEvent::ContextReport(report));
+            continue;
+        }
+        match answer {
+            Ok(response) => {
+                if let Some(usage) = response.usage {
+                    events.emit(SessionEvent::TurnUsage(turn_usage(usage)));
+                }
+                let stop_reason = format!("{:?}", response.stop_reason);
+                events.emit(SessionEvent::TurnEnded { stop_reason });
+            }
+            Err(err) => {
+                let message = describe_error(err, login_options);
+                events.emit(SessionEvent::TurnFailed(message));
+            }
+        }
     }
 }
 
@@ -935,7 +1088,7 @@ async fn between_turns(
                 // No turn is running to show a permission request in, so one that comes
                 // is answered as cancelled as this drops.
                 let mut permissions = Vec::new();
-                let _ = handle(dispatch, events, &mut permissions, false).await;
+                let _ = handle(dispatch, events, &mut permissions, false, None).await;
             }
             Ok(_) => {}
             Err(_) => *reading = false,
@@ -1015,18 +1168,21 @@ fn cancel_turn(session: &ActiveSession<'_, Agent>) -> Result<(), Error> {
         .send_notification(CancelNotification::new(id))
 }
 
-/// Sends one prompt and forwards the session's updates until the agent answers it.
+/// Sends one prompt and forwards the session's updates until the agent answers it. The
+/// agent's text goes to `report` instead, when there is one, for a `ReadContext`.
 /// The prompt is sent by hand instead of with `ActiveSession::send_prompt`, whose
 /// failure would end the whole connection along with every other session.
 async fn run_turn(
     session: &mut ActiveSession<'_, Agent>,
     text: String,
+    mut report: Option<&mut String>,
     commands: &Receiver<SessionCommand>,
-    waiting: &mut VecDeque<String>,
+    waiting: &mut Waiting,
     changes: &mut Changes,
     events: &SessionEvents,
-) -> Result<StopReason, Error> {
+) -> Result<PromptResponse, Error> {
     let key = events.key;
+    let reads_context = report.is_some();
     enum Next {
         Update(Result<SessionMessage, Error>),
         Answered(Result<Result<PromptResponse, Error>, oneshot::Canceled>),
@@ -1094,7 +1250,8 @@ async fn run_turn(
                 if let SessionMessage::SessionMessage(dispatch) = update? {
                     first_update_ms.get_or_insert_with(|| millis(sent));
                     updates += 1;
-                    handle(dispatch, events, &mut permissions, false).await?;
+                    let report = report.as_deref_mut();
+                    handle(dispatch, events, &mut permissions, false, report).await?;
                 }
             }
             Next::Answered(answer) => {
@@ -1106,11 +1263,10 @@ async fn run_turn(
                     first_update_ms,
                     updates,
                     after_stop_ms = stopped.map(millis),
+                    reads_context,
                     "session/prompt"
                 );
-                return answer
-                    .map_err(|_| internal_error("the prompt was dropped"))?
-                    .map(|response| response.stop_reason);
+                return answer.map_err(|_| internal_error("the prompt was dropped"))?;
             }
             Next::Chosen(ix, choice) => {
                 let permission = permissions.remove(ix);
@@ -1122,6 +1278,13 @@ async fn run_turn(
                 permission.answer(choice)?
             }
             Next::Command(Some(SessionCommand::Cancel)) => {
+                // A stop during a context read is meant for the prompt that stopped it,
+                // which waits behind it and so never runs.
+                if reads_context && waiting.prompts.pop_front().is_some() {
+                    let stop_reason = format!("{:?}", StopReason::Cancelled);
+                    events.emit(SessionEvent::TurnEnded { stop_reason });
+                    continue;
+                }
                 stopped.get_or_insert_with(Instant::now);
                 cancel_turn(session)?;
                 // ACP has the client answer every open permission request as cancelled.
@@ -1129,9 +1292,20 @@ async fn run_turn(
                     permission.answer(None)?;
                 }
             }
-            Next::Command(Some(SessionCommand::Prompt(text))) => waiting.push_back(text),
+            Next::Command(Some(SessionCommand::Prompt(text))) => {
+                waiting.prompts.push_back(text);
+                // A context read never holds up a prompt.
+                if reads_context && stopped.is_none() {
+                    stopped = Some(Instant::now());
+                    cancel_turn(session)?;
+                }
+            }
             Next::Command(Some(SessionCommand::ChangeSetting(setting, value))) => {
                 change_setting(session, setting, value, events, changes)?
+            }
+            // The one running answers it, if this turn is one.
+            Next::Command(Some(SessionCommand::ReadContext)) => {
+                waiting.read_context |= !reads_context;
             }
             // Closed; the check at the top of the loop stops the turn.
             Next::Command(None) => {}
@@ -1210,7 +1384,7 @@ enum Waited {
 /// reported failed.
 async fn wait_for_changes(
     session: &ActiveSession<'_, Agent>,
-    waiting: &mut VecDeque<String>,
+    waiting: &mut Waiting,
     commands: &Receiver<SessionCommand>,
     events: &SessionEvents,
     changes: &mut Changes,
@@ -1254,7 +1428,8 @@ async fn wait_for_changes(
                 changes.last = None;
             }
             Next::Command(Some(SessionCommand::Cancel)) => return Waited::Stopped,
-            Next::Command(Some(SessionCommand::Prompt(text))) => waiting.push_back(text),
+            Next::Command(Some(SessionCommand::Prompt(text))) => waiting.prompts.push_back(text),
+            Next::Command(Some(SessionCommand::ReadContext)) => waiting.read_context = true,
             Next::Command(Some(SessionCommand::ChangeSetting(setting, value))) => {
                 // Only a closed connection fails this, which ends the session anyway.
                 let _ = change_setting(session, setting, value, events, changes);
@@ -1403,17 +1578,24 @@ fn send_change(
     sent
 }
 
-/// Takes one message the agent sent for the session; `replaying` while it loads.
+/// Takes one message the agent sent for the session; `replaying` while it loads. The
+/// agent's text goes to `report` instead, when there is one.
 async fn handle(
     dispatch: Dispatch,
     events: &SessionEvents,
     permissions: &mut Vec<PendingPermission>,
     replaying: bool,
+    report: Option<&mut String>,
 ) -> Result<(), Error> {
     MatchDispatch::new(dispatch)
         .if_notification(async |notification: SessionNotification| {
-            if let Some(event) = flatten(notification.update, replaying) {
-                events.emit(event);
+            if let SessionUpdate::AvailableCommandsUpdate(update) = &notification.update {
+                events.note_commands(&update.available_commands);
+            }
+            match (flatten(notification.update, replaying), report) {
+                (Some(SessionEvent::AgentText(text)), Some(report)) => report.push_str(&text),
+                (Some(event), _) => events.emit(event),
+                (None, _) => {}
             }
             Ok(())
         })
@@ -1566,8 +1748,25 @@ fn flatten(update: SessionUpdate, replaying: bool) -> Option<SessionEvent> {
             MaybeUndefined::Value(title) if !title.trim().is_empty() => SessionEvent::Title(title),
             _ => return None,
         },
+        // A window of 0 says nothing, and Codex's adapter never sends one.
+        SessionUpdate::UsageUpdate(usage) if usage.size > 0 => {
+            SessionEvent::ContextUsage(ContextUsage {
+                used: usage.used,
+                size: usage.size,
+            })
+        }
         _ => return None,
     })
+}
+
+fn turn_usage(usage: Usage) -> TurnUsage {
+    TurnUsage {
+        input: usage.input_tokens,
+        cached_read: usage.cached_read_tokens.unwrap_or(0),
+        cached_write: usage.cached_write_tokens.unwrap_or(0),
+        output: usage.output_tokens,
+        thought: usage.thought_tokens.unwrap_or(0),
+    }
 }
 
 /// The thought level the agent reports for a session it has just created or loaded, for

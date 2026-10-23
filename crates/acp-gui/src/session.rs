@@ -466,6 +466,10 @@ impl Session {
                 self.title = Some(title);
                 self.title_source = TitleSource::Agent;
             }
+            // Nothing in the window shows these yet.
+            SessionEvent::ContextUsage(_)
+            | SessionEvent::TurnUsage(_)
+            | SessionEvent::ContextReport(_) => {}
         }
     }
 
@@ -684,7 +688,7 @@ pub(crate) struct Paced {
 }
 
 /// Events that land in the transcript, which keep their order behind held-back text.
-/// The others concern settings and land at once.
+/// The others concern settings or the context window and land at once.
 fn in_transcript(event: &SessionEvent) -> bool {
     !matches!(
         event,
@@ -694,6 +698,9 @@ fn in_transcript(event: &SessionEvent) -> bool {
             | SessionEvent::ModeChanged(_)
             | SessionEvent::SettingFailed { .. }
             | SessionEvent::Title(_)
+            | SessionEvent::ContextUsage(_)
+            | SessionEvent::TurnUsage(_)
+            | SessionEvent::ContextReport(_)
     )
 }
 
