@@ -25,7 +25,7 @@ use gpui_kit::*;
 use crate::chat_view::ChatView;
 use crate::chrome::{
     OWN_TITLE_BAR, TrafficLights, WINDOW_BLUR, apply_appearance, traffic_light_size,
-    window_background, with_panel_colors,
+    window_background, with_code_colors, with_panel_colors,
 };
 use crate::config::{AppSettings, load_settings};
 
@@ -229,6 +229,8 @@ fn main() {
             Theme::update(cx, |theme| {
                 theme.light_theme = with_panel_colors(&theme.light_theme, "#f7f7f7", "#fcfcfc");
                 theme.dark_theme = with_panel_colors(&theme.dark_theme, "#111111", "#151515");
+                theme.light_theme = with_code_colors(&theme.light_theme);
+                theme.dark_theme = with_code_colors(&theme.dark_theme);
             });
             let lights = TrafficLights::new(traffic_light_size());
             // Blurred from the start, where the platform can blur and the settings say so.

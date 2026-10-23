@@ -1,9 +1,10 @@
 //! The window around the sidebar and the chat: the title bar row the app draws itself on
 //! macOS, the traffic lights in it, the blurred background, and the theme's light or dark
-//! mode with the sidebar's and the chat's two grays.
+//! mode with the sidebar's and the chat's two grays and the colors of code.
 
 use std::rc::Rc;
 
+use gpui_kit::component::highlighter::{SyntaxColors, ThemeStyle};
 use gpui_kit::component::{Theme, ThemeConfig, ThemeMode};
 use gpui_kit::*;
 
@@ -139,5 +140,49 @@ pub(crate) fn with_panel_colors(
     let mut config = config.clone();
     config.colors.sidebar = Some(sidebar.into());
     config.colors.background = Some(chat.into());
+    Rc::new(config)
+}
+
+/// `config` with the colors of code. gpui-component's `Diff` takes them all from the
+/// theme: added and removed lines in success and danger, as their signs and at 12% and
+/// 30% behind lines and words, folded runs in muted at 35%, and the syntax colors, which
+/// keep clear of green and red as those mean added and removed. A mono size of 12 makes
+/// its rows 19.2 px, with the code boxes' 12 px text.
+pub(crate) fn with_code_colors(config: &ThemeConfig) -> Rc<ThemeConfig> {
+    let dark = config.mode.is_dark();
+    let mut config = config.clone();
+    if dark {
+        config.colors.success = Some("#4ade80".into());
+        config.colors.danger = Some("#f87171".into());
+    } else {
+        config.colors.success = Some("#15803d".into());
+        config.colors.danger = Some("#b91c1c".into());
+        // The library's #f5f5f5 is the code box's own ground, so folded runs vanished.
+        config.colors.muted = Some("#e0e0e0".into());
+    }
+    config.mono_font_size = Some(12.);
+    let (keyword, string, comment, number) = if dark {
+        (0xc4a5f5, 0x9ecbff, 0x8f8f8f, 0xe5b97d)
+    } else {
+        (0x6f3cc4, 0x0a4a8a, 0x6b6b6b, 0x8a4b00)
+    };
+    let style = |color: u32| {
+        Some(ThemeStyle {
+            color: Some(rgb(color).into()),
+            font_style: None,
+            font_weight: None,
+        })
+    };
+    // Only these kinds are colored; the rest of the code keeps the text's own color.
+    config.highlight.get_or_insert_default().syntax = SyntaxColors {
+        keyword: style(keyword),
+        string: style(string),
+        comment: style(comment),
+        number: style(number),
+        constant: style(number),
+        boolean: style(number),
+        type_: style(number),
+        ..SyntaxColors::default()
+    };
     Rc::new(config)
 }

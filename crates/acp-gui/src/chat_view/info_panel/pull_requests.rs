@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use acp_core::SessionKey;
 use gpui_kit::assets;
+use gpui_kit::component::diff::{Diff, DiffHunkSeparator, DiffState};
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::{ActiveTheme as _, Icon, IconName, Sizable as _};
 use gpui_kit::prelude::FluentBuilder as _;
@@ -19,7 +20,7 @@ use super::{
     ROW_GAP, ROW_PAD, ROW_RADIUS, TEXT_LINE_HEIGHT, TEXT_SIZE, chevron, section_header,
 };
 use crate::chat_view::ChatView;
-use crate::chat_view::tool_call::{CODE_LINE_HEIGHT, CODE_SIZE, ToolLook, diff_line, frame};
+use crate::chat_view::tool_call::{ToolLook, frame};
 use crate::session::{
     ChecksState, GhProblem, PrState, PrStatus, PullRequest, Session, file_diffs, read_diff, view,
 };
@@ -48,8 +49,9 @@ const BACK_ICON_SIZE: Pixels = px(16.);
 const DIFF_PATH_LEFT: Pixels = px(15.);
 const DIFF_PATH_RIGHT: Pixels = px(12.);
 const DIFF_PATH_BELOW: Pixels = px(10.);
-/// Above and below the diff's lines, inside its box.
-const DIFF_BOX_PAD: Pixels = px(6.);
+/// How wide the panel is before the diff numbers its lines. Its two number columns take
+/// 82 px at three digits, which at the panel's first 296 px leaves 22 characters of code.
+const DIFF_NUMBERS_FROM: Pixels = px(400.);
 
 /// A file of a pull request, whose diff the panel shows in place of its sections.
 #[derive(Clone)]
@@ -203,7 +205,7 @@ impl ChatView {
             let asked = url.clone();
             let answer = cx
                 .background_executor()
-                .spawn(async move { read_diff(&asked) })
+                .spawn(async move { read_diff(&asked).map(|patch| file_diffs(&patch)) })
                 .await;
             let _ = this.update(cx, |this, cx| {
                 let Some(pr) = this
@@ -214,7 +216,7 @@ impl ChatView {
                 };
                 pr.reading_diff = false;
                 match answer {
-                    Ok(patch) => pr.diffs = Some((head, Rc::new(file_diffs(&patch)))),
+                    Ok(diffs) => pr.diffs = Some((head, Rc::new(diffs))),
                     Err(problem) => pr.diff_problem = Some(problem),
                 }
                 cx.notify();
@@ -486,6 +488,7 @@ impl ChatView {
         &self,
         session: &Session,
         look: PanelLook,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let shown = self.info_panel.diff.as_ref()?;
@@ -561,42 +564,42 @@ impl ChatView {
             .diffs
             .as_ref()
             .filter(|(at, _)| Some(at.as_str()) == head)
-            .map(|(_, diffs)| diffs.get(&file.path));
+            .map(|(at, diffs)| (at, diffs.get(&file.path)));
         let body = match (diff, &pr.diff_problem) {
-            (Some(Some(diff)), _) if !diff.lines.is_empty() => {
+            (Some((at, Some(diff))), _) if diff.lines > 0 => {
                 let tool = ToolLook::new(cx);
-                let lines = diff.lines.clone();
-                let numbered = diff.numbered;
-                let count = lines.len();
-                let list = uniform_list(
-                    ElementId::Name(format!("info-diff-{}", file.path).into()),
-                    count,
-                    move |range, _, _| {
-                        range
-                            .map(|ix| diff_line(&lines[ix], numbered, tool))
-                            .collect::<Vec<_>>()
-                    },
-                )
-                .with_width_from_item(Some(diff.widest))
-                .with_horizontal_sizing_behavior(ListHorizontalSizingBehavior::Unconstrained)
-                .size_full();
-                // As tall as its lines, and no taller than the panel leaves it: then its
-                // lines scroll.
+                let shown = diff.file.clone();
+                // A new head commit is a new diff, with its own scroll and folds.
+                let id = ElementId::Name(format!("info-diff-{at}-{}", file.path).into());
+                let state = window.use_keyed_state(id, cx, move |_, cx| {
+                    // Every line the patch has: git already cut it to 3 around a change.
+                    DiffState::new([shown], cx).with_context_lines(None)
+                });
+                // As tall as its rows, and no taller than the panel leaves it: then they
+                // scroll. Diff draws a line 1.6 times the theme's mono size, and the
+                // note on lines the patch leaves out 1.5 rem.
+                let rem = window.rem_size();
+                let line = rem * (f32::from(cx.theme().mono_font_size) / 16.) * 1.6;
+                let gap = rem * 1.5;
                 // Its 1px edge above and below.
                 let edges = px(2.);
                 frame(tool)
                     .flex_shrink(1.)
                     .min_h(px(0.))
-                    .h(CODE_LINE_HEIGHT * count as f32 + DIFF_BOX_PAD * 2. + edges)
+                    .h(line * diff.lines as f32 + gap * diff.gaps as f32 + edges)
                     .ml(BODY_LEFT)
                     .mr(BODY_RIGHT)
                     .mb(BODY_BOTTOM)
-                    .py(DIFF_BOX_PAD)
-                    .font_family(cx.theme().mono_font_family.clone())
-                    .text_size(CODE_SIZE)
-                    .line_height(CODE_LINE_HEIGHT)
-                    .text_color(tool.code_text)
-                    .child(list)
+                    .child(
+                        Diff::new(&state)
+                            .header_visible(false)
+                            .line_number(self.info_panel.width >= DIFF_NUMBERS_FROM)
+                            .hunk_separator(DiffHunkSeparator::LineInfo)
+                            .size_full()
+                            .bg(tool.code)
+                            .text_color(tool.code_text)
+                            .border_0(),
+                    )
             }
             (Some(_), _) => diff_note(
                 "No lines to show: the file is binary, or only moved.",

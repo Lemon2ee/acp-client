@@ -1546,7 +1546,9 @@ impl Render for ChatView {
             )
             .child(folder_line)
             .children(usage_line);
-        let panel = self.render_info_panel(panel_hidden, cx).opacity(chat_shown);
+        let panel = self
+            .render_info_panel(panel_hidden, window, cx)
+            .opacity(chat_shown);
 
         // The chat fills the window right of the sidebar.
         let chat = div()

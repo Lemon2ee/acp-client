@@ -5,15 +5,13 @@
 
 use std::collections::HashMap;
 use std::io::ErrorKind;
-use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::rc::Rc;
 use std::time::Instant;
 
 use acp_core::ToolContent;
+use gpui_kit::component::diff::DiffFile;
 use serde::{Deserialize, Serialize};
-
-use super::tool_call::{Diff, patch_diff};
 
 /// What `gh pr view` is asked for.
 const FIELDS: &str = "number,title,state,isDraft,baseRefName,headRefName,headRefOid,additions,\
@@ -37,7 +35,7 @@ pub(crate) struct PullRequest {
     /// When gh last answered; none until it has in this run, or since a turn ended.
     pub(crate) checked: Option<Instant>,
     /// Each file's diff by its path, as read at the head commit named with them.
-    pub(crate) diffs: Option<(String, Rc<HashMap<String, Diff>>)>,
+    pub(crate) diffs: Option<(String, Rc<HashMap<String, FileDiff>>)>,
     /// `gh pr diff` has been asked and hasn't answered.
     pub(crate) reading_diff: bool,
     /// Why the last diff didn't come, until the user opens a file's diff again.
@@ -373,36 +371,71 @@ fn gh(args: &[&str]) -> Result<Vec<u8>, GhProblem> {
     ))
 }
 
+/// One file's part of a pull request's diff, parsed for gpui-component's `Diff`.
+pub(crate) struct FileDiff {
+    pub(crate) file: DiffFile,
+    /// The rows it shows: one for each line of its hunks, and one more before each hunk
+    /// with lines the patch leaves out above it.
+    pub(crate) lines: usize,
+    pub(crate) gaps: usize,
+}
+
 /// Each file's diff in a pull request's whole diff, by the file's path in the head
-/// commit, or in the base one for a file it deletes.
-pub(crate) fn file_diffs(patch: &str) -> HashMap<String, Diff> {
+/// commit, or in the base one for a file it deletes. Each file is parsed on its own, so
+/// one the parser refuses leaves the others.
+pub(crate) fn file_diffs(patch: &str) -> HashMap<String, FileDiff> {
     let mut diffs = HashMap::new();
     let mut lines = patch.lines().peekable();
     while let Some(line) = lines.next() {
-        let Some(header) = line.strip_prefix("diff --git ") else {
+        if !line.starts_with("diff --git ") {
             continue;
-        };
-        let mut path = header.rsplit_once(" b/").map(|(_, path)| path.to_string());
-        let mut body = Vec::new();
+        }
+        let mut section = vec![line];
+        let (mut rows, mut gaps) = (0, 0);
+        // The next line of the old text; none until the first hunk says where it starts.
+        let mut next_old: Option<usize> = None;
         while let Some(line) = lines.next_if(|line| !line.starts_with("diff --git ")) {
-            if body.is_empty() && !line.starts_with("@@") {
-                // The header's own lines name the file more surely than its first line,
-                // which is ambiguous for a path with " b/" in it.
-                if let Some(named) = line.strip_prefix("+++ b/") {
-                    path = Some(named.to_string());
-                } else if let (Some(named), None) = (line.strip_prefix("--- a/"), &path) {
-                    path = Some(named.to_string());
+            section.push(line);
+            if let Some(old_start) = hunk_start(line) {
+                if old_start > next_old.unwrap_or(1) {
+                    gaps += 1;
                 }
+                next_old = Some(old_start);
                 continue;
             }
-            body.push(line);
+            let Some(old) = next_old.as_mut() else {
+                continue;
+            };
+            // Some tools trim the space off an empty unchanged line; "\ No newline at
+            // end of file" is about the line before.
+            match line.as_bytes().first() {
+                Some(b'+') => rows += 1,
+                Some(b' ' | b'-') | None => {
+                    rows += 1;
+                    *old += 1;
+                }
+                _ => {}
+            }
         }
-        if let Some(path) = path {
-            let diff = patch_diff(PathBuf::from(&path), &body);
-            diffs.insert(path, diff);
+        let parsed = DiffFile::parse(&section.join("\n"));
+        if let Some(file) = parsed.ok().and_then(|files| files.into_iter().next()) {
+            let diff = FileDiff {
+                file,
+                lines: rows,
+                gaps,
+            };
+            diffs.insert(diff.file.path().to_string(), diff);
         }
     }
     diffs
+}
+
+/// Where a hunk starts in the old text, from its `@@ -12,7 +12,9 @@`.
+fn hunk_start(line: &str) -> Option<usize> {
+    let rest = line.strip_prefix("@@ -")?;
+    let (old, rest) = rest.split_once(" +")?;
+    rest.split_once(" @@")?;
+    old.split(',').next()?.parse().ok()
 }
 
 /// `gh pr view`'s answer, as far as the panel reads it.
@@ -655,7 +688,7 @@ mod tests {
                      +2\n\
                      +3\n \
                      four\n\
-                     @@ -20,2 +21,2 @@\n \
+                     @@ -20 +21 @@\n \
                      x\n\
                      \\ No newline at end of file\n\
                      diff --git a/gone.md b/gone.md\n\
@@ -666,23 +699,25 @@ mod tests {
                      -bye\n";
         let diffs = file_diffs(patch);
         let a = &diffs["src/a.rs"];
-        assert_eq!((a.added, a.removed), (2, 1));
-        let shown: Vec<String> = a
-            .lines
-            .iter()
-            .map(|line| match line {
-                crate::session::DiffLine::Line { change, number, .. } => {
-                    format!("{change}{number}")
-                }
-                crate::session::DiffLine::Folded(count) => format!("~{count}"),
-            })
-            .collect();
-        // 9 lines before the first hunk, and 20 - 13 = 7 between the two.
-        assert_eq!(
-            shown,
-            ["~9", " 10", "-11", "+11", "+12", " 13", "~7", " 21"]
-        );
+        assert_eq!((a.file.additions(), a.file.deletions()), (2, 1));
+        // Five lines in the first hunk and one in the second; 9 lines left out before
+        // the first and 20 - 13 = 7 between the two.
+        assert_eq!((a.lines, a.gaps), (6, 2));
         let gone = &diffs["gone.md"];
-        assert_eq!((gone.added, gone.removed), (0, 1));
+        assert_eq!((gone.file.additions(), gone.file.deletions()), (0, 1));
+        assert_eq!((gone.lines, gone.gaps), (1, 0));
+    }
+
+    #[test]
+    fn a_new_file_has_no_gap_above_it() {
+        let patch = "diff --git a/new.rs b/new.rs\n\
+                     new file mode 100644\n\
+                     --- /dev/null\n\
+                     +++ b/new.rs\n\
+                     @@ -0,0 +1,2 @@\n\
+                     +one\n\
+                     +two\n";
+        let new = &file_diffs(patch)["new.rs"];
+        assert_eq!((new.lines, new.gaps), (2, 0));
     }
 }
