@@ -254,7 +254,7 @@ impl ChatView {
             }
             if let Some(changes) = &repo.changes {
                 items.extend(base_item(changes, &look, lines));
-                items.push(status_item(changes, &look));
+                items.extend(status_item(changes, &look));
             }
         }
 
@@ -311,8 +311,13 @@ fn base_item(changes: &Changes, look: &MenuLook, lines: ToolLook) -> Option<Stat
     Some(item)
 }
 
-/// "Clean", or how many files are changed and not committed, and how many are untracked.
-fn status_item(changes: &Changes, look: &MenuLook) -> Stateful<Div> {
+/// How many files are changed and not committed, and how many are untracked. None when
+/// there are none: the line only speaks up about what needs a look.
+fn status_item(changes: &Changes, look: &MenuLook) -> Option<Stateful<Div>> {
+    let (uncommitted, untracked) = (changes.uncommitted, changes.untracked);
+    if uncommitted == 0 && untracked == 0 {
+        return None;
+    }
     let item = div()
         .id("git-status")
         .flex()
@@ -322,12 +327,6 @@ fn status_item(changes: &Changes, look: &MenuLook) -> Stateful<Div> {
         .text_size(GIT_TEXT_SIZE)
         .line_height(FOLDER_TEXT_LINE)
         .text_color(look.muted);
-    let (uncommitted, untracked) = (changes.uncommitted, changes.untracked);
-    if uncommitted == 0 && untracked == 0 {
-        return item
-            .child(Icon::new(IconName::Check).size(GIT_ICON_SIZE))
-            .child("Clean");
-    }
     let mut short = Vec::new();
     let mut long = Vec::new();
     if uncommitted > 0 {
@@ -342,16 +341,18 @@ fn status_item(changes: &Changes, look: &MenuLook) -> Stateful<Div> {
         long.push(count(untracked, "untracked file", "untracked files"));
     }
     let tip = SharedString::from(long.join(" \u{b7} "));
-    item.child(
-        // The model panel's star color, which reads as "needs a look" in both themes.
-        div()
-            .size(DIRTY_DOT_SIZE)
-            .flex_none()
-            .rounded_full()
-            .bg(look.star),
-    )
-    .child(short.join(" \u{b7} "))
-    .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+    let item = item
+        .child(
+            // The model panel's star color, which reads as "needs a look" in both themes.
+            div()
+                .size(DIRTY_DOT_SIZE)
+                .flex_none()
+                .rounded_full()
+                .bg(look.star),
+        )
+        .child(short.join(" \u{b7} "))
+        .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx));
+    Some(item)
 }
 
 /// One of git's items: its icon, then whatever the caller adds after it.
