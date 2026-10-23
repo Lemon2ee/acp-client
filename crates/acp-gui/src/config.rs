@@ -302,6 +302,55 @@ pub(crate) fn change_saved_sessions(
     std::fs::rename(&written, &path)
 }
 
+/// Holds the folders sessions were started in, newest first, as JSON.
+const RECENT_FOLDERS: &str = "recent-folders";
+/// How many of them the folder menu lists.
+const RECENT_FOLDERS_MAX: usize = 10;
+
+/// The folders kept, but those gone since. None when there is no file yet, which is how
+/// the window knows to start the list from the sessions kept, and when it can't be read.
+pub(crate) fn load_recent_folders() -> Option<Vec<PathBuf>> {
+    read_recent_folders(&config_folder()?.join(RECENT_FOLDERS))
+}
+
+fn read_recent_folders(path: &Path) -> Option<Vec<PathBuf>> {
+    let folders: Vec<PathBuf> = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+    Some(
+        folders
+            .into_iter()
+            .filter(|folder| folder.is_dir())
+            .collect(),
+    )
+}
+
+/// Makes `change` to the folders kept in `folder`, and returns the newest
+/// `RECENT_FOLDERS_MAX` of them. Windows changing them at once take turns under a lock,
+/// and the new file replaces the old one whole. A file that can't be read is started
+/// over: all it saves is finding a folder in the folder panel again.
+pub(crate) fn change_recent_folders(
+    folder: &Path,
+    change: impl FnOnce(&mut Vec<PathBuf>),
+) -> std::io::Result<Vec<PathBuf>> {
+    std::fs::create_dir_all(folder)?;
+    // Held until the new file is in place.
+    let lock = std::fs::File::create(folder.join(format!("{RECENT_FOLDERS}.lock")))?;
+    lock.lock()?;
+    let path = folder.join(RECENT_FOLDERS);
+    let mut folders = read_recent_folders(&path).unwrap_or_default();
+    change(&mut folders);
+    folders.truncate(RECENT_FOLDERS_MAX);
+    let written = folder.join(format!("{RECENT_FOLDERS}.new"));
+    std::fs::write(&written, serde_json::to_vec(&folders)?)?;
+    std::fs::rename(&written, &path)?;
+    Ok(folders)
+}
+
+/// Puts `used` first among `folders`, and nowhere else.
+pub(crate) fn put_first(folders: &mut Vec<PathBuf>, used: &Path) {
+    folders.retain(|folder| folder != used);
+    folders.insert(0, used.to_path_buf());
+}
+
 /// Holds what the settings page sets, as JSON.
 pub(crate) const SETTINGS: &str = "settings.json";
 
@@ -516,4 +565,20 @@ pub(crate) fn change_stuff(
     // Laid out for reading, as notes are the user's own text.
     std::fs::write(&written, serde_json::to_vec_pretty(&StuffFile { notes })?)?;
     std::fs::rename(&written, &path)
+}
+
+#[cfg(test)]
+mod tests {
+    // Not a glob: gpui's own `test` attribute would shadow the standard one.
+    use super::put_first;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn a_folder_used_again_moves_to_the_front() {
+        let mut folders = ["/a", "/b", "/c"].map(PathBuf::from).to_vec();
+        put_first(&mut folders, Path::new("/c"));
+        assert_eq!(folders, ["/c", "/a", "/b"].map(PathBuf::from));
+        put_first(&mut folders, Path::new("/d"));
+        assert_eq!(folders, ["/d", "/c", "/a", "/b"].map(PathBuf::from));
+    }
 }
