@@ -172,6 +172,10 @@ const SELECT_CHECK_SIZE: Pixels = px(10.);
 /// A card's sides, which the circle's click target reaches out to, so it is the card's
 /// end rather than the circle alone.
 const CARD_PAD_X: Pixels = px(12.);
+/// The bar's buttons, and its right padding: 5px puts the last button's icon over the
+/// cards' circles.
+const BAR_BUTTON_SIZE: Pixels = px(28.);
+const BAR_PAD_RIGHT: Pixels = px(5.);
 
 /// What a drag of the sidebar's edge carries. gpui tells drags apart by this type, and
 /// draws it under the pointer: nothing, since the sidebar itself follows the pointer.
@@ -386,12 +390,17 @@ impl ChatView {
     fn selection_bar(&self, chip_hover: Hsla, cx: &mut Context<Self>) -> Stateful<Div> {
         let hover = cx.theme().secondary;
         let count = self.sidebar.selection.keys.len();
+        let (archive_icon, archive_label) = if self.sidebar.selection.archived {
+            (gpui_kit::assets::IconName::ArchiveRestore, "Unarchive")
+        } else {
+            (gpui_kit::assets::IconName::Archive, "Archive")
+        };
         div()
             .id("selection-bar")
             .h(px(32.))
             .flex_none()
             .pl(px(8.5))
-            .pr_3()
+            .pr(BAR_PAD_RIGHT)
             .flex()
             .items_center()
             .gap_1p5()
@@ -422,6 +431,25 @@ impl ChatView {
                     .font_weight(FontWeight::MEDIUM)
                     .child(format!("{count} selected")),
             )
+            .child(
+                bar_button("archive-selected", archive_icon, archive_label, cx).on_click(
+                    cx.listener(|this, _: &ClickEvent, window, cx| {
+                        this.archive_selected(window, cx)
+                    }),
+                ),
+            )
+    }
+
+    /// Moves the picked sessions to Archived, or out of it, all at once. Nothing asks
+    /// first: Unarchive, or Archive, puts any back.
+    fn archive_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let archived = !self.sidebar.selection.archived;
+        let keys = std::mem::take(&mut self.sidebar.selection.keys);
+        self.sidebar.selection.clear();
+        for key in keys {
+            self.set_archived(key, archived, window, cx);
+        }
+        cx.notify();
     }
 
     /// A session's card in the sidebar: its name, or the field to change it. The session
@@ -481,6 +509,7 @@ impl ChatView {
         let view = cx.entity().downgrade();
         let selecting = self.sidebar.selection.shown_in(archived);
         let picked = self.sidebar.selection.has(key);
+        let picked_count = self.sidebar.selection.keys.len();
         card.role(Role::Button)
             .aria_label(title.clone())
             .cursor_pointer()
@@ -505,6 +534,13 @@ impl ChatView {
                 let (rename, archive, delete) = (view.clone(), view.clone(), view.clone());
                 let pick = view.clone();
                 let archive_label = if archived { "Unarchive" } else { "Archive" };
+                // A picked card's menu acts on all those picked.
+                if picked {
+                    let label = format!("{archive_label} {}", sessions(picked_count));
+                    return menu.item(PopupMenuItem::new(label).on_click(move |_, window, cx| {
+                        let _ = archive.update(cx, |this, cx| this.archive_selected(window, cx));
+                    }));
+                }
                 menu.item(PopupMenuItem::new("Rename").on_click(move |_, window, cx| {
                     let _ = rename.update(cx, |this, cx| this.start_rename(key, window, cx));
                 }))
@@ -851,10 +887,55 @@ impl ChatView {
     }
 }
 
+/// One of the selection bar's buttons: an icon, named by its tooltip.
+fn bar_button(
+    id: &'static str,
+    icon: gpui_kit::assets::IconName,
+    label: &'static str,
+    cx: &App,
+) -> Stateful<Div> {
+    let theme = cx.theme();
+    let (hover, muted, foreground) = (
+        theme.secondary,
+        theme.muted_foreground,
+        theme.sidebar_foreground,
+    );
+    div()
+        .id(id)
+        .role(Role::Button)
+        .aria_label(label)
+        .size(BAR_BUTTON_SIZE)
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded_md()
+        .text_color(muted)
+        .cursor_pointer()
+        .hover(move |style| style.bg(hover).text_color(foreground))
+        .child(Icon::new(icon).small())
+        .tooltip(move |window, cx| Tooltip::new(label).build(window, cx))
+}
+
+/// "1 session", "4 sessions".
+fn sessions(count: usize) -> String {
+    if count == 1 {
+        "1 session".to_string()
+    } else {
+        format!("{count} sessions")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     // Not a glob: gpui's own `test` attribute would shadow the standard one.
-    use super::{Selection, SessionKey};
+    use super::{Selection, SessionKey, sessions};
+
+    #[test]
+    fn one_session_is_said_without_an_s() {
+        assert_eq!(sessions(1), "1 session");
+        assert_eq!(sessions(4), "4 sessions");
+    }
 
     fn keys(ids: &[u64]) -> Vec<SessionKey> {
         ids.iter().map(|&id| SessionKey(id)).collect()
