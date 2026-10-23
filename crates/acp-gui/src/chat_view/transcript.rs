@@ -23,7 +23,8 @@ const WAIT_DELAY: Duration = Duration::from_millis(250);
 impl ChatView {
     /// A row of the active session's transcript. In a live turn a new row comes in as
     /// the menus do, rising the theme's short distance as it fades in, and the last row
-    /// carries the waiting line while the agent has sent nothing new. `keyed` is the
+    /// carries the waiting line while the agent has sent nothing new, or loads the session
+    /// behind rows kept from an earlier run. `keyed` is the
     /// permission card the prompt's keys answer (see `card_with_keys`), worked out before
     /// the list lays out its rows.
     pub(crate) fn render_row(
@@ -43,15 +44,21 @@ impl ChatView {
         let travel = motion.distance_short.to_pixels(window.rem_size());
         let muted = cx.theme().muted_foreground;
         let session = &mut self.sessions[self.active];
-        let row = if session.waiting() && switches().thinking && ix + 1 == session.rows.len() {
-            div()
+        let waiting = if session.waiting() && switches().thinking {
+            Some("Thinking…")
+        } else if session.loading {
+            Some("Loading…")
+        } else {
+            None
+        };
+        let row = match waiting {
+            Some(text) if ix + 1 == session.rows.len() => div()
                 .flex()
                 .flex_col()
                 .child(row)
-                .child(waiting_line(session, ix, muted, &enter, window))
-                .into_any_element()
-        } else {
-            row
+                .child(waiting_line(session, ix, text, muted, &enter, window))
+                .into_any_element(),
+            _ => row,
         };
         let Some(arrived) = session.entering.get(&ix) else {
             return row;
@@ -127,14 +134,14 @@ impl ChatView {
                     .child(self.sent_bubble(key, ix, bubble, body, cx))
                     .into_any_element()
             }
-            Row::Agent(view) => row
-                .child(TextView::new(view).selectable(true))
+            Row::Agent(text) => row
+                .child(TextView::new(&text.view).selectable(true))
                 .into_any_element(),
-            Row::Thought(view) => row
+            Row::Thought(text) => row
                 .text_sm()
                 .italic()
                 .text_color(muted)
-                .child(TextView::new(view).selectable(true))
+                .child(TextView::new(&text.view).selectable(true))
                 .into_any_element(),
             Row::Tool(_) => self.render_tool_call(ix, keyed, window, cx),
             Row::Notice(text) => row
@@ -157,13 +164,14 @@ impl ChatView {
     }
 }
 
-/// "Thinking…" under the last row, with the component library's shimmer, while a live
-/// turn waits on the agent. Its space is there from the start, so the row that takes its
-/// place doesn't move the transcript; it fades in once the rows have kept still for
-/// `WAIT_DELAY`.
+/// `text` under the last row, with the component library's shimmer: "Thinking…" while a
+/// live turn waits on the agent, "Loading…" while it loads the session. Its space is there
+/// from the start, so the row that takes its place doesn't move the transcript; it fades in
+/// once the rows have kept still for `WAIT_DELAY`.
 fn waiting_line(
     session: &Session,
     ix: usize,
+    text: &'static str,
     muted: Hsla,
     enter: &Enter,
     window: &mut Window,
@@ -184,7 +192,7 @@ fn waiting_line(
         .text_sm()
         .text_color(muted)
         .opacity(fade)
-        .child(ShimmerText::new("Thinking…").id(row_id("waiting", session.key, ix)))
+        .child(ShimmerText::new(text).id(row_id("waiting", session.key, ix)))
 }
 
 /// How a row or the waiting line comes in: the theme's normal duration and entering curve,
