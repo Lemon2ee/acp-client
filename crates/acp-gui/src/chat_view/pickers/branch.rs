@@ -1,6 +1,6 @@
-//! The branch menu, opened from the branch under the prompt box while the agent isn't
-//! replying: the local branches the session's folder can switch to, the newest commit
-//! first.
+//! The branch menu, opened from the branch under the prompt box while no agent replies
+//! in the folder's worktree: the local branches the session's folder can switch to, the
+//! newest commit first.
 
 use std::rc::Rc;
 

@@ -1,9 +1,9 @@
 //! The line under the prompt box: the folder the session works in, as a button that opens
 //! the folder menu until the session's first prompt, the folders sessions were started in
 //! that the menu lists, and what git says of the folder (see `crate::git`): its branch, as
-//! a button that opens the branch menu while the agent isn't replying, a mark for a linked
-//! worktree, what the branch has changed since it left its base branch, and the files not
-//! committed yet.
+//! a button that opens the branch menu while no agent replies in its worktree, a mark for a
+//! linked worktree, what the branch has changed since it left its base branch, and the
+//! files not committed yet.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -251,8 +251,11 @@ impl ChatView {
             .h_full()
             .px(BRANCH_PAD)
             .rounded(FOLDER_RADIUS);
-            // Not while the agent works: the switch would change the files under it.
+            // Not while an agent works anywhere in the worktree, this session's or another's:
+            // the switch would change the files under it.
+            let working = self.working_in(&repo.root);
             let switchable = !session.busy
+                && working.is_none()
                 && repo
                     .branches
                     .iter()
@@ -267,6 +270,24 @@ impl ChatView {
                 let place = branch_place(StyleRefinement::default().flex(), detached);
                 self.render_branch_picker(key, &repo.branches, current, shown, place, cx)
             } else {
+                // Another session's turn locks it with no sign of that here, so its
+                // tooltip says which; this session's own turn needs no telling.
+                let tip = working
+                    .filter(|_| !session.busy)
+                    .map(|other| match &other.title {
+                        Some(title) => SharedString::from(format!(
+                            "Can't switch while \u{201c}{title}\u{201d} is replying"
+                        )),
+                        None => {
+                            SharedString::from("Can't switch while another session is replying")
+                        }
+                    });
+                let shown = match tip {
+                    Some(tip) => {
+                        shown.tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+                    }
+                    None => shown,
+                };
                 branch_place(shown, detached).into_any_element()
             });
             if let Some(main) = &repo.worktree_of {
@@ -305,8 +326,15 @@ impl ChatView {
             }))
     }
 
+    /// The session whose turn is running in a folder of the worktree at `root`, if any.
+    fn working_in(&self, root: &Path) -> Option<&Session> {
+        self.sessions
+            .iter()
+            .find(|session| session.is_live() && in_worktree(session, root))
+    }
+
     /// Switches the folder of the session `key` to `branch`, then has git asked again about
-    /// every session in that folder. What git says when it refuses, such as changes not
+    /// every session in that worktree. What git says when it refuses, such as changes not
     /// committed that the switch would overwrite, goes in the session's transcript.
     pub(super) fn switch_branch(
         &mut self,
@@ -317,14 +345,18 @@ impl ChatView {
         let Some(session) = self.session(key) else {
             return;
         };
-        if session.busy {
+        // Asked again, as a turn may have started since the menu opened.
+        let Some(root) = session.git.as_ref().map(|repo| repo.root.clone()) else {
+            return;
+        };
+        if session.busy || self.working_in(&root).is_some() {
             return;
         }
         let folder = session.folder().to_path_buf();
         cx.spawn(async move |this, cx| {
-            let (switching, to) = (folder.clone(), branch.clone());
+            let to = branch.clone();
             let switched = cx
-                .background_spawn(async move { git::switch(&switching, &to) })
+                .background_spawn(async move { git::switch(&folder, &to) })
                 .await;
             let _ = this.update(cx, |this, cx| {
                 if let Err(said) = switched
@@ -335,7 +367,7 @@ impl ChatView {
                 let shown: Vec<SessionKey> = this
                     .sessions
                     .iter()
-                    .filter(|session| session.folder() == folder)
+                    .filter(|session| in_worktree(session, &root))
                     .map(|session| session.key)
                     .collect();
                 for key in shown {
@@ -345,6 +377,16 @@ impl ChatView {
             });
         })
         .detach();
+    }
+}
+
+/// Whether the session works in the worktree at `root`, from anywhere in it. Told by the
+/// worktree git found for its folder, so a linked worktree kept inside the main one, as
+/// `.claude/worktrees/` is, counts as its own; by its folder alone until git has said.
+fn in_worktree(session: &Session, root: &Path) -> bool {
+    match &session.git {
+        Some(repo) => repo.root == root,
+        None => session.folder().starts_with(root),
     }
 }
 

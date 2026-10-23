@@ -12,6 +12,9 @@ use std::sync::OnceLock;
 /// The repository a folder is in, as `read_head` finds it.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Repo {
+    /// The top folder of the worktree the folder is in: what a branch switch rewrites the
+    /// files of, for every session working anywhere under it.
+    pub(crate) root: PathBuf,
     pub(crate) head: Head,
     /// The local branches the folder can switch to, the newest commit first, with the one
     /// checked out here (see `switchable`).
@@ -57,20 +60,21 @@ pub(crate) enum Base {
 }
 
 /// Whether the folder is in a repository, its branch and the branches it could switch to:
-/// None outside one, and when git isn't installed. A folder inside a repository counts,
-/// as git looks up from it.
+/// None outside one, in one with no worktree (a bare one, or inside `.git`), and when git
+/// isn't installed. A folder inside a repository counts, as git looks up from it.
 pub(crate) fn read_head(folder: &Path) -> Option<Repo> {
     let dirs = git(
         folder,
         &[
             "rev-parse",
             "--path-format=absolute",
+            "--show-toplevel",
             "--git-dir",
             "--git-common-dir",
         ],
     )?;
     let mut dirs = dirs.lines().map(PathBuf::from);
-    let (git_dir, common_dir) = (dirs.next()?, dirs.next()?);
+    let (root, git_dir, common_dir) = (dirs.next()?, dirs.next()?, dirs.next()?);
     // A linked worktree keeps its own git folder under the main one's `.git/worktrees`.
     let worktree_of = (git_dir != common_dir)
         .then(|| common_dir.parent().map(Path::to_path_buf))
@@ -94,6 +98,7 @@ pub(crate) fn read_head(folder: &Path) -> Option<Repo> {
     );
     let branches = refs.map_or_else(Vec::new, |refs| switchable(&refs, &head));
     Some(Repo {
+        root,
         head,
         branches,
         worktree_of,
