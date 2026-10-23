@@ -23,6 +23,9 @@ dirs = "6"
 # Pins a gpui-pre snapshot of Zed's gpui and re-exports it with gpui-component.
 # (crates.io `gpui` itself stopped at 0.2.2 in 2025-10.)
 gpui-kit = "0.8"
+# Watches a session's folder during its turns for the files the info panel lists: FSEvents
+# on macOS. gpui-component already builds it at this version.
+notify = "8.2"
 # Keeps each agent's last settings, the sessions to load again, and the settings page's
 # settings between runs.
 serde.workspace = true

@@ -57,7 +57,8 @@ gpui_kit::assets::icon_assets!(
         GitPullRequestClosed,
         GitMerge,
         Clock,
-        CircleMinus
+        CircleMinus,
+        FileSpreadsheet
     ]
 );
 

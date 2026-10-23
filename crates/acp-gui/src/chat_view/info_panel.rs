@@ -1,8 +1,9 @@
 //! The session's info panel, right of the transcript and under the title row, with its
 //! button at the title row's right end; its left edge drags its width. It shows the pull
-//! requests the session opened (see `pull_requests`), and the session's context window:
-//! how full it is and, opened, what fills it.
+//! requests the session opened (see `pull_requests`), the files it made (see `files`),
+//! and the session's context window: how full it is and, opened, what fills it.
 
+mod files;
 mod pull_requests;
 
 use std::path::Path;
@@ -34,6 +35,8 @@ pub(crate) struct InfoPanelState {
     category: Option<String>,
     /// The Pull requests section is unfolded.
     pr_section: bool,
+    /// The Files section is unfolded.
+    files_section: bool,
     /// The pull request opened to its files, by its address.
     pr_open: Option<String>,
     /// The file whose diff takes the panel's place, in place of its list.
@@ -51,6 +54,7 @@ impl Default for InfoPanelState {
             context_detail: false,
             category: None,
             pr_section: true,
+            files_section: true,
             pr_open: None,
             diff: None,
             pr_clock: None,
@@ -282,6 +286,7 @@ impl ChatView {
                 .flex_col()
                 .gap(SECTION_GAP)
                 .child(self.render_pr_section(session, look, cx))
+                .child(self.render_files_section(session, look, cx))
                 .child(self.render_context_section(session, look, cx))
                 .into_any_element(),
         };

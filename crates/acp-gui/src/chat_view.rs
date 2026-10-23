@@ -46,7 +46,7 @@ use crate::config::{
     load_saved_sessions, save_last_settings,
 };
 use crate::hotkey::{self, GlobalShortcut};
-use crate::session::{Held, Origin, Row, Session, SessionPullRequests};
+use crate::session::{Held, Origin, Row, Session, SessionFiles, SessionPullRequests};
 
 /// How often text held back in a live turn shows its next piece: about once a frame.
 const PACE_TICK: Duration = Duration::from_millis(16);
@@ -336,6 +336,7 @@ impl ChatView {
                 session.context.restore(kept);
             }
             session.pull_requests = SessionPullRequests::restore(&saved.pull_requests);
+            session.files = SessionFiles::restore(&saved.files);
             self.sessions.push(session);
         }
     }
@@ -382,6 +383,7 @@ impl ChatView {
             title_source: session.title_source,
             context: session.context.kept(),
             pull_requests: session.pull_requests.kept(),
+            files: session.files.kept(),
         };
         let changed = config_folder()
             .ok_or_else(|| std::io::Error::other("there is no config folder"))
@@ -590,6 +592,8 @@ impl ChatView {
         self.input.update(cx, |input, cx| input.focus(window, cx));
         self.read_context_if_shown();
         self.recheck_pull_requests(cx);
+        // A file may have been moved or deleted since.
+        self.sessions[ix].files.look_again();
         cx.notify();
     }
 
@@ -626,6 +630,14 @@ impl ChatView {
             return;
         };
         self.change_kept(key, |saved| saved.pull_requests = kept);
+    }
+
+    /// Keeps the files the session made for later runs.
+    fn keep_files(&self, key: SessionKey) {
+        let Some(kept) = self.session(key).map(|session| session.files.kept()) else {
+            return;
+        };
+        self.change_kept(key, |saved| saved.files = kept);
     }
 
     /// Makes `change` to the session as kept for later runs, if it is kept already.
@@ -712,6 +724,7 @@ impl ChatView {
             fresh.context.restore(&kept);
         }
         fresh.pull_requests = SessionPullRequests::restore(&session.pull_requests.kept());
+        fresh.files = SessionFiles::restore(&session.files.kept());
         let old = std::mem::replace(&mut self.sessions[ix], fresh);
         self.sessions[ix].draft = old.draft;
         let _ = self.agents[old.agent]
@@ -829,6 +842,7 @@ impl ChatView {
         // Has the agent create the session first, if it hasn't yet.
         let prompt = Command::Prompt(key, text);
         let _ = self.agents[session.agent].commands.try_send(prompt);
+        self.watch_files(key, cx);
         // Runs once the turn is over, while the panel shows the window.
         self.read_context_if_shown();
         // A spare the agent created has its id already; any other session is kept
@@ -1050,6 +1064,7 @@ impl ChatView {
                 // The agent may just have said it can read the window, or answered a read.
                 self.read_context_if_shown();
                 self.note_pull_requests(cx);
+                self.note_files(cx);
             }
             AgentEvent::RateLimits(windows) => self.set_rate_limits(agent, windows, cx),
             // Connection-wide failures show in the session on screen when it is the
@@ -1120,6 +1135,7 @@ impl ChatView {
                     }
                     if landed {
                         this.note_pull_requests(cx);
+                        this.note_files(cx);
                     }
                     if !holding {
                         this.pacing = None;

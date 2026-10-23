@@ -3,6 +3,7 @@
 //! agent's events for it lands there.
 
 mod context;
+mod files;
 mod pacing;
 mod pull_requests;
 mod tool_call;
@@ -26,6 +27,7 @@ use crate::debug::switches;
 pub(crate) use context::{
     Category, CategoryKind, ContextReport, KeptContext, SessionContext, now, short_tokens,
 };
+pub(crate) use files::{FileKind, KeptFile, MadeFile, SessionFiles, watch, watched};
 use pacing::Pacer;
 pub(crate) use pull_requests::{
     ChecksState, GhProblem, KeptPullRequest, PrState, PrStatus, PullRequest, SessionPullRequests,
@@ -88,6 +90,8 @@ pub(crate) struct Session {
     pub(crate) context: SessionContext,
     /// The pull requests its tool calls opened, for the info panel.
     pub(crate) pull_requests: SessionPullRequests,
+    /// The PDFs, spreadsheets and tables its turns made, for the info panel.
+    pub(crate) files: SessionFiles,
     /// A turn prompted here is running, so the agent's text arrives as it is written: it
     /// fades in and new rows come in with motion. A loaded session's replay shows at once.
     live: bool,
@@ -157,6 +161,7 @@ impl Session {
             archived: false,
             context: SessionContext::default(),
             pull_requests: SessionPullRequests::default(),
+            files: SessionFiles::default(),
             live: false,
             entering: HashMap::new(),
             changed: Instant::now(),
@@ -380,6 +385,7 @@ impl Session {
                 locations,
             } => {
                 self.pull_requests.note(&title, &content);
+                self.files.note_named(&title, &content);
                 let mut call = ToolCall::new(id, title, kind, status, self.live);
                 call.update(None, None, None, Some(content), Some(locations), cx);
                 self.push(Row::Tool(call), cx)
@@ -399,7 +405,9 @@ impl Session {
                             _ => None,
                         })
                     });
-                    self.pull_requests.note(&shown.unwrap_or_default(), content);
+                    let shown = shown.unwrap_or_default();
+                    self.pull_requests.note(&shown, content);
+                    self.files.note_named(&shown, content);
                 }
                 // A call the agent never sent comes first in a permission request; acp-core
                 // sends its fields as an update just before.
@@ -452,6 +460,7 @@ impl Session {
             SessionEvent::TurnEnded { stop_reason } => {
                 self.busy = false;
                 self.pull_requests.turn_ended();
+                self.files.turn_ended();
                 self.after_turn = true;
                 self.cancel_open_permissions(cx);
                 if stop_reason != "EndTurn" {
@@ -462,6 +471,7 @@ impl Session {
             SessionEvent::TurnFailed(message) => {
                 self.busy = false;
                 self.pull_requests.turn_ended();
+                self.files.turn_ended();
                 self.after_turn = true;
                 self.cancel_open_permissions(cx);
                 self.push(Row::Error(message), cx);
