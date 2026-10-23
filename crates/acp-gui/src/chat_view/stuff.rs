@@ -1,9 +1,11 @@
 //! The Stuff panel, the sidebar's other list: a note in front to write or paste anything
 //! into, and the board behind it that each finished note is stuck onto. It belongs to the
 //! window, not to a session, so switching sessions leaves the note and the board as they
-//! are. A stuck note flies onto the board and turns into its card on the way, and a card
-//! can be dragged into the chat (see `drag`).
+//! are. Images and files pasted into the note go under its text (see `attachments`). A
+//! stuck note flies onto the board and turns into its card on the way, and a card can be
+//! dragged into the chat (see `drag`).
 
+mod attachments;
 mod drag;
 
 use std::cell::{Cell, RefCell};
@@ -21,8 +23,11 @@ use gpui_kit::*;
 
 use crate::chat_view::ChatView;
 use crate::chat_view::pickers::{MenuLook, SURFACE_RADIUS};
+use crate::chat_view::stuff::attachments::{STRIP_GAP, TileHover, TileLook};
 use crate::chat_view::stuff::drag::{DragState, StuffDrag, pick_up};
-use crate::config::{StuffNote, change_stuff, config_folder, load_stuff};
+use crate::config::{
+    StuffAttachment, StuffNote, change_stuff, config_folder, forget_attachment, load_stuff,
+};
 
 /// The text of the note and the cards. Both wrap it at the sidebar's width less 40, so a
 /// note's lines break in the same places once it is a card.
@@ -83,6 +88,10 @@ pub(crate) struct StuffState {
     /// The note being written, in front of the board.
     pub(crate) input: Entity<TextareaState>,
     _input_events: Subscription,
+    /// What has been pasted into the note besides text, until it is stuck.
+    pending: Vec<StuffAttachment>,
+    tile_hover: TileHover,
+    _quit: Subscription,
     /// The note last stuck, flying onto the board until its time is up.
     sticking: Option<Sticking>,
     layout: Rc<StuffLayout>,
@@ -141,10 +150,22 @@ impl StuffState {
                 cx.notify();
             }
         });
+        // Like the note's text, what was pasted into it is gone with the app, and so are
+        // the images saved for it.
+        let quit = cx.on_app_quit(|this, _| {
+            this.stuff
+                .pending
+                .drain(..)
+                .for_each(|attachment| forget_attachment(&attachment));
+            std::future::ready(())
+        });
         Self {
             notes: load_stuff(),
             input,
             _input_events: input_events,
+            pending: Vec::new(),
+            tile_hover: TileHover::default(),
+            _quit: quit,
             sticking: None,
             layout: Rc::default(),
             board_scroll: ScrollHandle::new(),
@@ -200,18 +221,31 @@ impl StuffState {
 }
 
 impl ChatView {
+    /// Whether the note has nothing to stick: no text but spaces, and nothing pasted.
+    fn note_empty(&self, cx: &App) -> bool {
+        self.stuff.input.read(cx).value().trim().is_empty() && self.stuff.pending.is_empty()
+    }
+
     /// Sticks the note onto the board, newest first, and keeps it for later runs. The
     /// note flies there and empties, ready for the next one, which can be written at
     /// once but sticks only once this one has landed. An empty note sticks nothing.
     fn stick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let text = self.stuff.input.read(cx).value().trim_end().to_string();
-        if text.trim().is_empty() || self.stuff.stick_frame(cx).is_some() {
+        if self.note_empty(cx) || self.stuff.stick_frame(cx).is_some() {
             return;
         }
+        let value = self.stuff.input.read(cx).value();
+        // Spaces alone, with something pasted, are no text.
+        let text = if value.trim().is_empty() {
+            String::new()
+        } else {
+            value.trim_end().to_string()
+        };
         let note = StuffNote {
             id: self.stuff.next_id(),
             text,
+            attachments: std::mem::take(&mut self.stuff.pending),
         };
+        self.stuff.tile_hover = TileHover::default();
         let layout = &self.stuff.layout;
         let (panel, from) = (layout.panel.get(), layout.note.get());
         self.stuff.sticking = (!cx.reduce_motion()).then(|| Sticking {
@@ -259,24 +293,26 @@ impl ChatView {
             .children(frame.and_then(|frame| self.render_flight(frame, cx)))
     }
 
-    /// The note in front of the board, on the menus' surface: the field, and a row with
-    /// the shortcut and the button that stick it. Cmd+Enter sticks it from the field,
-    /// where Enter alone starts a new line. While a note flies off, its place shrinks to
-    /// the new one's height, bringing the board up, and the new one comes up into it.
+    /// The note in front of the board, on the menus' surface: the field, what was pasted
+    /// into it, and a row with the shortcut and the button that stick it. Cmd+Enter
+    /// sticks it from the field, where Enter alone starts a new line. While a note flies
+    /// off, its place shrinks to the new one's height, bringing the board up, and the new
+    /// one comes up into it.
     fn render_note(
         &self,
         frame: Option<StickFrame>,
-        window: &Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Div {
         let look = MenuLook::new(cx);
-        let empty = self.stuff.input.read(cx).value().trim().is_empty();
+        let empty = self.note_empty(cx);
         let rise = cx
             .theme()
             .motion_tokens()
             .distance_short
             .to_pixels(window.rem_size());
         let layout = self.stuff.layout.clone();
+        let view = cx.entity().downgrade();
         let note = look
             .surface()
             .id("stuff-note")
@@ -299,8 +335,20 @@ impl ChatView {
                     // sides, which the note's own padding makes up to the design's.
                     .with_size(Size::XSmall)
                     .text_size(TEXT_SIZE)
-                    .line_height(LINE_HEIGHT),
+                    .line_height(LINE_HEIGHT)
+                    .on_paste(move |item, _, cx| {
+                        view.update(cx, |this, cx| this.paste_into_note(item, cx))
+                            .unwrap_or(false)
+                    }),
             )
+            // Lined up with the text, inside the field's own padding.
+            .when(!self.stuff.pending.is_empty(), |note| {
+                note.child(
+                    self.note_attachments(window, cx)
+                        .mt(STRIP_GAP)
+                        .mx(FIELD_PAD_X),
+                )
+            })
             .child(self.stick_row(empty, &look, cx).mt(STICK_ROW_GAP))
             .children(look.edge())
             .child(measure(move |bounds| layout.note.set(bounds)))
@@ -450,6 +498,8 @@ impl ChatView {
     /// The note on its way onto the board, over the panel: the note's box turning into
     /// the card's, while the lines past the card's and the Stick row fade out. The text
     /// stays put inside, as the box comes in 4px at each side and its padding goes out 4.
+    /// What was pasted keeps to the box's foot, from above the Stick row down to the
+    /// card's padding, so it rises with the box's foot past the lines fading out.
     fn render_flight(&self, frame: StickFrame, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
         if frame.landed {
             return None;
@@ -481,21 +531,35 @@ impl ChatView {
         let card_lines = LINE_HEIGHT * CARD_LINES as f32;
         // The card's text, and over it the note's lines past the card's: the whole
         // text moved up by the card's lines, cut off above them.
-        let text = div()
-            .relative()
-            .child(card_text(note, card.link_line))
-            .child(
-                div()
-                    .absolute()
-                    .top(card_lines)
-                    .left_0()
-                    .right_0()
-                    .flex()
-                    .flex_col()
-                    .overflow_hidden()
-                    .opacity(1. - frame.faded)
-                    .child(div().mt(-card_lines).child(note.text.clone())),
-            );
+        let text = (!note.text.is_empty()).then(|| {
+            div()
+                .relative()
+                .child(card_text(note, card.link_line))
+                .child(
+                    div()
+                        .absolute()
+                        .top(card_lines)
+                        .left_0()
+                        .right_0()
+                        .flex()
+                        .flex_col()
+                        .overflow_hidden()
+                        .opacity(1. - frame.faded)
+                        .child(div().mt(-card_lines).child(note.text.clone())),
+                )
+        });
+        let attachments = (!note.attachments.is_empty()).then(|| {
+            let side = moved(NOTE_PAD_X + FIELD_PAD_X, CARD_PAD);
+            card.tiles
+                .strip(&note.attachments)
+                .absolute()
+                .left(side)
+                .right(side)
+                .bottom(moved(
+                    NOTE_PAD_BOTTOM + STICK_ROW_HEIGHT + STICK_ROW_GAP,
+                    CARD_PAD,
+                ))
+        });
         Some(
             div()
                 .id("stuff-flight")
@@ -519,8 +583,9 @@ impl ChatView {
                         .overflow_hidden()
                         .pt(moved(NOTE_PAD_TOP, CARD_PAD))
                         .px(moved(NOTE_PAD_X + FIELD_PAD_X, CARD_PAD))
-                        .child(text),
+                        .children(text),
                 )
+                .children(attachments)
                 .child(
                     self.stick_row(false, &look, cx)
                         .absolute()
@@ -538,6 +603,7 @@ struct CardLook {
     background: Hsla,
     tape: Hsla,
     link_line: Hsla,
+    tiles: TileLook,
     /// The dashed edge of the place a card in hand leaves.
     slot_edge: Hsla,
     /// At rest on the board.
@@ -565,6 +631,7 @@ impl CardLook {
             background,
             tape,
             link_line,
+            tiles: TileLook::new(cx),
             slot_edge: theme.foreground.opacity(SLOT_EDGE_ALPHA),
             shadow: card_shadow(dark),
         }
@@ -591,11 +658,26 @@ impl CardLook {
             .line_height(LINE_HEIGHT)
             .child(self.tape(taped))
             .child(
-                card_text(note, self.link_line).when(hollow > 0., |text| text.opacity(1. - hollow)),
+                self.body(note)
+                    .when(hollow > 0., |body| body.opacity(1. - hollow)),
             )
             // Over the card rather than its own border, which would move its content.
             .when(hollow > 0., |card| {
                 card.child(dashed_edge(self.slot_edge.opacity(hollow)).rounded(CARD_RADIUS))
+            })
+    }
+
+    /// What a card shows: its text's first lines, then what was pasted into the note.
+    fn body(&self, note: &StuffNote) -> Div {
+        let text = !note.text.is_empty();
+        div()
+            .when(text, |body| body.child(card_text(note, self.link_line)))
+            .when(!note.attachments.is_empty(), |body| {
+                body.child(
+                    self.tiles
+                        .strip(&note.attachments)
+                        .when(text, |strip| strip.mt(STRIP_GAP)),
+                )
             })
     }
 

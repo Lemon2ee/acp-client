@@ -19,8 +19,8 @@ use gpui_kit::*;
 use crate::chat_view::ChatView;
 use crate::chat_view::pickers::MenuLook;
 use crate::chat_view::stuff::{
-    CARD_PAD, CARD_RADIUS, CardLook, LINE_HEIGHT, SLOT_EDGE_ALPHA, TEXT_SIZE, card_text,
-    dashed_edge, measure, mix_shadows,
+    CARD_PAD, CARD_RADIUS, CardLook, LINE_HEIGHT, SLOT_EDGE_ALPHA, TEXT_SIZE, dashed_edge, measure,
+    mix_shadows,
 };
 use crate::config::StuffNote;
 
@@ -243,7 +243,7 @@ impl Render for CardInHand {
             .text_color(cx.theme().foreground)
             .text_size(TEXT_SIZE)
             .line_height(LINE_HEIGHT)
-            .child(card_text(&self.note, card.link_line))
+            .child(card.body(&self.note))
     }
 }
 
@@ -275,6 +275,7 @@ pub(super) fn pick_up(
             let note = StuffNote {
                 id: drag.id,
                 text: String::new(),
+                attachments: Vec::new(),
             };
             (note, px(0.))
         });
@@ -288,8 +289,17 @@ pub(super) fn pick_up(
 
 impl ChatView {
     /// The zone a card let go at `at` goes to: the prompt zone, then the rest of the chat.
+    /// A card of pasted things alone has nothing the chat can take yet, so it goes back.
     fn zone_at(&self, at: Point<Pixels>) -> Option<Zone> {
-        let zones = &self.stuff.drag.zones;
+        let drag = &self.stuff.drag;
+        if drag
+            .held
+            .as_ref()
+            .is_some_and(|held| held.note.text.is_empty())
+        {
+            return None;
+        }
+        let zones = &drag.zones;
         if zones.prompt.get().contains(&at) {
             Some(Zone::Prompt { busy: false })
         } else if zones.chat.get().contains(&at) {
@@ -481,7 +491,7 @@ impl ChatView {
                 .text_size(TEXT_SIZE)
                 .line_height(LINE_HEIGHT)
                 .opacity(1. - frame.faded)
-                .child(card_text(&dropped.note, card.link_line)),
+                .child(card.body(&dropped.note)),
         )
     }
 
