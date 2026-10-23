@@ -3,7 +3,7 @@
 //! window, not to a session, so switching sessions leaves the note and the board as they
 //! are. Images and files pasted into the note go under its text (see `attachments`). A
 //! stuck note flies onto the board and turns into its card on the way, and a card can be
-//! dragged into the chat (see `drag`).
+//! dragged into the chat, which uses it up (see `drag`).
 
 mod attachments;
 mod drag;
@@ -272,7 +272,7 @@ impl ChatView {
     /// one to the other over both.
     pub(crate) fn render_stuff(&self, window: &mut Window, cx: &mut Context<Self>) -> Div {
         let frame = self.stuff.stick_frame(cx);
-        if frame.is_some() {
+        if frame.is_some() || self.stuff.drag.any_closing() {
             window.request_animation_frame();
         }
         let dots = if cx.theme().is_dark() {
@@ -422,7 +422,7 @@ impl ChatView {
     /// The board: the stuck notes as cards, newest at the top, scrolling under the note.
     /// The card a note is flying to grows its place from nothing, pushing the others
     /// down, and shows once the note lands on it. A card can be picked up and dragged
-    /// into the chat, leaving its place behind.
+    /// into the chat, leaving its place behind, which closes once the card is in.
     fn render_board(&self, frame: Option<StickFrame>, cx: &mut Context<Self>) -> Stateful<Div> {
         let look = CardLook::new(cx);
         let muted = cx.theme().muted_foreground;
@@ -431,6 +431,7 @@ impl ChatView {
             let id = note.id;
             let layout = self.stuff.layout.clone();
             let flying = frame.filter(|frame| frame.id == id);
+            let closing = self.stuff.drag.closing(id, cx);
             let (shadow, taped) = match flying {
                 Some(frame) => (
                     mix_shadows(&flattened(&look.shadow), &look.shadow, frame.settled),
@@ -443,26 +444,30 @@ impl ChatView {
                 .child(measure(move |bounds| {
                     layout.cards.borrow_mut().insert(id, bounds);
                 }))
-                .on_drag(StuffDrag::new(id), pick_up(view.clone()));
+                // Gone into the chat, it can't be picked up again.
+                .when(closing.is_none(), |card| {
+                    card.on_drag(StuffDrag::new(id), pick_up(view.clone()))
+                });
+            let height = || {
+                self.stuff
+                    .layout
+                    .cards
+                    .borrow()
+                    .get(&id)
+                    .map_or(px(0.), |card| card.size.height)
+            };
+            // The card below comes up over what is left of it.
+            if let Some(closing) = closing {
+                return place(height(), 1. - closing.closed)
+                    .opacity(1. - closing.faded)
+                    .child(card)
+                    .into_any_element();
+            }
             let Some(frame) = flying else {
                 return card.into_any_element();
             };
-            let height = self
-                .stuff
-                .layout
-                .cards
-                .borrow()
-                .get(&id)
-                .map_or(px(0.), |card| card.size.height);
             let card = card.when(!frame.landed, |card| card.opacity(0.));
-            // Less the gap after it while it has no height, so the cards below move
-            // only as it grows.
-            div()
-                .flex_none()
-                .h(height * frame.moved)
-                .mb(-CARD_GAP * (1. - frame.moved))
-                .child(card)
-                .into_any_element()
+            place(height(), frame.moved).child(card).into_any_element()
         });
         // The empty board's line, fading as the first note flies in.
         let empty = match frame {
@@ -639,13 +644,13 @@ impl CardLook {
     }
 
     /// A card, with `shadow`, its tape `taped` of the way down onto it. While it is
-    /// `hollow`, it is only its place: a dashed edge and the tape.
+    /// `hollow`, it is only its place: a dashed edge and the tape, as tall as the card.
     fn card(
         &self,
         note: &StuffNote,
         shadow: Vec<BoxShadow>,
         taped: f32,
-        hollow: f32,
+        hollow: bool,
     ) -> Stateful<Div> {
         div()
             .id(("stuff-card", note.id))
@@ -653,18 +658,14 @@ impl CardLook {
             .flex_none()
             .p(CARD_PAD)
             .rounded(CARD_RADIUS)
-            .bg(self.background.opacity(1. - hollow))
-            .shadow(dimmed(&shadow, 1. - hollow))
+            .when(!hollow, |card| card.bg(self.background).shadow(shadow))
             .text_size(TEXT_SIZE)
             .line_height(LINE_HEIGHT)
             .child(self.tape(taped))
-            .child(
-                self.body(note)
-                    .when(hollow > 0., |body| body.opacity(1. - hollow)),
-            )
+            .child(self.body(note).when(hollow, |body| body.opacity(0.)))
             // Over the card rather than its own border, which would move its content.
-            .when(hollow > 0., |card| {
-                card.child(dashed_edge(self.slot_edge.opacity(hollow)).rounded(CARD_RADIUS))
+            .when(hollow, |card| {
+                card.child(dashed_edge(self.slot_edge).rounded(CARD_RADIUS))
             })
     }
 
@@ -730,15 +731,13 @@ fn dashed_edge(color: Hsla) -> Div {
         .border_color(color)
 }
 
-/// `shadow` with each layer `by` as strong.
-fn dimmed(shadow: &[BoxShadow], by: f32) -> Vec<BoxShadow> {
-    shadow
-        .iter()
-        .map(|layer| BoxShadow {
-            color: layer.color.opacity(by),
-            ..layer.clone()
-        })
-        .collect()
+/// A card's place on the board, `open` of the way to the card's `height`, less the gap
+/// after it as it is less, so the cards below move only as it grows or closes.
+fn place(height: Pixels, open: f32) -> Div {
+    div()
+        .flex_none()
+        .h(height * open)
+        .mb(-CARD_GAP * (1. - open))
 }
 
 /// Each of `from`'s shadows `progress` of the way to the same one of `to`'s. Both lists

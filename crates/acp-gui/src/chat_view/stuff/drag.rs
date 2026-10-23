@@ -2,7 +2,9 @@
 //! goes into the prompt after what is there, and what was pasted into it onto the
 //! prompt's row of tiles, not sent. Let go over the transcript, it is sent at once,
 //! unless the agent is still replying, when it goes into the prompt as well. Anywhere
-//! else, or on Esc, it flies back. The card stays on the board either way.
+//! else, or on Esc, it flies back. A card that went into the chat is used: its place on
+//! the board closes and the note is gone, from later runs too, though what was pasted
+//! into it stays for the prompt's tiles or the row it was sent as.
 //!
 //! gpui's drag view is gone once the pointer lets go, so the card's way into the prompt,
 //! onto its sent row or back to the board is drawn by `ChatView` over the whole window.
@@ -24,15 +26,15 @@ use crate::chat_view::stuff::{
     CARD_PAD, CARD_RADIUS, CardLook, LINE_HEIGHT, SLOT_EDGE_ALPHA, TEXT_SIZE, dashed_edge, measure,
     mix_shadows,
 };
-use crate::config::StuffNote;
+use crate::config::{StuffNote, change_stuff, config_folder};
 
 /// A card let go of fades from 120ms, over 160ms, as it reaches its place.
 const FADE_AFTER: Duration = Duration::from_millis(120);
 const FADE: Duration = Duration::from_millis(160);
 /// What it carries goes into the prompt as it reaches the prompt's first line.
 const INTO_PROMPT_AFTER: Duration = Duration::from_millis(160);
-/// From 300ms the card on the board shows again, and the prompt's ring lets go over the
-/// slow duration.
+/// From 300ms the place a used card left on the board closes over the slow duration as it
+/// fades over the normal one, and the prompt's ring lets go over the slow one too.
 const SETTLE_AFTER: Duration = Duration::from_millis(300);
 /// Where in the prompt zone a card going in heads for: the box is 12px in, and its first
 /// line 8px further right and 4px further down.
@@ -82,6 +84,8 @@ pub(super) struct DragState {
     /// fades.
     last: Option<Zone>,
     zones: Rc<Zones>,
+    /// Cards that went into the chat, their places on the board closing.
+    leaving: Vec<Leaving>,
 }
 
 /// A card in hand.
@@ -98,6 +102,19 @@ struct Dropped {
     to: DropTo,
     from: Bounds<Pixels>,
     started: Instant,
+}
+
+/// A card that went into the chat, let go of at `dropped`.
+struct Leaving {
+    id: u64,
+    dropped: Instant,
+}
+
+/// How far the place a used card left on the board has gone, eased, 0 to 1.
+pub(super) struct Closing {
+    /// Its height going, the cards below coming up.
+    pub(super) closed: f32,
+    pub(super) faded: f32,
 }
 
 #[derive(Clone, Copy)]
@@ -139,9 +156,7 @@ struct DropFrame {
     faded: f32,
     /// The sent row filling in under the card.
     filled: f32,
-    /// How much of the card on the board is still just its place.
-    hollow: f32,
-    /// Past 300ms: the card on the board coming back, and the prompt's ring letting go.
+    /// Past 300ms: the prompt's ring letting go.
     settling: bool,
 }
 
@@ -156,17 +171,45 @@ impl DragState {
         self.over.filter(|_| self.dragging(cx))
     }
 
-    /// How much of the card with `id` on the board is just its place, while it is in
-    /// hand or on its way somewhere.
-    pub(super) fn hollow(&self, id: u64, cx: &App) -> f32 {
-        if self.dragging(cx) && self.held.as_ref().is_some_and(|held| held.note.id == id) {
-            return 1.;
-        }
-        self.dropped
+    /// Whether the card with `id` on the board is just its place: while it is in hand, on
+    /// its way back, or gone into the chat.
+    pub(super) fn hollow(&self, id: u64, cx: &App) -> bool {
+        let held = self.dragging(cx) && self.held.as_ref().is_some_and(|held| held.note.id == id);
+        let dropped = self
+            .dropped
             .as_ref()
-            .filter(|dropped| dropped.note.id == id)
-            .and_then(|_| self.drop_frame(cx))
-            .map_or(0., |frame| frame.hollow)
+            .is_some_and(|dropped| dropped.note.id == id)
+            && self.drop_frame(cx).is_some();
+        held || dropped || self.leaving.iter().any(|leaving| leaving.id == id)
+    }
+
+    /// How far the place of the card with `id` has closed, if the card went into the chat.
+    pub(super) fn closing(&self, id: u64, cx: &App) -> Option<Closing> {
+        let leaving = self.leaving.iter().find(|leaving| leaving.id == id)?;
+        let motion = cx.theme().motion_tokens();
+        let elapsed = cx
+            .background_executor()
+            .now()
+            .saturating_duration_since(leaving.dropped);
+        Some(Closing {
+            closed: part(
+                elapsed,
+                SETTLE_AFTER,
+                motion.duration_slow,
+                &motion.easing_move,
+            ),
+            faded: part(
+                elapsed,
+                SETTLE_AFTER,
+                motion.duration_normal,
+                &motion.easing_enter,
+            ),
+        })
+    }
+
+    /// Whether a place on the board is closing, which takes a frame each frame.
+    pub(super) fn any_closing(&self) -> bool {
+        !self.leaving.is_empty()
     }
 
     fn drop_frame(&self, cx: &App) -> Option<DropFrame> {
@@ -176,7 +219,8 @@ impl DragState {
         let total = match dropped.to {
             DropTo::Back => slow,
             DropTo::Prompt => SETTLE_AFTER + slow,
-            DropTo::Sent { .. } => SETTLE_AFTER + normal,
+            // Once its row has filled in.
+            DropTo::Sent { .. } => FADE_AFTER + normal,
         };
         let elapsed = cx
             .background_executor()
@@ -185,27 +229,25 @@ impl DragState {
         if elapsed >= total {
             return None;
         }
-        let part = |after: Duration, length: Duration, easing: &Easing| {
-            let into = elapsed.saturating_sub(after).as_secs_f32() / length.as_secs_f32();
-            easing.sample(into.min(1.))
-        };
         let back = matches!(dropped.to, DropTo::Back);
         Some(DropFrame {
-            moved: part(Duration::ZERO, slow, &motion.easing_move),
+            moved: part(elapsed, Duration::ZERO, slow, &motion.easing_move),
             faded: if back {
                 0.
             } else {
-                part(FADE_AFTER, FADE, &motion.easing_enter)
+                part(elapsed, FADE_AFTER, FADE, &motion.easing_enter)
             },
-            filled: part(FADE_AFTER, normal, &motion.easing_enter),
-            hollow: if back {
-                1.
-            } else {
-                1. - part(SETTLE_AFTER, normal, &motion.easing_enter)
-            },
+            filled: part(elapsed, FADE_AFTER, normal, &motion.easing_enter),
             settling: elapsed >= SETTLE_AFTER,
         })
     }
+}
+
+/// How far a part of a motion is at `elapsed`, eased, 0 to 1: one that starts `after` and
+/// takes `length`.
+fn part(elapsed: Duration, after: Duration, length: Duration, easing: &Easing) -> f32 {
+    let into = elapsed.saturating_sub(after).as_secs_f32() / length.as_secs_f32();
+    easing.sample(into.min(1.))
 }
 
 /// What gpui draws under the pointer while a card is in hand: the card, lifting off the
@@ -316,7 +358,8 @@ impl ChatView {
         }
     }
 
-    /// The card in hand let go at `at`, over `zone`: into the prompt, sent, or back.
+    /// The card in hand let go at `at`, over `zone`: into the prompt, sent, or back. Into
+    /// the chat, it is taken off the board.
     fn let_go(
         &mut self,
         at: Point<Pixels>,
@@ -356,13 +399,52 @@ impl ChatView {
             None => DropTo::Back,
         };
         self.stuff.drag.zones.sent.set(None);
+        let (id, started) = (held.note.id, cx.background_executor().now());
         self.stuff.drag.dropped = (!cx.reduce_motion()).then(|| Dropped {
             from: Bounds::new(at - held.grab, held.size),
             note: held.note,
             to,
-            started: cx.background_executor().now(),
+            started,
         });
+        if !matches!(to, DropTo::Back) {
+            self.take_off_board(id, started, cx);
+        }
         cx.notify();
+    }
+
+    /// Takes the card with `id`, let go into the chat at `dropped`, off the board and out
+    /// of the notes kept for later runs. Its place closes first, unless motion is reduced.
+    /// What was pasted into it stays on disk, as the prompt's tiles or the row it was sent
+    /// as still show it.
+    fn take_off_board(&mut self, id: u64, dropped: Instant, cx: &mut Context<Self>) {
+        let changed = config_folder()
+            .ok_or_else(|| std::io::Error::other("there is no config folder"))
+            .and_then(|folder| change_stuff(&folder, |notes| notes.retain(|note| note.id != id)));
+        if let Err(err) = changed {
+            eprintln!("couldn't forget the note for later runs: {err}");
+        }
+        if cx.reduce_motion() {
+            self.forget_card(id);
+            return;
+        }
+        self.stuff.drag.leaving.push(Leaving { id, dropped });
+        let closed = SETTLE_AFTER + cx.theme().motion_tokens().duration_slow;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(closed).await;
+            let _ = this.update(cx, |this, cx| {
+                this.forget_card(id);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// The card with `id` gone from the board, its place too.
+    fn forget_card(&mut self, id: u64) {
+        let stuff = &mut self.stuff;
+        stuff.notes.retain(|note| note.id != id);
+        stuff.drag.leaving.retain(|leaving| leaving.id != id);
+        stuff.layout.cards.borrow_mut().remove(&id);
     }
 
     /// Puts the note's text at the end of the session's prompt after a blank line, the
@@ -447,7 +529,7 @@ impl ChatView {
     ) -> Option<Div> {
         let drag = &self.stuff.drag;
         let frame = drag.drop_frame(cx)?;
-        // Past the card itself: the card on the board and the prompt's ring after it.
+        // Past the card itself: the prompt's ring after it, and the sent row filling in.
         window.request_animation_frame();
         let dropped = drag.dropped.as_ref()?;
         if frame.faded >= 1. {
