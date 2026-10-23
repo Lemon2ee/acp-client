@@ -55,8 +55,8 @@ const BOX_RADIUS: Pixels = px(8.);
 const BOX_HEADER_HEIGHT: Pixels = px(28.);
 const BOX_TEXT_SIZE: Pixels = px(14.);
 const BOX_TEXT_LINE_HEIGHT: Pixels = px(21.);
-pub(super) const CODE_SIZE: Pixels = px(12.);
-pub(super) const CODE_LINE_HEIGHT: Pixels = px(18.);
+const CODE_SIZE: Pixels = px(12.);
+const CODE_LINE_HEIGHT: Pixels = px(18.);
 const CODE_PAD: Pixels = px(10.);
 const NUMBER_WIDTH: Pixels = px(28.);
 const SIGN_WIDTH: Pixels = px(12.);
@@ -107,7 +107,7 @@ pub(super) struct ToolLook {
     pub(super) removed: Hsla,
     removed_bg: Hsla,
     /// The box's fill, its edge and its text.
-    code: Hsla,
+    pub(super) code: Hsla,
     line: Hsla,
     pub(super) code_text: Hsla,
     /// Behind the copy button where it floats over the box's text.
@@ -1381,7 +1381,7 @@ fn diff_box(
 
 /// A line of a diff: an added one green, a removed one red, each with its number when
 /// the diff has them, or a run of unchanged lines folded into one.
-pub(super) fn diff_line(line: &DiffLine, numbered: bool, look: ToolLook) -> AnyElement {
+fn diff_line(line: &DiffLine, numbered: bool, look: ToolLook) -> AnyElement {
     match line {
         DiffLine::Line {
             change,

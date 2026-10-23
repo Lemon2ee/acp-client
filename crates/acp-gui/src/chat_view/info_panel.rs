@@ -275,11 +275,16 @@ impl ChatView {
 
     /// The panel, `hidden` of the way slid out past the window's right edge: it keeps
     /// its width, and less of it shows.
-    pub(crate) fn render_info_panel(&self, hidden: f32, cx: &mut Context<Self>) -> Div {
+    pub(crate) fn render_info_panel(
+        &self,
+        hidden: f32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Div {
         let width = self.info_panel.width;
         let session = &self.sessions[self.active];
         let look = PanelLook::new(cx);
-        let body = match self.render_diff_view(session, look, cx) {
+        let body = match self.render_diff_view(session, look, window, cx) {
             Some(diff) => diff,
             None => div()
                 .id("info-panel")

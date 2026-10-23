@@ -21,8 +21,10 @@ chrono = { workspace = true, features = ["clock"] }
 # Finds the folder for the app's own files, such as the models added to the model list.
 dirs = "6"
 # Pins a gpui-pre snapshot of Zed's gpui and re-exports it with gpui-component.
-# (crates.io `gpui` itself stopped at 0.2.2 in 2025-10.)
-gpui-kit = "0.8"
+# (crates.io `gpui` itself stopped at 0.2.2 in 2025-10.) `syntect` colors the code in
+# diffs and in markdown code blocks: about 1.5 MB, where all of the tree-sitter grammars
+# are 40 MB more and need `cc` held back to 1.2.
+gpui-kit = { version = "0.8", features = ["syntect"] }
 # Watches a session's folder during its turns for the files the info panel lists: FSEvents
 # on macOS. gpui-component already builds it at this version.
 notify = "8.2"
