@@ -37,6 +37,7 @@ clearly needs splitting. acp-gui is split by what each part keeps or draws:
 | `chat_view/scroller.rs` | The transcript's list: following its newest text, the button back to the newest, and how far a finger may push it past either end. |
 | `chat_view/sidebar.rs` | The session cards, renaming, the delete prompt, the Archived list, the draggable edge. |
 | `chat_view/settings_page.rs` | The settings, which take the window while open. |
+| `chat_view/usage_line.rs` | The plan usage line under the prompt box: which of the agent's limits show, how each reads, and the clock that redraws it when one starts over. |
 | `chat_view/pickers.rs` | What the buttons below the prompt and their menus share: `MenuLook`, sizes, `picker_button`. |
 | `chat_view/pickers/` | One file each for the model panel, the effort meter with its slider, and the mode menu; `effort/wheel.rs` is how the meter reads a scroll (wheel notches, trackpad pixels, momentum, scrolls begun elsewhere). |
 
@@ -59,10 +60,12 @@ cargo fmt --all
 
 - `claude` and `codex` resolve to pinned `npx` adapter commands in `acp-core::agent_for`.
   Bump those pins deliberately; they tie the adapter to the agent CLI it was tested with.
+  For now they point at commits on Lemon2ee's adapter forks, which add the rate limits push
+  ahead of upstream; go back to the npm releases once upstream ships it.
 - Build output goes to `target.nosync/` (see `.cargo/config.toml`): `~/Documents` syncs to
   iCloud, which skips `.nosync` names. Do not change the target dir.
-- Tests are few: only acp-gui's pacing, tool-call content and effort meter rules have
-  unit tests, as plain functions need no window. "Verified" means `cargo build`,
+- Tests are few: only acp-gui's pacing, tool-call content, effort meter and usage line
+  rules have unit tests, as plain functions need no window. "Verified" means `cargo build`,
   `cargo test`, `cargo clippy` and `cargo fmt` are clean, plus a run of the affected
   front end when the change is user-visible.
 - `dist` (workspace `Cargo.toml`) is `release` with fat LTO and one codegen unit: 20.6 MB
@@ -110,8 +113,8 @@ downloaded copy needs allowing once in System Settings > Privacy & Security.
 
 - **Core owns the protocol; front ends own display.** Anything that talks to
   `agent_client_protocol` lives in `acp-core`. The CLI and GUI see only `Command`,
-  `Event`, `SessionEvent`, `Setting`, `PermissionRequest`, `ToolStatus` and `Harness`
-  (the agents the client can start by name).
+  `Event`, `SessionEvent`, `Setting`, `PermissionRequest`, `ToolStatus`,
+  `RateLimitWindow` and `Harness` (the agents the client can start by name).
 - **One connection, many sessions.** `SessionKey` is chosen by the front end so it can show
   a session before the agent has created it. Each session reads its commands from one
   queue in order, so a cancel never overtakes the prompt it is meant to stop.

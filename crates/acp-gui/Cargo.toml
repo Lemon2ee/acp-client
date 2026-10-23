@@ -17,6 +17,7 @@ profile = [
 
 [dependencies]
 acp-core.workspace = true
+chrono = { workspace = true, features = ["clock"] }
 # Finds the folder for the app's own files, such as the models added to the model list.
 dirs = "6"
 # Pins a gpui-pre snapshot of Zed's gpui and re-exports it with gpui-component.
@@ -69,6 +70,9 @@ objc2-app-kit = { version = "0.3.2", default-features = false, features = [
 objc2-foundation = { version = "0.3.2", default-features = false, features = [
     "std",
     "NSData",
+    "NSDateFormatter",
+    "NSFormatter",
+    "NSLocale",
     "NSString",
     "NSUserDefaults",
 ] }
