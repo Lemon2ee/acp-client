@@ -6,6 +6,7 @@ publish.workspace = true
 
 [dependencies]
 agent-client-protocol.workspace = true
+chrono.workspace = true
 futures.workspace = true
 # Lets a front end keep settings between runs.
 serde.workspace = true

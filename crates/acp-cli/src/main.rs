@@ -3,8 +3,11 @@
 use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
 use std::process::ExitCode;
+use std::time::{Duration, SystemTime};
 
-use acp_core::{Command, Event, PermissionRequest, Receiver, SessionEvent, SessionKey};
+use acp_core::{
+    Command, Event, PermissionRequest, RateLimitWindow, Receiver, SessionEvent, SessionKey,
+};
 
 /// The CLI talks to a single session.
 const SESSION: SessionKey = SessionKey(0);
@@ -124,12 +127,46 @@ fn pump(events: &Receiver<Event>, lines: &mut impl Iterator<Item = io::Result<St
                 | SessionEvent::SettingChanged { .. }
                 | SessionEvent::SettingFailed { .. } => {}
             },
+            Event::RateLimits(windows) => print_rate_limits(&windows),
             Event::Error(message) => eprintln!("\nerror: {message}"),
             Event::Closed => return false,
         }
         io::stdout().flush().ok();
     }
     false
+}
+
+/// The agent sends every window again each time one changes.
+fn print_rate_limits(windows: &[RateLimitWindow]) {
+    if windows.is_empty() {
+        println!("\n[plan limits: none for this login]");
+        return;
+    }
+    println!("\n[plan limits]");
+    for window in windows {
+        let resets = window
+            .resets_at
+            .and_then(|at| at.duration_since(SystemTime::now()).ok())
+            .map(|left| format!(", resets in {}", rough_duration(left)))
+            .unwrap_or_default();
+        println!(
+            "  {}: {:.0}% used{resets}",
+            window.label, window.used_percent
+        );
+    }
+}
+
+/// `3d 4h`, `2h 05m`, `12m`.
+fn rough_duration(duration: Duration) -> String {
+    let minutes = duration.as_secs() / 60;
+    let (days, hours, minutes) = (minutes / (24 * 60), minutes / 60 % 24, minutes % 60);
+    if days > 0 {
+        format!("{days}d {hours}h")
+    } else if hours > 0 {
+        format!("{hours}h {minutes:02}m")
+    } else {
+        format!("{minutes}m")
+    }
 }
 
 fn ask(mut request: PermissionRequest, lines: &mut impl Iterator<Item = io::Result<String>>) {

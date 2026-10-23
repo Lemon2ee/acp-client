@@ -13,7 +13,7 @@ use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use agent_client_protocol::schema::v1::{
     AuthMethod, BooleanConfigOptionCapabilities, CancelNotification, ClientCapabilities,
@@ -30,7 +30,8 @@ use agent_client_protocol::schema::{MaybeUndefined, ProtocolVersion};
 use agent_client_protocol::util::{MatchDispatch, internal_error};
 pub use agent_client_protocol::{AcpAgent, Error};
 use agent_client_protocol::{
-    ActiveSession, Agent, Client, ConnectionTo, Dispatch, Responder, SessionMessage,
+    ActiveSession, Agent, Client, ConnectionTo, Dispatch, JsonRpcNotification, Responder,
+    SessionMessage,
 };
 use futures::FutureExt as _;
 use futures::channel::oneshot;
@@ -84,6 +85,11 @@ pub enum Event {
     /// The agent could not create the session; its next prompt tries again.
     SessionFailed(SessionKey, String),
     Session(SessionKey, SessionEvent),
+    /// How much of its plan's usage limits the agent's login has used, each time that
+    /// changes: every window, in the order the agent shows them. Empty when the login has
+    /// no plan limits, such as an API key. Only an agent that pushes
+    /// `_auth/rate_limits_update` sends it; until one comes, the limits are unknown.
+    RateLimits(Vec<RateLimitWindow>),
     /// The connection failed (missing login, agent crashed, ...); every session is gone.
     Error(String),
     /// No more events will follow.
@@ -325,6 +331,26 @@ pub struct PermissionChoice {
     pub always: bool,
 }
 
+/// One of the usage limits of the agent's login, such as the 5-hour or the weekly window
+/// of a Claude or ChatGPT plan, and how much of it is used.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RateLimitWindow {
+    /// Stable for the same window across updates: `five_hour`, `seven_day:Fable`,
+    /// `codex:primary`.
+    pub id: String,
+    /// The agent's own name for it: "5-hour limit", "Weekly · Fable", "Codex 5h limit".
+    pub label: String,
+    /// Share of the window used, 0 to 100.
+    pub used_percent: f64,
+    /// When the window starts over, where the agent says.
+    pub resets_at: Option<SystemTime>,
+    /// How long the window is, where the agent says: 300 for 5 hours, 10080 for a week.
+    pub window_minutes: Option<u32>,
+    /// Set when only some models count against the window: the plan's name for them,
+    /// such as "Fable". It is not a model id.
+    pub model: Option<String>,
+}
+
 pub struct AgentHandle {
     pub commands: Sender<Command>,
     pub events: Receiver<Event>,
@@ -403,8 +429,16 @@ impl SessionEvents {
 
 /// Pinned rather than `@latest`, so each adapter runs the CLI it bundles and was tested with
 /// (claude-agent-acp pins Agent SDK 0.3.303 exactly; codex-acp takes @openai/codex 0.160.x).
-const CLAUDE_ADAPTER: &str = "npx -y @agentclientprotocol/claude-agent-acp@0.94.0";
-const CODEX_ADAPTER: &str = "npx -y @agentclientprotocol/codex-acp@2.2.2";
+///
+/// For now both come from Lemon2ee's forks: the `preview/rate-limits` branch adds the
+/// `_auth/rate_limits_update` push (see `RateLimitsUpdate`), whose upstream PRs are not
+/// merged yet. Each is upstream main past 0.94.0 and 2.2.2, with the same Agent SDK and
+/// @openai/codex, and the branch has its built `dist/` committed, as the packages build
+/// nothing when installed. They run from GitHub's tarball of the commit: npm 10 fails on
+/// `npx github:…` with "GitFetcher requires an Arborist constructor". Go back to the npm
+/// releases once upstream ships the push.
+const CLAUDE_ADAPTER: &str = "npx -y https://codeload.github.com/Lemon2ee/claude-agent-acp/tar.gz/bb11951ef4c2edf27ce50145e3994208336f87ec";
+const CODEX_ADAPTER: &str = "npx -y https://codeload.github.com/Lemon2ee/codex-acp/tar.gz/079052f7c1f0c535a18849274cf48c1d9a21414b";
 
 /// An agent the client knows how to start: Claude Code or Codex, through its official
 /// ACP adapter. A front end can run one of each and let the user pick between them.
@@ -474,9 +508,19 @@ async fn run(
 ) -> Result<(), String> {
     let started = Instant::now();
     let mut info = AgentInfo::default();
+    let to_front_end = events.clone();
     Client
         .builder()
         .name("acp-gui")
+        // Not part of ACP: the adapter forks `CLAUDE_ADAPTER` and `CODEX_ADAPTER` run push
+        // it for the connection, not for a session, as the limits belong to the login.
+        .on_receive_notification(
+            async move |update: RateLimitsUpdate, _cx| {
+                emit(&to_front_end, Event::RateLimits(update.windows()));
+                Ok(())
+            },
+            agent_client_protocol::on_receive_notification!(),
+        )
         .connect_with(agent, async |cx: ConnectionTo<Agent>| {
             // Lets agents offer a setting that is on or off, such as a fast mode, as a
             // switch rather than a pick of two values.
@@ -1663,6 +1707,58 @@ fn describe_error(err: Error, login_options: &[String]) -> String {
          (`claude` then /login, or `codex login`), then try again. Agent offers: {}",
         login_options.join(", ")
     )
+}
+
+/// `_auth/rate_limits_update`, an extension Claude's and Codex's adapters share until ACP
+/// has a way to report rate limits. The agent advertises it with
+/// `agentCapabilities._meta.rateLimits`, which needs no answer, so nothing here reads that.
+#[derive(Clone, Debug, Serialize, Deserialize, JsonRpcNotification)]
+#[notification(method = "_auth/rate_limits_update")]
+#[serde(rename_all = "camelCase")]
+struct RateLimitsUpdate {
+    rate_limits: RateLimitsPayload,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct RateLimitsPayload {
+    windows: Vec<RateLimitsPayloadWindow>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RateLimitsPayloadWindow {
+    id: String,
+    label: String,
+    used_percent: f64,
+    /// ISO 8601.
+    #[serde(default)]
+    resets_at: Option<String>,
+    #[serde(default)]
+    window_minutes: Option<u32>,
+    #[serde(default)]
+    model: Option<String>,
+}
+
+impl RateLimitsUpdate {
+    fn windows(self) -> Vec<RateLimitWindow> {
+        self.rate_limits
+            .windows
+            .into_iter()
+            .map(|window| RateLimitWindow {
+                id: window.id,
+                label: window.label,
+                used_percent: window.used_percent.clamp(0., 100.),
+                // A date it can't read is taken as not given.
+                resets_at: window.resets_at.and_then(|at| {
+                    chrono::DateTime::parse_from_rfc3339(&at)
+                        .ok()
+                        .map(SystemTime::from)
+                }),
+                window_minutes: window.window_minutes,
+                model: window.model,
+            })
+            .collect()
+    }
 }
 
 /// Whole milliseconds since `since`, for the timings sent to `tracing`.

@@ -10,6 +10,7 @@ publish = false
 [workspace.dependencies]
 acp-core = { path = "crates/acp-core" }
 agent-client-protocol = { version = "3.4", features = ["process"] }
+chrono = { version = "0.4.45", default-features = false, features = ["std"] }
 futures = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

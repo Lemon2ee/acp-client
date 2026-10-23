@@ -8,13 +8,14 @@ mod settings_page;
 mod sidebar;
 mod tool_call;
 mod transcript;
+mod usage_line;
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use acp_core::{
-    AcpAgent, Command, Event as AgentEvent, Sender, SessionEvent, SessionKey, Setting, SettingKind,
-    SettingValue,
+    AcpAgent, Command, Event as AgentEvent, RateLimitWindow, Sender, SessionEvent, SessionKey,
+    Setting, SettingKind, SettingValue,
 };
 use gpui_kit::base::input::Copy;
 use gpui_kit::base::{TextSelection, Transition, transition};
@@ -33,6 +34,7 @@ use crate::chat_view::pickers::effort::EffortMeter;
 use crate::chat_view::pickers::model_panel::ModelPanelState;
 use crate::chat_view::settings_page::SettingsPageState;
 use crate::chat_view::sidebar::{ResizeSidebar, SidebarState};
+use crate::chat_view::usage_line::{USAGE_LINE_BOTTOM_PAD, UsageLineState};
 use crate::chrome::{
     BLURRED_CHAT_ALPHA, BLURRED_SIDEBAR_ALPHA, OWN_TITLE_BAR, WINDOW_BLUR, apply_appearance,
     as_title_bar, window_background,
@@ -72,6 +74,9 @@ struct AgentSlot {
     /// it: no session is created before its first prompt, and creating one takes the
     /// agent seconds, as Claude's adapter starts the Claude Code CLI for it.
     last_settings: Vec<Setting>,
+    /// The plan limits the agent last pushed for its login; none until it has, and
+    /// none for a login without plan limits.
+    rate_limits: Vec<RateLimitWindow>,
     _events: Task<()>,
 }
 
@@ -112,6 +117,7 @@ pub(crate) struct ChatView {
     pacing: Option<Task<()>>,
     /// Draws the window again each second while a tool call on screen counts its seconds.
     tool_clock: Option<Task<()>>,
+    usage: UsageLineState,
     _input_events: Subscription,
     _bounds_events: Subscription,
     _settings_events: Subscription,
@@ -259,6 +265,7 @@ impl ChatView {
                     commands: handle.commands,
                     spare: None,
                     spare_failed: false,
+                    rate_limits: Vec::new(),
                     _events: events_task,
                 }
             })
@@ -283,6 +290,7 @@ impl ChatView {
             global_shortcut: GlobalShortcut::default(),
             pacing: None,
             tool_clock: None,
+            usage: UsageLineState::default(),
             _input_events: input_events,
             _bounds_events: bounds_events,
             _settings_events: settings_events,
@@ -993,6 +1001,7 @@ impl ChatView {
                     self.keep_title(key);
                 }
             }
+            AgentEvent::RateLimits(windows) => self.set_rate_limits(agent, windows, cx),
             // Connection-wide failures show in the session on screen when it is the
             // agent's, else in the agent's newest session, else in the session on
             // screen. With several agents, the message says which one failed, as a
@@ -1171,6 +1180,7 @@ impl Render for ChatView {
                 .find(|setting| setting.kind == SettingKind::Mode)
                 .map(|setting| self.render_mode_picker(session.key, setting, cx)),
         ];
+        let usage_line = self.render_usage_line(session, &shown, cx);
         let action = if session.busy {
             InputGroupButton::new("stop")
                 .icon(IconName::Square)
@@ -1224,45 +1234,53 @@ impl Render for ChatView {
             .child(transcript.flex_1().min_h(px(0.)).opacity(chat_shown))
             .child(
                 // A row along the input box's bottom: the session's model and mode on the
-                // left, the send/stop button on the right.
-                div().p_3().opacity(chat_shown).child(
-                    InputGroup::new("prompt")
-                        .rounded_xl()
-                        // The group brightens its border and rings itself while it has
-                        // focus. An inset shadow draws its resting border instead, so the
-                        // box looks the same focused or not.
-                        .border_0()
-                        .shadow(vec![
-                            BoxShadow::new(px(0.), px(0.), input_border)
-                                .spread_radius(px(1.))
-                                .inset(),
-                        ])
-                        .focus_ring(false)
-                        // With the 44px row below it, the box is 129px tall until the
-                        // text needs more room, with the text at the top.
-                        .input(
-                            Textarea::new(&self.input)
-                                .min_h(px(85.))
-                                // On top of the textarea's own 10px and 8px, so the
-                                // text starts 17px in from the left, level with the
-                                // model button's mark, and its capitals 17px down.
-                                .px(px(6.))
-                                .pt(px(4.)),
-                        )
-                        .addon(
-                            InputGroupAddon::new("prompt-actions")
-                                .align(InputGroupAddonAlignment::BlockEnd)
-                                // 6px in from the box's sides and bottom, like the gap
-                                // above the buttons.
-                                .px_1p5()
-                                .pb_1p5()
-                                .children(pickers.into_iter().flatten())
-                                .child(div().flex_1())
-                                // A pointing hand over it, where the component's buttons
-                                // keep the arrow.
-                                .child(action.primary().small().rounded_full().cursor_pointer()),
-                        ),
-                ),
+                // left, the send/stop button on the right. Below the box, the plan usage
+                // of the session's agent, where it says.
+                div()
+                    .p_3()
+                    .when(usage_line.is_some(), |this| this.pb(USAGE_LINE_BOTTOM_PAD))
+                    .opacity(chat_shown)
+                    .child(
+                        InputGroup::new("prompt")
+                            .rounded_xl()
+                            // The group brightens its border and rings itself while it has
+                            // focus. An inset shadow draws its resting border instead, so the
+                            // box looks the same focused or not.
+                            .border_0()
+                            .shadow(vec![
+                                BoxShadow::new(px(0.), px(0.), input_border)
+                                    .spread_radius(px(1.))
+                                    .inset(),
+                            ])
+                            .focus_ring(false)
+                            // With the 44px row below it, the box is 129px tall until the
+                            // text needs more room, with the text at the top.
+                            .input(
+                                Textarea::new(&self.input)
+                                    .min_h(px(85.))
+                                    // On top of the textarea's own 10px and 8px, so the
+                                    // text starts 17px in from the left, level with the
+                                    // model button's mark, and its capitals 17px down.
+                                    .px(px(6.))
+                                    .pt(px(4.)),
+                            )
+                            .addon(
+                                InputGroupAddon::new("prompt-actions")
+                                    .align(InputGroupAddonAlignment::BlockEnd)
+                                    // 6px in from the box's sides and bottom, like the gap
+                                    // above the buttons.
+                                    .px_1p5()
+                                    .pb_1p5()
+                                    .children(pickers.into_iter().flatten())
+                                    .child(div().flex_1())
+                                    // A pointing hand over it, where the component's buttons
+                                    // keep the arrow.
+                                    .child(
+                                        action.primary().small().rounded_full().cursor_pointer(),
+                                    ),
+                            ),
+                    )
+                    .children(usage_line),
             );
 
         // Stays beside the traffic lights, over the sidebar or the chat, while the sidebar
