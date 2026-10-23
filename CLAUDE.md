@@ -42,7 +42,7 @@ clearly needs splitting. acp-gui is split by what each part keeps or draws:
 | `chat_view/sidebar.rs` | The Sessions and Stuff tabs, the session cards, renaming, the delete prompt, the Archived list, the draggable edge. |
 | `chat_view/stuff.rs` | The Stuff list: the note in front to write into, and the board of notes stuck from it, the same for every session. |
 | `chat_view/stuff/attachments.rs` | Images and files pasted into a note: taken from the clipboard, drawn as tiles on the note, its card, the prompt a card is let go on and the row it is sent as, taken off the note or the prompt with their ×. |
-| `chat_view/stuff/drag.rs` | A card dragged into the chat: into the prompt, sent from the transcript (into the prompt while the agent replies) or back; the zones it lights and its way there; once in the chat, its place on the board closing and the note gone. |
+| `chat_view/stuff/drag.rs` | A card dragged into the chat: pulled at by its tape until the tape tears in two, then into the prompt, sent from the transcript (into the prompt while the agent replies) or back; the zones it lights and its way there; once in the chat, its place on the board closing and the note gone. |
 | `chat_view/info_panel.rs` | The session info panel at the chat's right, under the title row: its button, the draggable edge, and the Context window section with its bar and categories. |
 | `chat_view/info_panel/pull_requests.rs` | The panel's Pull requests section, when it asks `gh`, and a file's diff in the panel's place. |
 | `chat_view/info_panel/files.rs` | The panel's Files section, and starting and stopping each turn's watch of the session's folder. |

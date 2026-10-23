@@ -24,7 +24,7 @@ use gpui_kit::*;
 use crate::chat_view::ChatView;
 use crate::chat_view::pickers::{MenuLook, SURFACE_RADIUS};
 use crate::chat_view::stuff::attachments::TileHover;
-use crate::chat_view::stuff::drag::{DragState, StuffDrag, pick_up};
+use crate::chat_view::stuff::drag::{DragState, Slot, StuffDrag, pick_up};
 use crate::config::{
     StuffAttachment, StuffNote, change_stuff, config_folder, forget_attachment, load_stuff,
 };
@@ -66,8 +66,19 @@ const TAPE_WIDTH: Pixels = px(32.);
 const TAPE_HEIGHT: Pixels = px(10.);
 const TAPE_RADIUS: Pixels = px(2.);
 const TAPE_DROP: Pixels = px(3.);
+/// Torn, the tape is two 18px halves meeting on a zigzag, the right one 14px in. Coming
+/// loose, the half left on the board turns 8° up about its left end and drops 2px, and the
+/// half on the card turns 6° up about its right end.
+const TORN_WIDTH: Pixels = px(18.);
+const TORN_RIGHT_AT: Pixels = px(14.);
+const TORN_LEFT_TURN: f32 = -8.;
+const TORN_LEFT_DROP: Pixels = px(2.);
+const TORN_RIGHT_TURN: f32 = 6.;
+/// The halves, square at the zigzag and as round as the tape at their outer ends.
+const TAPE_LEFT: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" width="18" height="10" viewBox="0 0 18 10"><path d="M2 0H15L17.5 2L15.5 4L17.5 6L15.5 8L17 10H2A2 2 0 0 1 0 8V2A2 2 0 0 1 2 0Z"/></svg>"#;
+const TAPE_RIGHT: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" width="18" height="10" viewBox="0 0 18 10"><path d="M1 0H16A2 2 0 0 1 18 2V8A2 2 0 0 1 16 10H3L1.5 8L3.5 6L1.5 4L3.5 2Z"/></svg>"#;
 /// The place a card in hand leaves on the board: a dashed edge at the text's color, 20%,
-/// with the tape still on it.
+/// with the tape, or once torn its left half, still on it.
 const SLOT_EDGE_ALPHA: f32 = 0.2;
 /// The board's dots: 2px across, one every 12px.
 const DOT_SPACING: Pixels = px(12.);
@@ -272,7 +283,7 @@ impl ChatView {
     /// one to the other over both.
     pub(crate) fn render_stuff(&self, window: &mut Window, cx: &mut Context<Self>) -> Div {
         let frame = self.stuff.stick_frame(cx);
-        if frame.is_some() || self.stuff.drag.any_closing() {
+        if frame.is_some() || self.stuff.drag.moving(cx) {
             window.request_animation_frame();
         }
         let dots = if cx.theme().is_dark() {
@@ -440,7 +451,7 @@ impl ChatView {
                 None => (look.shadow.clone(), 1.),
             };
             let card = look
-                .card(note, shadow, taped, self.stuff.drag.hollow(id, cx))
+                .card(note, shadow, taped, self.stuff.drag.slot(id, cx))
                 .child(measure(move |bounds| {
                     layout.cards.borrow_mut().insert(id, bounds);
                 }))
@@ -643,28 +654,35 @@ impl CardLook {
         }
     }
 
-    /// A card, with `shadow`, its tape `taped` of the way down onto it. While it is
-    /// `hollow`, it is only its place: a dashed edge and the tape, as tall as the card.
+    /// A card, with `shadow`, its tape `taped` of the way down onto it, or less as its
+    /// `slot` says, keeping the card's height.
     fn card(
         &self,
         note: &StuffNote,
         shadow: Vec<BoxShadow>,
         taped: f32,
-        hollow: bool,
+        slot: Slot,
     ) -> Stateful<Div> {
+        let shown = matches!(slot, Slot::Card);
         div()
             .id(("stuff-card", note.id))
             .relative()
             .flex_none()
             .p(CARD_PAD)
             .rounded(CARD_RADIUS)
-            .when(!hollow, |card| card.bg(self.background).shadow(shadow))
+            .when(shown, |card| card.bg(self.background).shadow(shadow))
             .text_size(TEXT_SIZE)
             .line_height(LINE_HEIGHT)
-            .child(self.tape(taped))
-            .child(self.body(note).when(hollow, |body| body.opacity(0.)))
+            .map(|card| match slot {
+                Slot::Card | Slot::Hollow { loose: None } => card.child(self.tape(taped)),
+                Slot::Hollow { loose: Some(loose) } => {
+                    card.child(self.torn_tape(Half::Left, loose))
+                }
+                Slot::Away => card,
+            })
+            .child(self.body(note).when(!shown, |body| body.opacity(0.)))
             // Over the card rather than its own border, which would move its content.
-            .when(hollow, |card| {
+            .when(matches!(slot, Slot::Hollow { .. }), |card| {
                 card.child(dashed_edge(self.slot_edge).rounded(CARD_RADIUS))
             })
     }
@@ -697,6 +715,63 @@ impl CardLook {
             .bg(self.tape)
             .opacity(dropped)
     }
+
+    /// The tape on a card pulled `by` from its place, stretched from where it holds the
+    /// board to where it holds the card, and half way between them up and down.
+    fn stretched_tape(&self, by: Point<Pixels>) -> Div {
+        div()
+            .absolute()
+            .top(-TAPE_HEIGHT / 2. - by.y / 2.)
+            .left_1_2()
+            .ml(-TAPE_WIDTH / 2. - px(by.x.as_f32().max(0.)))
+            .w(TAPE_WIDTH + by.x.abs())
+            .h(TAPE_HEIGHT)
+            .rounded(TAPE_RADIUS)
+            .bg(self.tape)
+    }
+
+    /// One half of the torn tape where the whole one was, `loose` of the way to coming
+    /// loose.
+    fn torn_tape(&self, half: Half, loose: f32) -> Svg {
+        let (data, left, turn, end, drop) = match half {
+            Half::Left => (
+                TAPE_LEFT,
+                px(0.),
+                TORN_LEFT_TURN,
+                -TORN_WIDTH / 2.,
+                TORN_LEFT_DROP,
+            ),
+            Half::Right => (
+                TAPE_RIGHT,
+                TORN_RIGHT_AT,
+                TORN_RIGHT_TURN,
+                TORN_WIDTH / 2.,
+                px(0.),
+            ),
+        };
+        let angle = (turn * loose).to_radians();
+        // gpui turns an svg about its middle, so it is moved back to turn about the middle
+        // of its outer end, `end` from there.
+        let moved = point(end - end * angle.cos(), -end * angle.sin() + drop * loose);
+        svg()
+            .data(data.as_bytes())
+            .absolute()
+            .top(-TAPE_HEIGHT / 2.)
+            .left_1_2()
+            .ml(-TAPE_WIDTH / 2. + left)
+            .w(TORN_WIDTH)
+            .h(TAPE_HEIGHT)
+            .text_color(self.tape)
+            .with_transformation(Transformation::rotate(radians(angle)).with_translation(moved))
+    }
+}
+
+/// A half of a torn tape: the left one stays on the board, the right one goes with the
+/// card.
+#[derive(Clone, Copy)]
+enum Half {
+    Left,
+    Right,
 }
 
 /// `shadow` pressed flat against the board: its soft shadows gone, its ring and edge
