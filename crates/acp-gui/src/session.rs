@@ -2,6 +2,7 @@
 //! its settings with the changes the agent hasn't answered yet, and how each of the
 //! agent's events for it lands there.
 
+mod context;
 mod pacing;
 mod tool_call;
 
@@ -21,6 +22,9 @@ use gpui_kit::*;
 use crate::chat_view::scroller::TranscriptScroll;
 use crate::config::TitleSource;
 use crate::debug::switches;
+pub(crate) use context::{
+    Category, CategoryKind, ContextReport, KeptContext, SessionContext, now, short_tokens,
+};
 use pacing::Pacer;
 pub(crate) use tool_call::{Answer, Ask, Code, Diff, DiffLine, Shown, ToolCall, folded_text};
 
@@ -75,6 +79,8 @@ pub(crate) struct Session {
     pub(crate) origin: Origin,
     /// In the sidebar's Archived list, out of the way.
     pub(crate) archived: bool,
+    /// Its context window, for the info panel.
+    pub(crate) context: SessionContext,
     /// A turn prompted here is running, so the agent's text arrives as it is written: it
     /// fades in and new rows come in with motion. A loaded session's replay shows at once.
     live: bool,
@@ -142,6 +148,7 @@ impl Session {
             id: None,
             origin: Origin::New,
             archived: false,
+            context: SessionContext::default(),
             live: false,
             entering: HashMap::new(),
             changed: Instant::now(),
@@ -466,11 +473,19 @@ impl Session {
                 self.title = Some(title);
                 self.title_source = TitleSource::Agent;
             }
-            // Nothing in the window shows these yet.
-            SessionEvent::ContextUsage(_)
-            | SessionEvent::TurnUsage(_)
-            | SessionEvent::ContextReport(_)
-            | SessionEvent::ContextReadable(_) => {}
+            SessionEvent::ContextUsage(usage) => {
+                self.context.usage = Some(usage);
+                self.context.kept_at = None;
+            }
+            SessionEvent::TurnUsage(usage) => self.context.took(usage),
+            SessionEvent::ContextReport(markdown) => {
+                self.context.reading = false;
+                // Text it can't read leaves the last report up.
+                if let Some(report) = markdown.as_deref().and_then(ContextReport::parse) {
+                    self.context.report = Some((report, now()));
+                }
+            }
+            SessionEvent::ContextReadable(readable) => self.context.readable = readable,
         }
     }
 

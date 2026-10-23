@@ -2,6 +2,7 @@
 //! how the sidebar, the chat and the settings are laid out. The parts it draws live in the
 //! modules below it, which can read its private fields.
 
+mod info_panel;
 mod pickers;
 pub(crate) mod scroller;
 mod settings_page;
@@ -29,6 +30,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::OpenSettings;
+use crate::chat_view::info_panel::{InfoPanelState, ResizeInfoPanel};
 use crate::chat_view::pickers::MenuNav;
 use crate::chat_view::pickers::effort::EffortMeter;
 use crate::chat_view::pickers::model_panel::ModelPanelState;
@@ -106,6 +108,7 @@ pub(crate) struct ChatView {
     /// The window is blurred now, and its sidebar and chat translucent.
     blurred: bool,
     sidebar: SidebarState,
+    info_panel: InfoPanelState,
     model_panel: ModelPanelState,
     /// The light and the focus of the menu below the prompt that is open.
     menu_nav: MenuNav,
@@ -283,6 +286,7 @@ impl ChatView {
             window_blur: blur,
             blurred: blur,
             sidebar: SidebarState::default(),
+            info_panel: InfoPanelState::default(),
             model_panel: ModelPanelState::new(window, cx),
             menu_nav: MenuNav::new(cx),
             effort: EffortMeter::new(cx),
@@ -328,6 +332,9 @@ impl ChatView {
             session.id = Some(saved.id);
             session.origin = Origin::Saved(saved.cwd);
             session.archived = saved.archived;
+            if let Some(kept) = &saved.context {
+                session.context.restore(kept);
+            }
             self.sessions.push(session);
         }
     }
@@ -372,6 +379,7 @@ impl ChatView {
             cwd: self.cwd.clone(),
             archived: session.archived,
             title_source: session.title_source,
+            context: session.context.kept(),
         };
         let changed = config_folder()
             .ok_or_else(|| std::io::Error::other("there is no config folder"))
@@ -578,6 +586,7 @@ impl ChatView {
             });
         }
         self.input.update(cx, |input, cx| input.focus(window, cx));
+        self.read_context_if_shown();
         cx.notify();
     }
 
@@ -594,6 +603,15 @@ impl ChatView {
             saved.title = title;
             saved.title_source = source;
         });
+    }
+
+    /// Keeps the session's last count of its context window, and its turns' tokens, for
+    /// later runs: the agent counts nothing as it loads a session.
+    fn keep_context(&self, key: SessionKey) {
+        let Some(kept) = self.session(key).and_then(|session| session.context.kept()) else {
+            return;
+        };
+        self.change_kept(key, |saved| saved.context = Some(kept));
     }
 
     /// Makes `change` to the session as kept for later runs, if it is kept already.
@@ -676,6 +694,9 @@ impl ChatView {
         fresh.id = session.id.clone();
         fresh.origin = Origin::Saved(folder);
         fresh.archived = session.archived;
+        if let Some(kept) = session.context.kept() {
+            fresh.context.restore(&kept);
+        }
         let old = std::mem::replace(&mut self.sessions[ix], fresh);
         self.sessions[ix].draft = old.draft;
         let _ = self.agents[old.agent]
@@ -784,6 +805,8 @@ impl ChatView {
             .title
             .get_or_insert_with(|| text.lines().next().unwrap_or_default().to_string());
         session.busy = true;
+        // What fills the window changes with the turn.
+        session.context.fresh = false;
         session.push(Row::User(text.clone()), cx);
         // Live from after the prompt's own row, which shows at once as it was typed here.
         session.set_live(true, cx);
@@ -791,6 +814,8 @@ impl ChatView {
         // Has the agent create the session first, if it hasn't yet.
         let prompt = Command::Prompt(key, text);
         let _ = self.agents[session.agent].commands.try_send(prompt);
+        // Runs once the turn is over, while the panel shows the window.
+        self.read_context_if_shown();
         // A spare the agent created has its id already; any other session is kept
         // once the agent gives it one.
         if first {
@@ -985,6 +1010,10 @@ impl ChatView {
                     self.agents[agent].spare_failed = false;
                 }
                 let created = matches!(event, SessionEvent::Created(_));
+                let ended = matches!(
+                    event,
+                    SessionEvent::TurnEnded { .. } | SessionEvent::TurnFailed(_)
+                );
                 let mut retitled = false;
                 if let Some(session) = self.session_mut(key) {
                     let title = session.title.clone();
@@ -1000,6 +1029,11 @@ impl ChatView {
                 if retitled {
                     self.keep_title(key);
                 }
+                if ended {
+                    self.keep_context(key);
+                }
+                // The agent may just have said it can read the window, or answered a read.
+                self.read_context_if_shown();
             }
             AgentEvent::RateLimits(windows) => self.set_rate_limits(agent, windows, cx),
             // Connection-wide failures show in the session on screen when it is the
@@ -1155,11 +1189,20 @@ impl Render for ChatView {
         let (muted, hover) = (theme.muted_foreground, theme.secondary);
         let motion = theme.motion_tokens();
         let slide = Transition::new(motion.duration_slow).easing(motion.easing_move.clone());
+        let panel_slide = slide.clone();
         // 0 while the sidebar is shown and 1 while it is hidden, in between as it slides.
         let hidden = transition(
             "sidebar-hidden",
             if self.sidebar.open { 0. } else { 1. },
             slide,
+            window,
+            cx,
+        );
+        // The same for the info panel.
+        let panel_hidden = transition(
+            "info-panel-hidden",
+            if self.info_panel.open { 0. } else { 1. },
+            panel_slide,
             window,
             cx,
         );
@@ -1205,6 +1248,54 @@ impl Render for ChatView {
         // name up to the sidebar button; from there it stays 6px past the button.
         let name_left = (toggle_left + SIDEBAR_BUTTON_SIZE + px(6.) - sidebar_width).max(px(16.));
 
+        // A row along the input box's bottom: the session's model and mode on the left,
+        // the send/stop button on the right. Below the box, the plan usage of the
+        // session's agent, where it says.
+        let composer = div()
+            .p_3()
+            .when(usage_line.is_some(), |this| this.pb(USAGE_LINE_BOTTOM_PAD))
+            .opacity(chat_shown)
+            .child(
+                InputGroup::new("prompt")
+                    .rounded_xl()
+                    // The group brightens its border and rings itself while it has
+                    // focus. An inset shadow draws its resting border instead, so the
+                    // box looks the same focused or not.
+                    .border_0()
+                    .shadow(vec![
+                        BoxShadow::new(px(0.), px(0.), input_border)
+                            .spread_radius(px(1.))
+                            .inset(),
+                    ])
+                    .focus_ring(false)
+                    // With the 44px row below it, the box is 129px tall until the
+                    // text needs more room, with the text at the top.
+                    .input(
+                        Textarea::new(&self.input)
+                            .min_h(px(85.))
+                            // On top of the textarea's own 10px and 8px, so the
+                            // text starts 17px in from the left, level with the
+                            // model button's mark, and its capitals 17px down.
+                            .px(px(6.))
+                            .pt(px(4.)),
+                    )
+                    .addon(
+                        InputGroupAddon::new("prompt-actions")
+                            .align(InputGroupAddonAlignment::BlockEnd)
+                            // 6px in from the box's sides and bottom, like the gap
+                            // above the buttons.
+                            .px_1p5()
+                            .pb_1p5()
+                            .children(pickers.into_iter().flatten())
+                            .child(div().flex_1())
+                            // A pointing hand over it, where the component's buttons
+                            // keep the arrow.
+                            .child(action.primary().small().rounded_full().cursor_pointer()),
+                    ),
+            )
+            .children(usage_line);
+        let panel = self.render_info_panel(panel_hidden, cx).opacity(chat_shown);
+
         // The chat fills the window right of the sidebar.
         let chat = div()
             .flex_1()
@@ -1222,7 +1313,7 @@ impl Render for ChatView {
                     .flex_none()
                     .h(self.title_bar_height)
                     .pl(name_left)
-                    .pr_4()
+                    .pr(Self::info_panel_button_room())
                     .flex()
                     .items_center()
                     .text_sm()
@@ -1231,56 +1322,23 @@ impl Render for ChatView {
                     .opacity(chat_shown)
                     .when(title_bar, as_title_bar),
             )
-            .child(transcript.flex_1().min_h(px(0.)).opacity(chat_shown))
             .child(
-                // A row along the input box's bottom: the session's model and mode on the
-                // left, the send/stop button on the right. Below the box, the plan usage
-                // of the session's agent, where it says.
+                // Under the title row: the transcript and the prompt, and the info panel
+                // right of them.
                 div()
-                    .p_3()
-                    .when(usage_line.is_some(), |this| this.pb(USAGE_LINE_BOTTOM_PAD))
-                    .opacity(chat_shown)
+                    .flex_1()
+                    .min_h(px(0.))
+                    .flex()
                     .child(
-                        InputGroup::new("prompt")
-                            .rounded_xl()
-                            // The group brightens its border and rings itself while it has
-                            // focus. An inset shadow draws its resting border instead, so the
-                            // box looks the same focused or not.
-                            .border_0()
-                            .shadow(vec![
-                                BoxShadow::new(px(0.), px(0.), input_border)
-                                    .spread_radius(px(1.))
-                                    .inset(),
-                            ])
-                            .focus_ring(false)
-                            // With the 44px row below it, the box is 129px tall until the
-                            // text needs more room, with the text at the top.
-                            .input(
-                                Textarea::new(&self.input)
-                                    .min_h(px(85.))
-                                    // On top of the textarea's own 10px and 8px, so the
-                                    // text starts 17px in from the left, level with the
-                                    // model button's mark, and its capitals 17px down.
-                                    .px(px(6.))
-                                    .pt(px(4.)),
-                            )
-                            .addon(
-                                InputGroupAddon::new("prompt-actions")
-                                    .align(InputGroupAddonAlignment::BlockEnd)
-                                    // 6px in from the box's sides and bottom, like the gap
-                                    // above the buttons.
-                                    .px_1p5()
-                                    .pb_1p5()
-                                    .children(pickers.into_iter().flatten())
-                                    .child(div().flex_1())
-                                    // A pointing hand over it, where the component's buttons
-                                    // keep the arrow.
-                                    .child(
-                                        action.primary().small().rounded_full().cursor_pointer(),
-                                    ),
-                            ),
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .flex()
+                            .flex_col()
+                            .child(transcript.flex_1().min_h(px(0.)).opacity(chat_shown))
+                            .child(composer),
                     )
-                    .children(usage_line),
+                    .child(panel),
             );
 
         // Stays beside the traffic lights, over the sidebar or the chat, while the sidebar
@@ -1338,6 +1396,15 @@ impl Render for ChatView {
                     this.resize_sidebar(event, cx);
                 }),
             )
+            // The same for the info panel's edge.
+            .on_drag_move(cx.listener(
+                move |this, event: &DragMoveEvent<ResizeInfoPanel>, _, cx| {
+                    if panel_hidden > 0. {
+                        return;
+                    }
+                    this.resize_info_panel(event, cx);
+                },
+            ))
             // The prompt box keeps keyboard focus while text in the chat is selected, and
             // its own Copy handler would swallow cmd-c, so copy the chat's selection first.
             .capture_action(|_: &Copy, window, cx| {
@@ -1366,6 +1433,7 @@ impl Render for ChatView {
             )
             .child(chat)
             .child(toggle)
+            .child(self.render_info_panel_button(cx).opacity(chat_shown))
             .into_any_element()
     }
 }
