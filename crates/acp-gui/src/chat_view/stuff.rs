@@ -23,11 +23,12 @@ use gpui_kit::*;
 
 use crate::chat_view::ChatView;
 use crate::chat_view::pickers::{MenuLook, SURFACE_RADIUS};
-use crate::chat_view::stuff::attachments::{STRIP_GAP, TileHover, TileLook};
+use crate::chat_view::stuff::attachments::TileHover;
 use crate::chat_view::stuff::drag::{DragState, StuffDrag, pick_up};
 use crate::config::{
     StuffAttachment, StuffNote, change_stuff, config_folder, forget_attachment, load_stuff,
 };
+pub(crate) use attachments::{STRIP_GAP, TileLook, TilesOn};
 
 /// The text of the note and the cards. Both wrap it at the sidebar's width less 40, so a
 /// note's lines break in the same places once it is a card.
@@ -344,7 +345,7 @@ impl ChatView {
             // Lined up with the text, inside the field's own padding.
             .when(!self.stuff.pending.is_empty(), |note| {
                 note.child(
-                    self.note_attachments(window, cx)
+                    self.removable_tiles(TilesOn::Note, window, cx)
                         .mt(STRIP_GAP)
                         .mx(FIELD_PAD_X),
                 )

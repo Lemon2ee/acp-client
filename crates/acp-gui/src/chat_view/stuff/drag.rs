@@ -1,7 +1,8 @@
 //! A card dragged off the Stuff board into the chat. Let go over the prompt box, its text
-//! goes into the prompt after what is there, not sent. Let go over the transcript, it is
-//! sent at once, unless the agent is still replying, when it goes into the prompt as
-//! well. Anywhere else, or on Esc, it flies back. The card stays on the board either way.
+//! goes into the prompt after what is there, and what was pasted into it onto the
+//! prompt's row of tiles, not sent. Let go over the transcript, it is sent at once,
+//! unless the agent is still replying, when it goes into the prompt as well. Anywhere
+//! else, or on Esc, it flies back. The card stays on the board either way.
 //!
 //! gpui's drag view is gone once the pointer lets go, so the card's way into the prompt,
 //! onto its sent row or back to the board is drawn by `ChatView` over the whole window.
@@ -18,6 +19,7 @@ use gpui_kit::*;
 
 use crate::chat_view::ChatView;
 use crate::chat_view::pickers::MenuLook;
+use crate::chat_view::stuff::attachments::TileHover;
 use crate::chat_view::stuff::{
     CARD_PAD, CARD_RADIUS, CardLook, LINE_HEIGHT, SLOT_EDGE_ALPHA, TEXT_SIZE, dashed_edge, measure,
     mix_shadows,
@@ -27,7 +29,7 @@ use crate::config::StuffNote;
 /// A card let go of fades from 120ms, over 160ms, as it reaches its place.
 const FADE_AFTER: Duration = Duration::from_millis(120);
 const FADE: Duration = Duration::from_millis(160);
-/// Its text goes into the prompt as it reaches the prompt's first line.
+/// What it carries goes into the prompt as it reaches the prompt's first line.
 const INTO_PROMPT_AFTER: Duration = Duration::from_millis(160);
 /// From 300ms the card on the board shows again, and the prompt's ring lets go over the
 /// slow duration.
@@ -289,17 +291,8 @@ pub(super) fn pick_up(
 
 impl ChatView {
     /// The zone a card let go at `at` goes to: the prompt zone, then the rest of the chat.
-    /// A card of pasted things alone has nothing the chat can take yet, so it goes back.
     fn zone_at(&self, at: Point<Pixels>) -> Option<Zone> {
-        let drag = &self.stuff.drag;
-        if drag
-            .held
-            .as_ref()
-            .is_some_and(|held| held.note.text.is_empty())
-        {
-            return None;
-        }
-        let zones = &drag.zones;
+        let zones = &self.stuff.drag.zones;
         if zones.prompt.get().contains(&at) {
             Some(Zone::Prompt { busy: false })
         } else if zones.chat.get().contains(&at) {
@@ -337,14 +330,14 @@ impl ChatView {
         let to = match zone {
             Some(Zone::Prompt { .. }) => {
                 let key = self.sessions[self.active].key;
-                let text = held.note.text.clone();
+                let note = held.note.clone();
                 if cx.reduce_motion() {
-                    self.add_to_prompt(key, &text, window, cx);
+                    self.add_to_prompt(key, &note, window, cx);
                 } else {
                     cx.spawn_in(window, async move |this, cx| {
                         cx.background_executor().timer(INTO_PROMPT_AFTER).await;
                         let _ = this.update_in(cx, |this, window, cx| {
-                            this.add_to_prompt(key, &text, window, cx)
+                            this.add_to_prompt(key, &note, window, cx)
                         });
                     })
                     .detach();
@@ -352,7 +345,8 @@ impl ChatView {
                 DropTo::Prompt
             }
             Some(Zone::History) => {
-                self.send_prompt(held.note.text.clone(), cx);
+                let note = &held.note;
+                self.send_prompt(note.text.clone(), note.attachments.clone(), cx);
                 let session = &self.sessions[self.active];
                 DropTo::Sent {
                     key: session.key,
@@ -371,35 +365,47 @@ impl ChatView {
         cx.notify();
     }
 
-    /// Puts `text` at the end of the session's prompt after a blank line, the caret after
-    /// it and the keys in the prompt, without sending it. A session gone off screen
-    /// meanwhile gets it at the end of its kept draft.
+    /// Puts the note's text at the end of the session's prompt after a blank line, the
+    /// caret after it and the keys in the prompt, and what was pasted into it after the
+    /// prompt's tiles, without sending it. A session gone off screen meanwhile gets the
+    /// text at the end of its kept draft.
     fn add_to_prompt(
         &mut self,
         key: SessionKey,
-        text: &str,
+        note: &StuffNote,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.sessions[self.active].key != key {
-            if let Some(session) = self.session_mut(key) {
+        let on_screen = self.sessions[self.active].key == key;
+        // The pointer was last over tiles that may have gone since.
+        self.stuff.tile_hover = TileHover::default();
+        let Some(session) = self.session_mut(key) else {
+            return;
+        };
+        session.attachments.extend(note.attachments.iter().cloned());
+        let text = note.text.as_str();
+        if !on_screen {
+            if !text.is_empty() {
                 session.draft = appended(&session.draft, text).into();
             }
             return;
         }
         self.input.update(cx, |input, cx| {
-            let value = input.value();
-            let kept = value.trim_end().len();
-            let added = if kept == 0 {
-                text.to_string()
-            } else {
-                format!("\n\n{text}")
-            };
-            // In place of any blank lines at the end, as one change to undo.
-            input.set_selected_range(kept..value.len(), cx);
-            input.replace(added, window, cx);
+            if !text.is_empty() {
+                let value = input.value();
+                let kept = value.trim_end().len();
+                let added = if kept == 0 {
+                    text.to_string()
+                } else {
+                    format!("\n\n{text}")
+                };
+                // In place of any blank lines at the end, as one change to undo.
+                input.set_selected_range(kept..value.len(), cx);
+                input.replace(added, window, cx);
+            }
             input.focus(window, cx);
         });
+        cx.notify();
     }
 
     /// The window's root, taking cards let go anywhere over it or outside it, and Esc.
@@ -656,15 +662,22 @@ impl ChatView {
         )
     }
 
-    /// The bubble of the row at `row` in `key`'s transcript, as it fills in under the card
-    /// it was sent as: a dashed outline its size at first.
-    pub(crate) fn sent_bubble(&self, key: SessionKey, row: usize, bubble: Div, cx: &App) -> Div {
+    /// The bubble of the row at `row` in `key`'s transcript with what it says, `body`, as
+    /// it fills in under the card it was sent as: a dashed outline its size at first.
+    pub(crate) fn sent_bubble(
+        &self,
+        key: SessionKey,
+        row: usize,
+        bubble: Div,
+        body: Div,
+        cx: &App,
+    ) -> Div {
         let drag = &self.stuff.drag;
         let sent_here = drag.dropped.as_ref().is_some_and(|dropped| {
             matches!(dropped.to, DropTo::Sent { key: sent, row: at } if sent == key && at == row)
         });
         let Some(frame) = drag.drop_frame(cx).filter(|_| sent_here) else {
-            return bubble;
+            return bubble.child(body);
         };
         let theme = cx.theme();
         let zones = drag.zones.clone();
@@ -673,7 +686,7 @@ impl ChatView {
             .opacity(SLOT_EDGE_ALPHA * (1. - frame.filled));
         bubble
             .bg(theme.secondary.opacity(frame.filled))
-            .text_color(theme.foreground.opacity(frame.filled))
+            .child(body.opacity(frame.filled))
             .child(dashed_edge(edge).rounded_lg())
             .child(measure(move |bounds| zones.sent.set(Some(bounds))))
     }

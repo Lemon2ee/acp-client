@@ -94,11 +94,13 @@ name = "acp-core"
 version = "0.1.0"
 dependencies = [
  "agent-client-protocol",
+ "base64 0.22.1",
  "chrono",
  "futures",
  "serde",
  "smol",
  "tracing",
+ "url",
 ]
 
 [[package]]

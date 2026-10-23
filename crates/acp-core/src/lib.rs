@@ -19,13 +19,14 @@ use std::time::{Duration, Instant, SystemTime};
 use agent_client_protocol::schema::v1::{
     AuthMethod, AvailableCommand, BooleanConfigOptionCapabilities, CancelNotification,
     ClientCapabilities, ClientSessionCapabilities, CloseSessionRequest, ContentBlock,
-    DeleteSessionRequest, ErrorCode, Implementation, InitializeRequest, PermissionOption,
-    PermissionOptionKind, PromptRequest, PromptResponse, RequestPermissionOutcome,
-    RequestPermissionRequest, RequestPermissionResponse, SelectedPermissionOutcome,
-    SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory, SessionConfigOptionValue,
-    SessionConfigOptionsCapabilities, SessionConfigSelectOptions, SessionId, SessionNotification,
-    SessionUpdate, SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, StopReason,
-    ToolCallContent, ToolCallLocation, ToolCallStatus, ToolKind as ProtocolToolKind, Usage,
+    DeleteSessionRequest, ErrorCode, ImageContent, Implementation, InitializeRequest,
+    PermissionOption, PermissionOptionKind, PromptRequest, PromptResponse,
+    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse, ResourceLink,
+    SelectedPermissionOutcome, SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory,
+    SessionConfigOptionValue, SessionConfigOptionsCapabilities, SessionConfigSelectOptions,
+    SessionId, SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
+    SetSessionConfigOptionResponse, StopReason, ToolCallContent, ToolCallLocation, ToolCallStatus,
+    ToolKind as ProtocolToolKind, Usage,
 };
 use agent_client_protocol::schema::{MaybeUndefined, ProtocolVersion};
 use agent_client_protocol::util::{MatchDispatch, internal_error};
@@ -34,15 +35,45 @@ use agent_client_protocol::{
     ActiveSession, Agent, Client, ConnectionTo, Dispatch, JsonRpcNotification, Responder,
     SessionMessage,
 };
+use base64::prelude::{BASE64_STANDARD, Engine as _};
 use futures::FutureExt as _;
 use futures::channel::oneshot;
 use serde::{Deserialize, Serialize};
 pub use smol::channel::{Receiver, Sender};
+use url::Url;
 
 /// Names a session on the connection. The front end picks it, so it can show the
 /// session before the agent has created it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct SessionKey(pub u64);
+
+/// What the user sends as one prompt: their text, and the files they put with it, which
+/// are read as the prompt goes out.
+#[derive(Clone, Debug, Default)]
+pub struct Prompt {
+    pub text: String,
+    pub attachments: Vec<Attachment>,
+}
+
+impl From<String> for Prompt {
+    fn from(text: String) -> Self {
+        Self {
+            text,
+            attachments: Vec::new(),
+        }
+    }
+}
+
+/// A file put with a prompt, by its path on this machine. An image goes to the agent as
+/// its pixels where it can (see `attachment_block`); anything else goes as a link to the
+/// file, which the agent opens with its own tools.
+#[derive(Clone, Debug)]
+pub enum Attachment {
+    /// An image file, with its type, such as `image/png`.
+    Image { path: PathBuf, mime: String },
+    /// Any other file, or a folder.
+    File { path: PathBuf },
+}
 
 /// What the front end asks the agent to do.
 pub enum Command {
@@ -57,7 +88,7 @@ pub enum Command {
     LoadSession(SessionKey, String, PathBuf),
     /// Runs after the session's earlier prompts. A session not created yet, or that the
     /// agent failed to create, is created first; if that fails, so does the prompt.
-    Prompt(SessionKey, String),
+    Prompt(SessionKey, Prompt),
     /// Stop the session's turn in flight; ignored when idle.
     Cancel(SessionKey),
     /// Asks the agent what fills the session's context window, with its `/context`
@@ -402,7 +433,7 @@ pub struct AgentHandle {
 /// A command for one session. Each session reads these from one queue in order,
 /// so a cancel never overtakes the prompt it is meant to stop.
 enum SessionCommand {
-    Prompt(String),
+    Prompt(Prompt),
     Cancel,
     /// A setting's id and its new value.
     ChangeSetting(String, SettingValue),
@@ -411,7 +442,7 @@ enum SessionCommand {
 
 /// One turn of a session: a prompt, or a `ReadContext`.
 enum Turn {
-    Prompt(String),
+    Prompt(Prompt),
     /// `/context`, whose answer goes to the front end as a `ContextReport` instead of
     /// the transcript.
     ReadContext,
@@ -420,7 +451,7 @@ enum Turn {
 /// What waits for a session's turn in flight to end.
 struct Waiting {
     /// Prompts, oldest first.
-    prompts: VecDeque<String>,
+    prompts: VecDeque<Prompt>,
     /// A `ReadContext`, which runs once no prompt waits.
     read_context: bool,
 }
@@ -428,7 +459,7 @@ struct Waiting {
 impl Waiting {
     fn next(&mut self) -> Option<Turn> {
         match self.prompts.pop_front() {
-            Some(text) => Some(Turn::Prompt(text)),
+            Some(prompt) => Some(Turn::Prompt(prompt)),
             None => std::mem::take(&mut self.read_context).then_some(Turn::ReadContext),
         }
     }
@@ -450,6 +481,8 @@ struct AgentInfo {
     loads: bool,
     /// The agent takes `session/delete`.
     deletes: bool,
+    /// The agent takes images in a prompt as pixels.
+    images: bool,
 }
 
 /// A session's task and the queue it reads its commands from.
@@ -639,6 +672,7 @@ async fn run(
                     .session_capabilities
                     .delete
                     .is_some(),
+                images: init.agent_capabilities.prompt_capabilities.image,
             };
             emit(events, Event::Connected { agent });
 
@@ -683,7 +717,7 @@ async fn run(
                                 }
                                 continue;
                             }
-                            Command::Prompt(key, text) => (key, SessionCommand::Prompt(text)),
+                            Command::Prompt(key, prompt) => (key, SessionCommand::Prompt(prompt)),
                             Command::Cancel(key) => (key, SessionCommand::Cancel),
                             Command::ReadContext(key) => (key, SessionCommand::ReadContext),
                             Command::ChangeSetting(key, setting, value) => {
@@ -795,10 +829,10 @@ async fn run_session(
     // session gets before the prompt that creates it.
     let mut changes_waiting = Vec::new();
     if let Open::New { now: false } = open {
-        let Some(text) = creating_prompt(&commands, &mut changes_waiting).await else {
+        let Some(prompt) = creating_prompt(&commands, &mut changes_waiting).await else {
             return;
         };
-        retry = Some(text);
+        retry = Some(prompt);
     }
     loop {
         let asked = Instant::now();
@@ -858,10 +892,10 @@ async fn run_session(
         };
         events.send(failed);
         // Returns at once if the session was closed while the agent was refusing it.
-        let Some(text) = creating_prompt(&commands, &mut changes_waiting).await else {
+        let Some(prompt) = creating_prompt(&commands, &mut changes_waiting).await else {
             return;
         };
-        retry = Some(text);
+        retry = Some(prompt);
     }
 }
 
@@ -870,7 +904,7 @@ async fn run_session(
 /// and `changes_waiting` the setting changes made while it didn't exist.
 async fn run_opened(
     session: &mut ActiveSession<'_, Agent>,
-    prompt: Option<String>,
+    prompt: Option<Prompt>,
     changes_waiting: &mut Vec<(String, SettingValue)>,
     commands: &Receiver<SessionCommand>,
     events: &SessionEvents,
@@ -904,15 +938,7 @@ async fn run_opened(
     for (setting, value) in std::mem::take(changes_waiting) {
         let _ = change_setting(session, setting, value, events, &mut changes);
     }
-    serve(
-        session,
-        waiting,
-        changes,
-        commands,
-        events,
-        &agent.login_options,
-    )
-    .await;
+    serve(session, waiting, changes, commands, events, agent).await;
     close(key, session, agent.closes);
 }
 
@@ -935,10 +961,10 @@ async fn replay(session: &mut ActiveSession<'_, Agent>, events: &SessionEvents) 
 async fn creating_prompt(
     commands: &Receiver<SessionCommand>,
     changes: &mut Vec<(String, SettingValue)>,
-) -> Option<String> {
+) -> Option<Prompt> {
     loop {
         match commands.recv().await {
-            Ok(SessionCommand::Prompt(text)) => return Some(text),
+            Ok(SessionCommand::Prompt(prompt)) => return Some(prompt),
             // No session, so nothing is running to stop, nor a context to read.
             Ok(SessionCommand::Cancel | SessionCommand::ReadContext) => {}
             Ok(SessionCommand::ChangeSetting(setting, value)) => changes.push((setting, value)),
@@ -957,7 +983,7 @@ async fn serve(
     mut changes: Changes,
     commands: &Receiver<SessionCommand>,
     events: &SessionEvents,
-    login_options: &[String],
+    agent: &AgentInfo,
 ) {
     // Off once the connection has gone, which the next prompt then reports.
     let mut reading = true;
@@ -965,7 +991,7 @@ async fn serve(
         let turn = match waiting.next() {
             Some(turn) => turn,
             None => match between_turns(session, commands, events, &mut reading).await {
-                Some(SessionCommand::Prompt(text)) => Turn::Prompt(text),
+                Some(SessionCommand::Prompt(prompt)) => Turn::Prompt(prompt),
                 Some(SessionCommand::ReadContext) => Turn::ReadContext,
                 // Nothing is running, so there is nothing to stop.
                 Some(SessionCommand::Cancel) => continue,
@@ -1006,20 +1032,23 @@ async fn serve(
             }
             Waited::Gone => return,
         }
-        let text = match turn {
-            Turn::Prompt(text) => text,
+        let prompt = match turn {
+            Turn::Prompt(prompt) => prompt,
             // A prompt sent meanwhile goes first.
             Turn::ReadContext if !waiting.prompts.is_empty() => {
                 waiting.read_context = true;
                 continue;
             }
-            Turn::ReadContext => format!("/{CONTEXT_COMMAND}"),
+            Turn::ReadContext => Prompt::from(format!("/{CONTEXT_COMMAND}")),
         };
+        // Read as it goes out, off this thread, which every session runs on.
+        let images = agent.images;
+        let content = smol::unblock(move || prompt_blocks(prompt, images)).await;
         let mut report = String::new();
         let into = reads_context.then_some(&mut report);
         let answer = run_turn(
             session,
-            text,
+            content,
             into,
             commands,
             &mut waiting,
@@ -1055,7 +1084,7 @@ async fn serve(
                 events.emit(SessionEvent::TurnEnded { stop_reason });
             }
             Err(err) => {
-                let message = describe_error(err, login_options);
+                let message = describe_error(err, &agent.login_options);
                 events.emit(SessionEvent::TurnFailed(message));
             }
         }
@@ -1166,6 +1195,67 @@ fn delete(
         });
 }
 
+/// The image types Claude takes as pixels, which Codex takes too.
+const INLINE_IMAGE_TYPES: [&str; 4] = ["image/png", "image/jpeg", "image/gif", "image/webp"];
+/// 3.75 MB is 5 MB as base64, the most Claude takes for one image on Bedrock, the
+/// strictest of the places it runs.
+const INLINE_IMAGE_MAX_BYTES: u64 = 3_750_000;
+
+/// The prompt as the agent takes it: the files put with it, then its text, as images
+/// read best before the text that asks about them. Reads the files, so it blocks.
+fn prompt_blocks(prompt: Prompt, images: bool) -> Vec<ContentBlock> {
+    let mut blocks: Vec<ContentBlock> = prompt
+        .attachments
+        .iter()
+        .map(|attachment| attachment_block(attachment, images))
+        .collect();
+    // A prompt of no text and no files still goes as its empty text.
+    if !prompt.text.is_empty() || blocks.is_empty() {
+        blocks.push(prompt.text.into());
+    }
+    blocks
+}
+
+/// A file put with a prompt. An image goes as its pixels when the agent takes images
+/// (`images`) and the image is of a type and size Claude takes; anything else, or an
+/// image that can't be read, goes as a link to the file, which the agent opens with its
+/// own tools. Both adapters pass a link on as `[@name](file:///...)` in the text.
+fn attachment_block(attachment: &Attachment, images: bool) -> ContentBlock {
+    let (path, mime) = match attachment {
+        Attachment::Image { path, mime } => (path, Some(mime)),
+        Attachment::File { path } => (path, None),
+    };
+    let uri = file_uri(path);
+    // None for a folder, and for a file gone since it was put with the prompt.
+    let size = std::fs::metadata(path)
+        .ok()
+        .filter(|meta| meta.is_file())
+        .map(|meta| meta.len());
+    let inline = images
+        && mime.is_some_and(|mime| INLINE_IMAGE_TYPES.contains(&mime.as_str()))
+        && size.is_some_and(|size| size <= INLINE_IMAGE_MAX_BYTES);
+    if let Some(mime) = mime.filter(|_| inline)
+        && let Ok(bytes) = std::fs::read(path)
+    {
+        let image = ImageContent::new(BASE64_STANDARD.encode(bytes), mime).uri(uri);
+        return ContentBlock::Image(image);
+    }
+    let name = path.file_name().map_or_else(
+        || path.display().to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    );
+    let link = ResourceLink::new(name, uri)
+        .mime_type(mime.cloned())
+        .size(size.and_then(|size| i64::try_from(size).ok()));
+    ContentBlock::ResourceLink(link)
+}
+
+/// `path` as a `file://` URL, with spaces and the like escaped. The front ends send
+/// only whole paths, so a relative one goes as it is.
+fn file_uri(path: &Path) -> String {
+    Url::from_file_path(path).map_or_else(|()| path.display().to_string(), String::from)
+}
+
 /// Asks the agent to stop the session's turn; the prompt is answered with `Cancelled`.
 fn cancel_turn(session: &ActiveSession<'_, Agent>) -> Result<(), Error> {
     let id = session.session_id().clone();
@@ -1180,7 +1270,7 @@ fn cancel_turn(session: &ActiveSession<'_, Agent>) -> Result<(), Error> {
 /// failure would end the whole connection along with every other session.
 async fn run_turn(
     session: &mut ActiveSession<'_, Agent>,
-    text: String,
+    content: Vec<ContentBlock>,
     mut report: Option<&mut String>,
     commands: &Receiver<SessionCommand>,
     waiting: &mut Waiting,
@@ -1198,10 +1288,7 @@ async fn run_turn(
     let (answer_tx, mut answer) = oneshot::channel();
     session
         .connection()
-        .prepare_request(PromptRequest::new(
-            session.session_id().clone(),
-            vec![text.into()],
-        ))
+        .prepare_request(PromptRequest::new(session.session_id().clone(), content))
         .on_receiving_result(async move |result| {
             let _ = answer_tx.send(result);
             Ok(())
@@ -1298,8 +1385,8 @@ async fn run_turn(
                     permission.answer(None)?;
                 }
             }
-            Next::Command(Some(SessionCommand::Prompt(text))) => {
-                waiting.prompts.push_back(text);
+            Next::Command(Some(SessionCommand::Prompt(prompt))) => {
+                waiting.prompts.push_back(prompt);
                 // A context read never holds up a prompt.
                 if reads_context && stopped.is_none() {
                     stopped = Some(Instant::now());
@@ -1434,7 +1521,9 @@ async fn wait_for_changes(
                 changes.last = None;
             }
             Next::Command(Some(SessionCommand::Cancel)) => return Waited::Stopped,
-            Next::Command(Some(SessionCommand::Prompt(text))) => waiting.prompts.push_back(text),
+            Next::Command(Some(SessionCommand::Prompt(prompt))) => {
+                waiting.prompts.push_back(prompt)
+            }
             Next::Command(Some(SessionCommand::ReadContext)) => waiting.read_context = true,
             Next::Command(Some(SessionCommand::ChangeSetting(setting, value))) => {
                 // Only a closed connection fails this, which ends the session anyway.
@@ -1974,4 +2063,119 @@ fn millis(since: Instant) -> u64 {
 fn emit(events: &Sender<Event>, event: Event) {
     // A closed channel means the front end quit; nothing left to tell.
     let _ = events.send_blocking(event);
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use super::*;
+
+    /// A folder of the test's own for the files it puts with a prompt.
+    fn folder(test: &str) -> PathBuf {
+        let folder = std::env::temp_dir().join(format!("acp-core-{}-{test}", std::process::id()));
+        let _ = fs::remove_dir_all(&folder);
+        fs::create_dir_all(&folder).unwrap();
+        folder
+    }
+
+    fn image(path: &Path, mime: &str) -> Attachment {
+        Attachment::Image {
+            path: path.to_path_buf(),
+            mime: mime.into(),
+        }
+    }
+
+    fn link(block: &ContentBlock) -> &ResourceLink {
+        match block {
+            ContentBlock::ResourceLink(link) => link,
+            _ => panic!("not a link"),
+        }
+    }
+
+    #[test]
+    fn sends_text_alone_as_one_block() {
+        let blocks = prompt_blocks("hello".to_string().into(), true);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(text_of(&blocks[0]), "hello");
+        let blocks = prompt_blocks(Prompt::default(), true);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(text_of(&blocks[0]), "");
+    }
+
+    #[test]
+    fn sends_a_small_image_as_its_pixels_before_the_text() {
+        let folder = folder("pixels");
+        let path = folder.join("shot one.png");
+        fs::write(&path, b"\x89PNG").unwrap();
+        let prompt = Prompt {
+            text: "what is this?".into(),
+            attachments: vec![image(&path, "image/png")],
+        };
+        let blocks = prompt_blocks(prompt, true);
+        assert_eq!(blocks.len(), 2);
+        let ContentBlock::Image(sent) = &blocks[0] else {
+            panic!("not an image");
+        };
+        assert_eq!(sent.data, "iVBORw==");
+        assert_eq!(sent.mime_type, "image/png");
+        let uri = sent.uri.as_deref().unwrap();
+        assert!(uri.starts_with("file:///") && uri.ends_with("/shot%20one.png"));
+        assert_eq!(text_of(&blocks[1]), "what is this?");
+        // Nothing but the image: no empty text after it.
+        let prompt = Prompt {
+            text: String::new(),
+            attachments: vec![image(&path, "image/png")],
+        };
+        assert_eq!(prompt_blocks(prompt, true).len(), 1);
+    }
+
+    #[test]
+    fn sends_an_image_as_a_link_where_pixels_wont_do() {
+        let folder = folder("image-links");
+        let small = folder.join("small.png");
+        fs::write(&small, b"\x89PNG").unwrap();
+        let heic = folder.join("photo.heic");
+        fs::write(&heic, b"heic").unwrap();
+        let large = folder.join("large.png");
+        fs::File::create(&large)
+            .unwrap()
+            .set_len(INLINE_IMAGE_MAX_BYTES + 1)
+            .unwrap();
+        let gone = folder.join("gone.png");
+        // An agent that takes no images.
+        let sent = attachment_block(&image(&small, "image/png"), false);
+        assert_eq!(link(&sent).name, "small.png");
+        assert_eq!(link(&sent).mime_type.as_deref(), Some("image/png"));
+        assert_eq!(link(&sent).size, Some(4));
+        // A type Claude doesn't take, and an image too large to send.
+        let sent = attachment_block(&image(&heic, "image/heic"), true);
+        assert_eq!(link(&sent).name, "photo.heic");
+        let sent = attachment_block(&image(&large, "image/png"), true);
+        assert_eq!(link(&sent).size, Some(INLINE_IMAGE_MAX_BYTES as i64 + 1));
+        // Gone since it was put with the prompt.
+        let sent = attachment_block(&image(&gone, "image/png"), true);
+        assert_eq!(link(&sent).size, None);
+        assert!(link(&sent).uri.ends_with("/gone.png"));
+    }
+
+    #[test]
+    fn sends_files_and_folders_as_links() {
+        let folder = folder("file-links");
+        let file = folder.join("notes.txt");
+        fs::write(&file, b"hello").unwrap();
+        let sent = attachment_block(&Attachment::File { path: file }, true);
+        assert_eq!(link(&sent).name, "notes.txt");
+        assert_eq!(link(&sent).mime_type, None);
+        assert_eq!(link(&sent).size, Some(5));
+        assert!(link(&sent).uri.starts_with("file:///"));
+        let sent = attachment_block(
+            &Attachment::File {
+                path: folder.clone(),
+            },
+            true,
+        );
+        assert_eq!(link(&sent).size, None);
+        assert!(link(&sent).name.ends_with("file-links"));
+    }
 }

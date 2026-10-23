@@ -1,11 +1,14 @@
 //! What is pasted into a note besides text: files copied in Finder, kept by their paths,
 //! and images copied as pictures, saved in the app's folder. They sit under the note's
 //! text as tiles, each with a × that takes it off while the note is in front, and stay
-//! with the note on its card.
+//! with the note on its card. A card let go on the prompt puts them on the prompt too,
+//! above its text and with their ×s, and they go with it to the agent and onto its row.
 
+use acp_core::Attachment;
 use gpui_kit::assets::IconName;
 use gpui_kit::base::{Transition, transition};
 use gpui_kit::component::{ActiveTheme as _, Icon};
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::chat_view::ChatView;
@@ -25,39 +28,50 @@ const NAME_TEXT_SIZE: Pixels = px(12.);
 const NAME_LINE_HEIGHT: Pixels = px(16.);
 const SIZE_TEXT_SIZE: Pixels = px(11.);
 const SIZE_LINE_HEIGHT: Pixels = px(14.);
-/// The tiles start 8px below the text of the note or the card.
-pub(super) const STRIP_GAP: Pixels = px(8.);
-/// The × that takes a tile off the note: 18px across, 6px out past the tile's top right
-/// corner.
+/// The tiles start 8px below the text of the note or the card, and end 8px above a
+/// prompt's text on its row.
+pub(crate) const STRIP_GAP: Pixels = px(8.);
+/// The × that takes a tile off the note or the prompt: 18px across, 6px out past the
+/// tile's top right corner.
 const REMOVE_SIZE: Pixels = px(18.);
 const REMOVE_OVERHANG: Pixels = px(6.);
 const REMOVE_ICON_SIZE: Pixels = px(10.);
 
-/// Which tile on the note the pointer is over, and which tile's ×: the × reaches out
-/// past its tile, so the pointer can be on it and off the tile.
+/// Where the tiles with a × are.
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum TilesOn {
+    /// The note in front of the board, which owns the images saved for it.
+    Note,
+    /// The prompt of the session on screen, which has them from the card let go there.
+    Prompt,
+}
+
+/// Which tile the pointer is over, and which tile's ×: the × reaches out past its tile,
+/// so the pointer can be on it and off the tile.
 #[derive(Default)]
 pub(super) struct TileHover {
-    tile: Option<usize>,
-    remove: Option<usize>,
+    tile: Option<(TilesOn, usize)>,
+    remove: Option<(TilesOn, usize)>,
 }
 
 impl TileHover {
-    fn shows_remove(&self, ix: usize) -> bool {
-        self.tile == Some(ix) || self.remove == Some(ix)
+    fn shows_remove(&self, at: (TilesOn, usize)) -> bool {
+        self.tile == Some(at) || self.remove == Some(at)
     }
 }
 
 /// How the tiles look.
-pub(super) struct TileLook {
+pub(crate) struct TileLook {
     background: Hsla,
-    ring: Hsla,
+    /// None on a prompt's row, where the bubble sets the tiles off.
+    ring: Option<Hsla>,
     muted: Hsla,
     remove_background: Hsla,
     remove_shadow: Vec<BoxShadow>,
 }
 
 impl TileLook {
-    pub(super) fn new(cx: &App) -> Self {
+    pub(crate) fn new(cx: &App) -> Self {
         let theme = cx.theme();
         let ink = |alpha| black().opacity(alpha);
         let (background, ring, remove_background, remove_shadow) = if theme.is_dark() {
@@ -81,15 +95,29 @@ impl TileLook {
         };
         Self {
             background,
-            ring,
+            ring: Some(ring),
             muted: theme.muted_foreground,
             remove_background,
             remove_shadow,
         }
     }
 
+    /// On a sent prompt's bubble: a shade off the bubble, with no ring.
+    pub(crate) fn on_bubble(cx: &App) -> Self {
+        let background = if cx.theme().is_dark() {
+            rgb(0x333333)
+        } else {
+            rgb(0xf5f5f5)
+        };
+        Self {
+            background: background.into(),
+            ring: None,
+            ..Self::new(cx)
+        }
+    }
+
     /// The tiles of `attachments`, in rows that wrap.
-    pub(super) fn strip(&self, attachments: &[StuffAttachment]) -> Div {
+    pub(crate) fn strip(&self, attachments: &[StuffAttachment]) -> Div {
         div()
             .flex()
             .flex_wrap()
@@ -104,9 +132,11 @@ impl TileLook {
             .h(TILE_SIZE)
             .rounded(TILE_RADIUS)
             .bg(self.background)
-            .shadow(vec![
-                BoxShadow::new(px(0.), px(0.), self.ring).spread_radius(px(1.)),
-            ]);
+            .when_some(self.ring, |tile, ring| {
+                tile.shadow(vec![
+                    BoxShadow::new(px(0.), px(0.), ring).spread_radius(px(1.)),
+                ])
+            });
         let muted = self.muted;
         match attachment {
             StuffAttachment::Image { path, .. } => tile.w(TILE_SIZE).child(
@@ -201,86 +231,115 @@ impl ChatView {
         true
     }
 
-    /// Takes the tile at `ix` off the note, and with it the image the app saved for it.
-    fn remove_pending(&mut self, ix: usize, cx: &mut Context<Self>) {
-        if ix < self.stuff.pending.len() {
-            forget_attachment(&self.stuff.pending.remove(ix));
+    /// Takes the tile at `ix` off the note, and with it the image the app saved for it,
+    /// or off the prompt, where the image stays with the card it came from.
+    fn remove_tile(&mut self, on: TilesOn, ix: usize, cx: &mut Context<Self>) {
+        let tiles = match on {
+            TilesOn::Note => &mut self.stuff.pending,
+            TilesOn::Prompt => &mut self.sessions[self.active].attachments,
+        };
+        if ix < tiles.len() {
+            let removed = tiles.remove(ix);
+            if on == TilesOn::Note {
+                forget_attachment(&removed);
+            }
             self.stuff.tile_hover = TileHover::default();
             cx.notify();
         }
     }
 
-    /// The tiles pasted into the note, each with a × that fades in over the fast
+    /// The tiles on the note or the prompt, each with a × that fades in over the fast
     /// duration while the pointer is over the tile or the × itself.
-    pub(super) fn note_attachments(&self, window: &mut Window, cx: &mut Context<Self>) -> Div {
+    pub(crate) fn removable_tiles(
+        &self,
+        on: TilesOn,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let (attachments, tile_id, remove_id) = match on {
+            TilesOn::Note => (&self.stuff.pending, "stuff-tile", "stuff-remove"),
+            TilesOn::Prompt => (
+                &self.sessions[self.active].attachments,
+                "prompt-tile",
+                "prompt-remove",
+            ),
+        };
         let look = TileLook::new(cx);
         let motion = cx.theme().motion_tokens();
         let shown = Transition::new(motion.duration_fast).easing(motion.easing_enter.clone());
-        let tiles = self
-            .stuff
-            .pending
-            .iter()
-            .enumerate()
-            .map(|(ix, attachment)| {
-                let target = if self.stuff.tile_hover.shows_remove(ix) {
-                    1.
-                } else {
-                    0.
-                };
-                let shown = transition(
-                    ElementId::from(("stuff-remove", ix)),
-                    target,
-                    shown.clone(),
-                    window,
-                    cx,
+        let tiles = attachments.iter().enumerate().map(|(ix, attachment)| {
+            let target = if self.stuff.tile_hover.shows_remove((on, ix)) {
+                1.
+            } else {
+                0.
+            };
+            let shown = transition(
+                ElementId::from((remove_id, ix)),
+                target,
+                shown.clone(),
+                window,
+                cx,
+            );
+            let remove = div()
+                .id((remove_id, ix))
+                .role(Role::Button)
+                .aria_label(format!("Remove {}", attachment.name()))
+                .absolute()
+                .top(-REMOVE_OVERHANG)
+                .right(-REMOVE_OVERHANG)
+                .size(REMOVE_SIZE)
+                .rounded(REMOVE_SIZE / 2.)
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(look.remove_background)
+                .shadow(look.remove_shadow.clone())
+                .opacity(shown)
+                .cursor_pointer()
+                .child(Icon::new(IconName::Close).size(REMOVE_ICON_SIZE))
+                .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                    let hover = &mut this.stuff.tile_hover;
+                    if *hovered {
+                        hover.remove = Some((on, ix));
+                    } else if hover.remove == Some((on, ix)) {
+                        hover.remove = None;
+                    }
+                    cx.notify();
+                }))
+                .on_click(
+                    cx.listener(move |this, _: &ClickEvent, _, cx| this.remove_tile(on, ix, cx)),
                 );
-                let remove = div()
-                    .id(("stuff-remove", ix))
-                    .role(Role::Button)
-                    .aria_label(format!("Remove {}", attachment.name()))
-                    .absolute()
-                    .top(-REMOVE_OVERHANG)
-                    .right(-REMOVE_OVERHANG)
-                    .size(REMOVE_SIZE)
-                    .rounded(REMOVE_SIZE / 2.)
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .bg(look.remove_background)
-                    .shadow(look.remove_shadow.clone())
-                    .opacity(shown)
-                    .cursor_pointer()
-                    .child(Icon::new(IconName::Close).size(REMOVE_ICON_SIZE))
-                    .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
-                        let hover = &mut this.stuff.tile_hover;
-                        if *hovered {
-                            hover.remove = Some(ix);
-                        } else if hover.remove == Some(ix) {
-                            hover.remove = None;
-                        }
-                        cx.notify();
-                    }))
-                    .on_click(
-                        cx.listener(move |this, _: &ClickEvent, _, cx| this.remove_pending(ix, cx)),
-                    );
-                div()
-                    .id(("stuff-tile", ix))
-                    .relative()
-                    .max_w_full()
-                    .min_w_0()
-                    .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
-                        let hover = &mut this.stuff.tile_hover;
-                        if *hovered {
-                            hover.tile = Some(ix);
-                        } else if hover.tile == Some(ix) {
-                            hover.tile = None;
-                        }
-                        cx.notify();
-                    }))
-                    .child(look.tile(attachment))
-                    .child(remove)
-            });
+            div()
+                .id((tile_id, ix))
+                .relative()
+                .max_w_full()
+                .min_w_0()
+                .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                    let hover = &mut this.stuff.tile_hover;
+                    if *hovered {
+                        hover.tile = Some((on, ix));
+                    } else if hover.tile == Some((on, ix)) {
+                        hover.tile = None;
+                    }
+                    cx.notify();
+                }))
+                .child(look.tile(attachment))
+                .child(remove)
+        });
         div().flex().flex_wrap().gap(TILE_GAP).children(tiles)
+    }
+}
+
+/// What goes to the agent: images and Finder's files and folders, by their paths.
+impl From<&StuffAttachment> for Attachment {
+    fn from(attachment: &StuffAttachment) -> Self {
+        match attachment {
+            StuffAttachment::Image { path, mime } => Attachment::Image {
+                path: path.clone(),
+                mime: mime.clone(),
+            },
+            StuffAttachment::File { path, .. } => Attachment::File { path: path.clone() },
+        }
     }
 }
 
