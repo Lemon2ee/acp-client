@@ -2,6 +2,7 @@
 //! how the sidebar, the chat and the settings are laid out. The parts it draws live in the
 //! modules below it, which can read its private fields.
 
+mod folder_line;
 mod info_panel;
 mod pickers;
 pub(crate) mod scroller;
@@ -12,7 +13,7 @@ mod tool_call;
 mod transcript;
 mod usage_line;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use acp_core::{
@@ -31,6 +32,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::OpenSettings;
+use crate::chat_view::folder_line::{GIT_SETTLE, UNDER_BOX_BOTTOM_PAD, may_change_files};
 use crate::chat_view::info_panel::{InfoPanelState, ResizeInfoPanel};
 use crate::chat_view::pickers::MenuNav;
 use crate::chat_view::pickers::effort::EffortMeter;
@@ -38,7 +40,7 @@ use crate::chat_view::pickers::model_panel::ModelPanelState;
 use crate::chat_view::settings_page::SettingsPageState;
 use crate::chat_view::sidebar::{ResizeSidebar, SidebarState};
 use crate::chat_view::stuff::{StuffState, TilesOn};
-use crate::chat_view::usage_line::{USAGE_LINE_BOTTOM_PAD, UsageLineState};
+use crate::chat_view::usage_line::UsageLineState;
 use crate::chrome::{
     BLURRED_CHAT_ALPHA, BLURRED_SIDEBAR_ALPHA, OWN_TITLE_BAR, WINDOW_BLUR, apply_appearance,
     as_title_bar, window_background,
@@ -100,7 +102,7 @@ pub(crate) struct ChatView {
     /// Never empty. New sessions go on the agent of the session on screen, until the
     /// user picks another agent's model.
     agents: Vec<AgentSlot>,
-    /// The folder the agents create new sessions in.
+    /// The folder new sessions start in, until the user picks another for one.
     cwd: PathBuf,
     /// The window's top row, across the sidebar and the chat. It holds the traffic lights
     /// on macOS, the sidebar button, and the name of the session on screen.
@@ -176,9 +178,14 @@ impl ChatView {
             this.apply_settings(window, cx)
         });
         // The recorder lets go of the shortcut while it records, so it stops when the
-        // window goes to the back rather than leave the shortcut let go of.
+        // window goes to the back rather than leave the shortcut let go of. Back in front,
+        // the folder may have changed: the user may have committed or switched branches
+        // elsewhere.
         let activation_events = cx.observe_window_activation(window, |this, window, cx| {
-            if !window.is_window_active() {
+            if window.is_window_active() {
+                let key = this.sessions[this.active].key;
+                this.read_git(key, Duration::ZERO, cx);
+            } else {
                 this.stop_recording(cx);
             }
         });
@@ -334,11 +341,10 @@ impl ChatView {
             };
             let key = SessionKey(self.next_key);
             self.next_key += 1;
-            let mut session = Session::new(key, agent, cx);
+            let mut session = Session::new(key, agent, Origin::Saved(saved.cwd), cx);
             session.title = Some(saved.title);
             session.title_source = saved.title_source;
             session.id = Some(saved.id);
-            session.origin = Origin::Saved(saved.cwd);
             session.archived = saved.archived;
             if let Some(kept) = &saved.context {
                 session.context.restore(kept);
@@ -379,14 +385,14 @@ impl ChatView {
         let Some(agent) = kept_name(&self.agents[session.agent].name) else {
             return;
         };
-        if !matches!(session.origin, Origin::New) {
+        let Origin::New(folder) = &session.origin else {
             return;
-        }
+        };
         let saved = SavedSession {
             agent: agent.to_string(),
             id: id.clone(),
             title: title.clone(),
-            cwd: self.cwd.clone(),
+            cwd: folder.clone(),
             archived: session.archived,
             title_source: session.title_source,
             context: session.context.kept(),
@@ -432,13 +438,13 @@ impl ChatView {
         cx.notify();
     }
 
-    /// A session on the agent that the agent hasn't created yet: acp-core has it created
-    /// by its first prompt. With the agent gone, the session says so and stays closed
-    /// to prompts.
-    fn create_session(&mut self, agent: usize, cx: &mut App) -> Session {
+    /// A session on the agent that the agent hasn't created yet, to work in `folder`:
+    /// acp-core has it created by its first prompt. With the agent gone, the session says
+    /// so and stays closed to prompts.
+    fn create_session(&mut self, agent: usize, folder: PathBuf, cx: &mut App) -> Session {
         let key = SessionKey(self.next_key);
         self.next_key += 1;
-        let mut session = Session::new(key, agent, cx);
+        let mut session = Session::new(key, agent, Origin::New(folder), cx);
         let slot = &self.agents[agent];
         if slot.commands.is_closed() {
             session.busy = true;
@@ -470,7 +476,7 @@ impl ChatView {
             {
                 continue;
             }
-            let mut spare = self.create_session(agent, cx);
+            let mut spare = self.create_session(agent, self.cwd.clone(), cx);
             // Created now rather than by a prompt, so its models are there to list.
             spare.busy = true;
             let slot = &mut self.agents[agent];
@@ -479,13 +485,19 @@ impl ChatView {
         }
     }
 
-    /// A session on the agent, to show: its spare, created with its settings, or one the
-    /// agent will create on its first prompt.
-    fn take_session(&mut self, agent: usize, cx: &mut App) -> Session {
-        match self.agents[agent].spare.take() {
-            Some(spare) => spare,
-            None => self.create_session(agent, cx),
+    /// A session on the agent to work in `folder`, to show: its spare, created with its
+    /// settings, when it is in that folder, or one the agent will create on its first
+    /// prompt.
+    fn take_session(&mut self, agent: usize, folder: &Path, cx: &mut App) -> Session {
+        let slot = &mut self.agents[agent];
+        if slot
+            .spare
+            .as_ref()
+            .is_some_and(|spare| spare.folder() == folder)
+        {
+            return slot.spare.take().expect("the spare is there");
         }
+        self.create_session(agent, folder.to_path_buf(), cx)
     }
 
     /// The session whose settings say what the agent's models are: its spare, or the
@@ -515,7 +527,12 @@ impl ChatView {
         if let Some(ix) = found.filter(|&ix| self.sessions[ix].agent == agent) {
             return ix;
         }
-        let mut session = self.take_session(agent, cx);
+        // A folder picked for the one giving way goes with the one taking its place.
+        let folder = match found {
+            Some(ix) => self.sessions[ix].folder().to_path_buf(),
+            None => self.cwd.clone(),
+        };
+        let mut session = self.take_session(agent, &folder, cx);
         match found {
             Some(ix) => {
                 // ACP can't move a session to another agent, so it goes. Text typed in
@@ -548,6 +565,69 @@ impl ChatView {
         // now, and an agent whose spare failed gets another go.
         self.make_spares(cx);
         self.show(ix, window, cx);
+    }
+
+    /// Has the session `key`, which has no prompt yet, work in `folder`. One the agent has
+    /// created, or is creating as a spare, gives way to one the agent will create there,
+    /// as ACP can't move a session: the text typed in it and the settings changed in it
+    /// go with it.
+    fn set_folder(
+        &mut self,
+        key: SessionKey,
+        folder: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(ix) = self.sessions.iter().position(|session| session.key == key) else {
+            return;
+        };
+        let session = &self.sessions[ix];
+        let Origin::New(old) = &session.origin else {
+            return;
+        };
+        let agent = session.agent;
+        if session.title.is_some() || *old == folder || self.agents[agent].commands.is_closed() {
+            return;
+        }
+        if !session.created && !session.busy {
+            // The first prompt tells acp-core the folder (see `send`).
+            let session = &mut self.sessions[ix];
+            session.origin = Origin::New(folder);
+            session.git = None;
+            self.read_git(key, Duration::ZERO, cx);
+            cx.notify();
+            return;
+        }
+        // A level picked just before goes to the session it was picked in first, so it
+        // counts among the changes made there.
+        self.send_held(key, cx);
+        let session = &self.sessions[ix];
+        let first = &self.agents[agent].last_settings;
+        let changed: Vec<_> = self
+            .shown_settings(session)
+            .into_iter()
+            .filter(|shown| {
+                !first
+                    .iter()
+                    .any(|setting| setting.id == shown.id && setting.value == shown.value)
+            })
+            .collect();
+        let mut fresh = self.create_session(agent, folder, cx);
+        let fresh_key = fresh.key;
+        fresh.draft = std::mem::take(&mut self.sessions[ix].draft);
+        let old = std::mem::replace(&mut self.sessions[ix], fresh);
+        let _ = self.agents[agent]
+            .commands
+            .try_send(Command::CloseSession(old.key));
+        for setting in changed {
+            self.change_setting(fresh_key, setting.id, setting.value, cx);
+        }
+        if ix == self.active {
+            self.show(ix, window, cx);
+        } else {
+            self.read_git(fresh_key, Duration::ZERO, cx);
+        }
+        cx.notify();
     }
 
     /// Picks a model of another agent's from the model menu of the session `from`, for
@@ -604,6 +684,8 @@ impl ChatView {
         self.recheck_pull_requests(cx);
         // A file may have been moved or deleted since.
         self.sessions[ix].files.look_again();
+        let key = self.sessions[ix].key;
+        self.read_git(key, Duration::ZERO, cx);
         cx.notify();
     }
 
@@ -714,21 +796,20 @@ impl ChatView {
     fn put_away(&mut self, ix: usize, cx: &mut App) {
         let session = &self.sessions[ix];
         let folder = match &session.origin {
-            Origin::New => self.cwd.clone(),
+            Origin::New(folder) | Origin::Loaded(folder) => folder.clone(),
             Origin::Saved(_) => return,
-            Origin::Loaded(folder) => folder.clone(),
         };
         let kept = kept_name(&self.agents[session.agent].name).is_some();
         if session.busy || session.id.is_none() || !kept {
             return;
         }
         // Under a new key, so nothing the agent still sends for the old one lands on it.
-        let mut fresh = Session::new(SessionKey(self.next_key), session.agent, cx);
+        let key = SessionKey(self.next_key);
+        let mut fresh = Session::new(key, session.agent, Origin::Saved(folder), cx);
         self.next_key += 1;
         fresh.title = session.title.clone();
         fresh.title_source = session.title_source;
         fresh.id = session.id.clone();
-        fresh.origin = Origin::Saved(folder);
         fresh.archived = session.archived;
         if let Some(kept) = session.context.kept() {
             fresh.context.restore(&kept);
@@ -873,9 +954,12 @@ impl ChatView {
         // Live from after the prompt's own row, which shows at once as it was typed here.
         session.set_live(true, cx);
         let key = session.key;
-        // Has the agent create the session first, if it hasn't yet.
-        let prompt = Command::Prompt(key, prompt);
-        let _ = self.agents[session.agent].commands.try_send(prompt);
+        let commands = &self.agents[session.agent].commands;
+        // Has the agent create the session first, if it hasn't yet, in its folder.
+        if !session.created {
+            let _ = commands.try_send(Command::SetFolder(key, session.folder().to_path_buf()));
+        }
+        let _ = commands.try_send(Command::Prompt(key, prompt));
         self.watch_files(key, cx);
         // Runs once the turn is over, while the panel shows the window.
         self.read_context_if_shown();
@@ -1013,7 +1097,7 @@ impl ChatView {
     fn remember_settings(&mut self, agent: usize, key: SessionKey, settings: &[Setting]) {
         let first = self
             .session_mut(key)
-            .is_some_and(|session| !session.created && matches!(session.origin, Origin::New));
+            .is_some_and(|session| !session.created && matches!(session.origin, Origin::New(_)));
         let slot = &mut self.agents[agent];
         if !first || slot.last_settings == settings {
             return;
@@ -1077,6 +1161,7 @@ impl ChatView {
                     event,
                     SessionEvent::TurnEnded { .. } | SessionEvent::TurnFailed(_)
                 );
+                let changed_files = may_change_files(&event);
                 let mut retitled = false;
                 if let Some(session) = self.session_mut(key) {
                     let title = session.title.clone();
@@ -1099,6 +1184,10 @@ impl ChatView {
                 self.read_context_if_shown();
                 self.note_pull_requests(cx);
                 self.note_files(cx);
+                // One not on screen is read again as it shows.
+                if changed_files && self.sessions[self.active].key == key {
+                    self.read_git(key, GIT_SETTLE, cx);
+                }
             }
             AgentEvent::RateLimits(windows) => self.set_rate_limits(agent, windows, cx),
             // Connection-wide failures show in the session on screen when it is the
@@ -1294,6 +1383,7 @@ impl Render for ChatView {
                 .find(|setting| setting.kind == SettingKind::Mode)
                 .map(|setting| self.render_mode_picker(session.key, setting, cx)),
         ];
+        let folder_line = self.render_folder_line(session, cx);
         let usage_line = self.render_usage_line(session, &shown, cx);
         // What Stuff cards let go on the prompt brought besides their text, above the text.
         let tiles = (!session.attachments.is_empty()).then(|| {
@@ -1337,11 +1427,11 @@ impl Render for ChatView {
         let name_left = (toggle_left + SIDEBAR_BUTTON_SIZE + px(6.) - sidebar_width).max(px(16.));
 
         // A row along the input box's bottom: the session's model and mode on the left,
-        // the send/stop button on the right. Below the box, the plan usage of the
-        // session's agent, where it says.
+        // the send/stop button on the right. Below the box, the session's folder and what
+        // git says of it, then the plan usage of the session's agent, where it says.
         let composer = self
             .prompt_drop_zone(div().p_3(), window, cx)
-            .when(usage_line.is_some(), |this| this.pb(USAGE_LINE_BOTTOM_PAD))
+            .pb(UNDER_BOX_BOTTOM_PAD)
             .opacity(chat_shown)
             .child(
                 InputGroup::new("prompt")
@@ -1379,6 +1469,7 @@ impl Render for ChatView {
                             .child(action.primary().small().rounded_full().cursor_pointer()),
                     ),
             )
+            .child(folder_line)
             .children(usage_line);
         let panel = self.render_info_panel(panel_hidden, cx).opacity(chat_shown);
 

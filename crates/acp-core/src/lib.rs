@@ -100,6 +100,10 @@ pub enum Command {
     /// `SettingChanged`, or `SettingFailed`; a prompt sent after it waits for the answer.
     /// A session not created yet gets the change once its first prompt creates it.
     ChangeSetting(SessionKey, String, SettingValue),
+    /// Has the session created in this folder rather than the one the connection was
+    /// started in. Only a session waiting for its first prompt to create it moves; one
+    /// the agent has created, or is creating after `NewSession`, stays where it is.
+    SetFolder(SessionKey, PathBuf),
     /// Drops the session: commands still queued for it never run, a turn in flight is
     /// stopped and its open permission requests answered as cancelled, and the agent is
     /// asked to close it where the agent can, once it exists if the agent is still
@@ -438,6 +442,8 @@ enum SessionCommand {
     /// A setting's id and its new value.
     ChangeSetting(String, SettingValue),
     ReadContext,
+    /// The folder to create the session in, if it isn't created yet.
+    SetFolder(PathBuf),
 }
 
 /// One turn of a session: a prompt, or a `ReadContext`.
@@ -723,6 +729,9 @@ async fn run(
                             Command::ChangeSetting(key, setting, value) => {
                                 (key, SessionCommand::ChangeSetting(setting, value))
                             }
+                            Command::SetFolder(key, folder) => {
+                                (key, SessionCommand::SetFolder(folder))
+                            }
                             Command::CloseSession(key) => {
                                 if let Some(session) = sessions.remove(&key) {
                                     session.close().detach();
@@ -816,7 +825,7 @@ impl Open {
 /// made again, the same way, by its next prompt.
 async fn run_session(
     cx: ConnectionTo<Agent>,
-    cwd: PathBuf,
+    mut cwd: PathBuf,
     commands: Receiver<SessionCommand>,
     events: SessionEvents,
     agent: &AgentInfo,
@@ -829,7 +838,7 @@ async fn run_session(
     // session gets before the prompt that creates it.
     let mut changes_waiting = Vec::new();
     if let Open::New { now: false } = open {
-        let Some(prompt) = creating_prompt(&commands, &mut changes_waiting).await else {
+        let Some(prompt) = creating_prompt(&commands, &mut changes_waiting, &mut cwd).await else {
             return;
         };
         retry = Some(prompt);
@@ -892,7 +901,7 @@ async fn run_session(
         };
         events.send(failed);
         // Returns at once if the session was closed while the agent was refusing it.
-        let Some(prompt) = creating_prompt(&commands, &mut changes_waiting).await else {
+        let Some(prompt) = creating_prompt(&commands, &mut changes_waiting, &mut cwd).await else {
             return;
         };
         retry = Some(prompt);
@@ -957,10 +966,12 @@ async fn replay(session: &mut ActiveSession<'_, Agent>, events: &SessionEvents) 
 }
 
 /// Waits, while there is no session, for the prompt that is to create it, keeping the
-/// setting changes made meanwhile in `changes`. `None` once the front end has gone.
+/// setting changes made meanwhile in `changes` and the last folder asked for in `folder`.
+/// `None` once the front end has gone.
 async fn creating_prompt(
     commands: &Receiver<SessionCommand>,
     changes: &mut Vec<(String, SettingValue)>,
+    folder: &mut PathBuf,
 ) -> Option<Prompt> {
     loop {
         match commands.recv().await {
@@ -968,6 +979,7 @@ async fn creating_prompt(
             // No session, so nothing is running to stop, nor a context to read.
             Ok(SessionCommand::Cancel | SessionCommand::ReadContext) => {}
             Ok(SessionCommand::ChangeSetting(setting, value)) => changes.push((setting, value)),
+            Ok(SessionCommand::SetFolder(asked)) => *folder = asked,
             Err(_) => return None,
         }
     }
@@ -1000,6 +1012,8 @@ async fn serve(
                     let _ = change_setting(session, setting, value, events, &mut changes);
                     continue;
                 }
+                // ACP can't move a session the agent has created.
+                Some(SessionCommand::SetFolder(_)) => continue,
                 None => return,
             },
         };
@@ -1400,6 +1414,8 @@ async fn run_turn(
             Next::Command(Some(SessionCommand::ReadContext)) => {
                 waiting.read_context |= !reads_context;
             }
+            // ACP can't move a session the agent has created.
+            Next::Command(Some(SessionCommand::SetFolder(_))) => {}
             // Closed; the check at the top of the loop stops the turn.
             Next::Command(None) => {}
         }
@@ -1529,6 +1545,8 @@ async fn wait_for_changes(
                 // Only a closed connection fails this, which ends the session anyway.
                 let _ = change_setting(session, setting, value, events, changes);
             }
+            // ACP can't move a session the agent has created.
+            Next::Command(Some(SessionCommand::SetFolder(_))) => {}
             Next::Command(None) => return Waited::Gone,
         }
     }

@@ -88,7 +88,8 @@ const ROW_GROUP: &str = "tool-call-row";
 /// The box's hover group, which shows its copy button.
 const BOX_GROUP: &str = "tool-call-box";
 
-/// The colors of the tool calls' rows and boxes, quieter than the agent's text.
+/// The colors of the tool calls' rows and boxes, quieter than the agent's text. The
+/// folder line's counts of lines a branch added and removed take theirs from here too.
 #[derive(Clone, Copy)]
 pub(super) struct ToolLook {
     /// The title and the icon.
@@ -101,9 +102,9 @@ pub(super) struct ToolLook {
     /// The chevron and the notes at the row's end.
     faint: Hsla,
     failed: Hsla,
-    added: Hsla,
+    pub(super) added: Hsla,
     added_bg: Hsla,
-    removed: Hsla,
+    pub(super) removed: Hsla,
     removed_bg: Hsla,
     /// The box's fill, its edge and its text.
     code: Hsla,
@@ -270,7 +271,7 @@ impl ChatView {
             return div();
         };
         let id = row_id("tool", key, ix);
-        let folder = session.folder().unwrap_or(&self.cwd).to_path_buf();
+        let folder = session.folder().to_path_buf();
         // Claude's adapter keeps a call pending until it finishes, sending in_progress only
         // with progress beats on long ones, so any unfinished call in a live turn runs,
         // unless it waits for the user's permission or didn't get it.

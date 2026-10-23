@@ -31,11 +31,10 @@ const EMPTY_INDENT: Pixels = px(24.);
 impl ChatView {
     /// Watches the session's folder for the files its turn makes, from its prompt on.
     pub(crate) fn watch_files(&mut self, key: SessionKey, cx: &mut Context<Self>) {
-        let cwd = self.cwd.clone();
         let Some(session) = self.session_mut(key) else {
             return;
         };
-        let folder = session.folder().map_or(cwd, Path::to_path_buf);
+        let folder = session.folder().to_path_buf();
         let files = &mut session.files;
         files.turn_started();
         // The last turn's, still taking its last changes.
@@ -155,7 +154,7 @@ impl ChatView {
                     .child("None yet"),
             );
         }
-        let folder = session.folder().unwrap_or(&self.cwd);
+        let folder = session.folder();
         section.children(
             list.iter()
                 .enumerate()

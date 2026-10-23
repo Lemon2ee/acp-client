@@ -6,6 +6,7 @@ mod chat_view;
 mod chrome;
 mod config;
 mod debug;
+mod git;
 mod hotkey;
 #[cfg(target_os = "macos")]
 mod launch;
@@ -61,7 +62,11 @@ gpui_kit::assets::icon_assets!(
         FileSpreadsheet,
         MessagesSquare,
         StickyNote,
-        Pin
+        Pin,
+        Folders,
+        GitBranch,
+        GitCommitHorizontal,
+        GitCompare
     ]
 );
 

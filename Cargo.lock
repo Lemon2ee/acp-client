@@ -108,6 +108,7 @@ name = "acp-gui"
 version = "0.1.0"
 dependencies = [
  "acp-core",
+ "block2 0.6.2",
  "chrono",
  "dirs 6.0.0",
  "gpui-kit",

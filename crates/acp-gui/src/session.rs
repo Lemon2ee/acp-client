@@ -24,6 +24,7 @@ use gpui_kit::*;
 use crate::chat_view::scroller::TranscriptScroll;
 use crate::config::{StuffAttachment, TitleSource};
 use crate::debug::switches;
+use crate::git::Repo;
 pub(crate) use context::{
     Category, CategoryKind, ContextReport, KeptContext, SessionContext, now, short_tokens,
 };
@@ -100,6 +101,11 @@ pub(crate) struct Session {
     pub(crate) pull_requests: SessionPullRequests,
     /// The PDFs, spreadsheets and tables its turns made, for the info panel.
     pub(crate) files: SessionFiles,
+    /// What git last said of its folder: None until it has said, and for a folder outside
+    /// a repository.
+    pub(crate) git: Option<Repo>,
+    /// Asks git again; a newer read drops it.
+    pub(crate) git_read: Option<Task<()>>,
     /// A turn prompted here is running, so the agent's text arrives as it is written: it
     /// fades in and new rows come in with motion. A loaded session's replay shows at once.
     live: bool,
@@ -122,8 +128,9 @@ pub(crate) struct Session {
 
 /// Which run a session's agent session comes from.
 pub(crate) enum Origin {
-    /// This one: the agent creates it on its first prompt, or as a spare.
-    New,
+    /// This one: the agent creates it in this folder on its first prompt, or as a spare.
+    /// The folder can change until then.
+    New(PathBuf),
     /// An earlier one, and the agent hasn't been asked to load it yet: the folder it
     /// was created in, which loading it needs. It loads as it first shows.
     Saved(PathBuf),
@@ -150,7 +157,7 @@ pub(crate) struct Asked {
 }
 
 impl Session {
-    pub(crate) fn new(key: SessionKey, agent: usize, cx: &mut App) -> Self {
+    pub(crate) fn new(key: SessionKey, agent: usize, origin: Origin, cx: &mut App) -> Self {
         Self {
             key,
             agent,
@@ -166,11 +173,13 @@ impl Session {
             asked: HashMap::new(),
             held: None,
             id: None,
-            origin: Origin::New,
+            origin,
             archived: false,
             context: SessionContext::default(),
             pull_requests: SessionPullRequests::default(),
             files: SessionFiles::default(),
+            git: None,
+            git_read: None,
             live: false,
             entering: HashMap::new(),
             changed: Instant::now(),
@@ -607,12 +616,10 @@ impl Session {
         }
     }
 
-    /// The folder the agent works in for it, where it comes from an earlier run; a new
-    /// one works in the window's.
-    pub(crate) fn folder(&self) -> Option<&Path> {
+    /// The folder the agent works in for it.
+    pub(crate) fn folder(&self) -> &Path {
         match &self.origin {
-            Origin::Saved(folder) | Origin::Loaded(folder) => Some(folder),
-            Origin::New => None,
+            Origin::New(folder) | Origin::Saved(folder) | Origin::Loaded(folder) => folder,
         }
     }
 
