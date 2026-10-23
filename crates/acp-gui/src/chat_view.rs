@@ -46,8 +46,9 @@ use crate::chrome::{
     as_title_bar, window_background,
 };
 use crate::config::{
-    AppSettings, SavedSession, StuffAttachment, change_saved_sessions, config_folder, kept_name,
-    load_last_settings, load_saved_sessions, save_last_settings,
+    AppSettings, SavedSession, StuffAttachment, append_transcript, change_saved_sessions,
+    config_folder, forget_transcript, kept_name, load_last_settings, load_report,
+    load_saved_sessions, load_transcript, save_last_settings, save_report, write_transcript,
 };
 use crate::hotkey::{self, GlobalShortcut};
 use crate::session::{Held, Origin, Row, Session, SessionFiles, SessionPullRequests};
@@ -356,19 +357,31 @@ impl ChatView {
     }
 
     /// Has the agent load a session kept from an earlier run, as it first shows. Its
-    /// transcript comes in as the agent replays it, and it takes prompts once loaded.
+    /// transcript and what last filled its context window show at once, as kept on disk,
+    /// while the agent loads it: that takes Claude's adapter seconds, as it starts a Claude
+    /// Code process. What the agent replays then takes the kept rows' place, and the
+    /// session takes prompts once loaded.
     fn load(&mut self, ix: usize, cx: &mut App) {
         let session = &mut self.sessions[ix];
         let (Origin::Saved(cwd), Some(id)) = (&session.origin, &session.id) else {
             return;
         };
-        let load = Command::LoadSession(session.key, id.clone(), cwd.clone());
-        session.origin = Origin::Loaded(cwd.clone());
-        session.busy = true;
+        let (cwd, id) = (cwd.clone(), id.clone());
         let slot = &self.agents[session.agent];
+        if let Some(agent) = kept_name(&slot.name) {
+            session.stand_in(load_transcript(agent, &id), cx);
+            if let Some(report) = load_report(agent, &id) {
+                session.context.restore_report(report);
+            }
+        }
+        let load = Command::LoadSession(session.key, id, cwd.clone());
+        session.origin = Origin::Loaded(cwd);
+        session.busy = true;
         if slot.commands.try_send(load).is_err() {
             let message = format!("{} has gone; restart to use it", slot.name);
             session.push_error(message, cx);
+        } else {
+            session.set_loading(true, cx);
         }
     }
 
@@ -735,6 +748,49 @@ impl ChatView {
         self.change_kept(key, |saved| saved.files = kept);
     }
 
+    /// Writes the transcript of each session kept for later runs where it is due: as a
+    /// whole once the agent's replay has changed it, and a turn's rows once the turn ends.
+    fn keep_transcripts(&mut self) {
+        for session in &mut self.sessions {
+            let (whole, added) = (session.rewrite(), session.new_rows());
+            if whole.is_none() && added.is_none() {
+                continue;
+            }
+            let (Some(id), Some(agent)) =
+                (&session.id, kept_name(&self.agents[session.agent].name))
+            else {
+                continue;
+            };
+            let mut written = Ok(());
+            if let Some(rows) = whole {
+                written = write_transcript(agent, id, &rows);
+            }
+            if let Some(rows) = added {
+                written = written.and_then(|()| append_transcript(agent, id, &rows));
+            }
+            if let Err(err) = written {
+                eprintln!("couldn't keep the transcript for later runs: {err}");
+            }
+        }
+    }
+
+    /// Keeps the session's last report of what fills its context window, for later runs
+    /// to show while the agent loads it.
+    fn keep_report(&self, key: SessionKey) {
+        let Some(session) = self.session(key) else {
+            return;
+        };
+        let agent = kept_name(&self.agents[session.agent].name);
+        let (Some(id), Some(agent), Some(kept)) =
+            (&session.id, agent, session.context.kept_report())
+        else {
+            return;
+        };
+        if let Err(err) = save_report(agent, id, &kept) {
+            eprintln!("couldn't keep the context report for later runs: {err}");
+        }
+    }
+
     /// Makes `change` to the session as kept for later runs, if it is kept already.
     /// One whose agent hasn't given it an id yet is kept as it stands once the agent does.
     fn change_kept(&self, key: SessionKey, change: impl FnOnce(&mut SavedSession)) {
@@ -859,6 +915,7 @@ impl ChatView {
         };
         let _ = slot.commands.try_send(command);
         if let (Some(id), Some(agent)) = (session.id, kept_name(&slot.name)) {
+            forget_transcript(agent, &id);
             let changed = config_folder()
                 .ok_or_else(|| std::io::Error::other("there is no config folder"))
                 .and_then(|folder| {
@@ -1145,7 +1202,9 @@ impl ChatView {
                         self.sessions[self.active].push_error(message, cx);
                     }
                 } else if let Some(session) = self.session_mut(key) {
-                    // Open for a prompt, which asks the agent to create the session again.
+                    // Open for a prompt, which asks the agent to create the session again,
+                    // or load it.
+                    session.set_loading(false, cx);
                     session.busy = false;
                     session.push_error(message, cx);
                     session.set_live(false, cx);
@@ -1160,6 +1219,7 @@ impl ChatView {
                     self.agents[agent].spare_failed = false;
                 }
                 let created = matches!(event, SessionEvent::Created(_));
+                let reported = matches!(event, SessionEvent::ContextReport(Some(_)));
                 let ended = matches!(
                     event,
                     SessionEvent::TurnEnded { .. } | SessionEvent::TurnFailed(_)
@@ -1183,6 +1243,10 @@ impl ChatView {
                 if ended {
                     self.keep_context(key);
                 }
+                if reported {
+                    self.keep_report(key);
+                }
+                self.keep_transcripts();
                 // The agent may just have said it can read the window, or answered a read.
                 self.read_context_if_shown();
                 self.note_pull_requests(cx);
@@ -1226,6 +1290,7 @@ impl ChatView {
                     session.flush(cx);
                     session.busy = true;
                     session.set_live(false, cx);
+                    session.set_loading(false, cx);
                     session.cancel_open_permissions(cx);
                     session.asked.clear();
                     session.held = None;
@@ -1262,6 +1327,7 @@ impl ChatView {
                     if landed {
                         this.note_pull_requests(cx);
                         this.note_files(cx);
+                        this.keep_transcripts();
                     }
                     if !holding {
                         this.pacing = None;

@@ -1,6 +1,7 @@
 //! What the app keeps on disk between runs: its settings, the models the user starred,
-//! the settings each agent last created a session with, the sessions kept for later, and
-//! the notes on the Stuff board with the images pasted into them.
+//! the settings each agent last created a session with, the sessions kept for later with
+//! the transcript and last context report of each, and the notes on the Stuff board with
+//! the images pasted into them.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -9,7 +10,7 @@ use acp_core::{Harness, Setting};
 use gpui_kit::*;
 use serde::{Deserialize, Serialize};
 
-use crate::session::{KeptContext, KeptFile, KeptPullRequest};
+use crate::session::{KeptContext, KeptFile, KeptPullRequest, KeptReport, KeptRow};
 
 /// A model the user starred: its agent's `kept_name` and its id. The agent goes by
 /// name, not index, so the star holds across runs that start the agents in another
@@ -302,6 +303,139 @@ pub(crate) fn change_saved_sessions(
     std::fs::rename(&written, &path)
 }
 
+/// Holds the transcript of each session kept for later runs, a row a line as JSON, which
+/// each turn's end adds to, and beside it the last report of what filled its context
+/// window. Each file is named for the session, so a turn writes only its own rows.
+const TRANSCRIPTS: &str = "transcripts";
+
+/// The file a session's transcript, or the report beside it, is kept in: named for its
+/// agent's `kept_name` and the agent's id for it, which may hold only what a file name can.
+fn kept_file(folder: &Path, agent: &str, id: &str, extension: &str) -> PathBuf {
+    let id: String = id
+        .chars()
+        .map(|c| match c {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' => c,
+            _ => '_',
+        })
+        .collect();
+    folder
+        .join(TRANSCRIPTS)
+        .join(format!("{agent}-{id}.{extension}"))
+}
+
+const TRANSCRIPT: &str = "jsonl";
+const REPORT: &str = "context.json";
+
+fn no_config_folder() -> std::io::Error {
+    std::io::Error::other("there is no config folder")
+}
+
+/// A missing file gives none.
+pub(crate) fn load_transcript(agent: &str, id: &str) -> Vec<KeptRow> {
+    config_folder()
+        .map(|folder| read_transcript(&kept_file(&folder, agent, id, TRANSCRIPT)))
+        .unwrap_or_default()
+}
+
+/// A line that can't be read, such as one cut short as the app quit, is left out: the
+/// agent's replay puts the transcript right once it loads the session.
+fn read_transcript(path: &Path) -> Vec<KeptRow> {
+    let Ok(bytes) = std::fs::read(path) else {
+        return Vec::new();
+    };
+    bytes
+        .split(|&byte| byte == b'\n')
+        .filter_map(|line| serde_json::from_slice(line).ok())
+        .collect()
+}
+
+fn transcript_lines(rows: &[KeptRow]) -> std::io::Result<Vec<u8>> {
+    let mut lines = Vec::new();
+    for row in rows {
+        serde_json::to_writer(&mut lines, row)?;
+        lines.push(b'\n');
+    }
+    Ok(lines)
+}
+
+/// Adds `rows` to the end of the session's transcript, in one write.
+pub(crate) fn append_transcript(agent: &str, id: &str, rows: &[KeptRow]) -> std::io::Result<()> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let path = kept_file(
+        &config_folder().ok_or_else(no_config_folder)?,
+        agent,
+        id,
+        TRANSCRIPT,
+    );
+    add_lines(&path, &transcript_lines(rows)?)
+}
+
+fn add_lines(path: &Path, lines: &[u8]) -> std::io::Result<()> {
+    if let Some(folder) = path.parent() {
+        std::fs::create_dir_all(folder)?;
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    std::io::Write::write_all(&mut file, lines)
+}
+
+/// Keeps `rows` as the session's whole transcript. The new file replaces the old one whole,
+/// so a write that fails or is cut short leaves the old one.
+pub(crate) fn write_transcript(agent: &str, id: &str, rows: &[KeptRow]) -> std::io::Result<()> {
+    let path = kept_file(
+        &config_folder().ok_or_else(no_config_folder)?,
+        agent,
+        id,
+        TRANSCRIPT,
+    );
+    replace_file(&path, &transcript_lines(rows)?)
+}
+
+fn replace_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    if let Some(folder) = path.parent() {
+        std::fs::create_dir_all(folder)?;
+    }
+    let mut written = path.as_os_str().to_owned();
+    written.push(".new");
+    std::fs::write(&written, contents)?;
+    std::fs::rename(&written, path)
+}
+
+/// A file that is missing or can't be read gives none, and the report waits for the agent.
+pub(crate) fn load_report(agent: &str, id: &str) -> Option<KeptReport> {
+    let path = kept_file(&config_folder()?, agent, id, REPORT);
+    serde_json::from_slice(&std::fs::read(path).ok()?).ok()
+}
+
+pub(crate) fn save_report(agent: &str, id: &str, report: &KeptReport) -> std::io::Result<()> {
+    let path = kept_file(
+        &config_folder().ok_or_else(no_config_folder)?,
+        agent,
+        id,
+        REPORT,
+    );
+    replace_file(&path, &serde_json::to_vec(report)?)
+}
+
+/// Removes what is kept of a deleted session beside the list of sessions.
+pub(crate) fn forget_transcript(agent: &str, id: &str) {
+    let Some(folder) = config_folder() else {
+        return;
+    };
+    for extension in [TRANSCRIPT, REPORT] {
+        match std::fs::remove_file(kept_file(&folder, agent, id, extension)) {
+            Err(err) if err.kind() != std::io::ErrorKind::NotFound => {
+                eprintln!("couldn't remove a deleted session's kept transcript: {err}")
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Holds what the settings page sets, as JSON.
 pub(crate) const SETTINGS: &str = "settings.json";
 
@@ -516,4 +650,34 @@ pub(crate) fn change_stuff(
     // Laid out for reading, as notes are the user's own text.
     std::fs::write(&written, serde_json::to_vec_pretty(&StuffFile { notes })?)?;
     std::fs::rename(&written, &path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{add_lines, read_transcript, transcript_lines};
+    use crate::session::KeptRow;
+
+    #[test]
+    fn a_transcript_reads_back_but_for_a_line_cut_short() {
+        let folder =
+            std::env::temp_dir().join(format!("acp-gui-transcript-{}", std::process::id()));
+        let path = folder.join("claude-1.jsonl");
+        let _ = std::fs::remove_file(&path);
+        let rows = [
+            KeptRow::User {
+                text: "Fix the build".into(),
+                attachments: Vec::new(),
+            },
+            KeptRow::Agent {
+                text: "Done.".into(),
+            },
+        ];
+        add_lines(&path, &transcript_lines(&rows).unwrap()).unwrap();
+        // As a write the app quit during would leave it.
+        add_lines(&path, br#"{"row":"agent","te"#).unwrap();
+        let read = read_transcript(&path);
+        let _ = std::fs::remove_dir_all(&folder);
+        assert_eq!(read.len(), 2);
+        assert!(matches!(&read[1], KeptRow::Agent { text } if text == "Done."));
+    }
 }

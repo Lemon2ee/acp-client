@@ -4,6 +4,7 @@
 
 mod context;
 mod files;
+mod kept;
 mod pacing;
 mod pull_requests;
 mod tool_call;
@@ -26,9 +27,12 @@ use crate::config::{StuffAttachment, TitleSource};
 use crate::debug::switches;
 use crate::git::Repo;
 pub(crate) use context::{
-    Category, CategoryKind, ContextReport, KeptContext, SessionContext, now, short_tokens,
+    Category, CategoryKind, ContextReport, KeptContext, KeptReport, SessionContext, now,
+    short_tokens,
 };
 pub(crate) use files::{FileKind, KeptFile, MadeFile, SessionFiles, watch, watched};
+pub(crate) use kept::KeptRow;
+use kept::Replay;
 use pacing::Pacer;
 pub(crate) use pull_requests::{
     ChecksState, GhProblem, KeptPullRequest, PrState, PrStatus, PullRequest, SessionPullRequests,
@@ -47,12 +51,35 @@ pub(crate) enum Row {
         attachments: Vec<StuffAttachment>,
     },
     /// Markdown, grown chunk by chunk as the agent streams.
-    Agent(Entity<TextViewState>),
-    Thought(Entity<TextViewState>),
+    Agent(Markdown),
+    Thought(Markdown),
     /// A tool call, with the agent's request for permission to run it if it sent one.
     Tool(ToolCall),
     Notice(String),
     Error(String),
+}
+
+/// The agent's text or thoughts as a row holds them.
+pub(crate) struct Markdown {
+    pub(crate) view: Entity<TextViewState>,
+    /// The markdown itself, which the view can't give back, until the row is kept on disk.
+    source: Option<String>,
+}
+
+impl Markdown {
+    fn new(view: Entity<TextViewState>, source: String) -> Self {
+        Self {
+            view,
+            source: Some(source),
+        }
+    }
+
+    fn push_str(&mut self, text: &str, cx: &mut App) {
+        if let Some(source) = &mut self.source {
+            source.push_str(text);
+        }
+        self.view.update(cx, |view, cx| view.push_str(text, cx));
+    }
 }
 
 /// One conversation with an agent: its transcript and whether it takes a prompt.
@@ -124,6 +151,22 @@ pub(crate) struct Session {
     /// acp-core passes it on, is a message of its own rather than more of the turn's last
     /// reply.
     after_turn: bool,
+    /// The agent has been asked to load it and hasn't yet: a line under the last row says
+    /// so, and the info panel shows what it kept from the last run as not live.
+    pub(crate) loading: bool,
+    /// While the rows kept on disk from an earlier run stand in for the transcript, the
+    /// agent's replay of it, which lands here out of sight until the load is done.
+    replay: Option<Replay>,
+    /// Rows are landing in the replay rather than on screen, so the list mustn't hear of them.
+    offstage: bool,
+    /// How many of the rows are kept on disk.
+    written: usize,
+    /// The kept rows differ from what the agent replayed, so the whole transcript is due to
+    /// be written again.
+    rewrite: bool,
+    /// A turn has ended since the rows were last written, so the rows after `written` are
+    /// due to be.
+    turn_ended: bool,
 }
 
 /// Which run a session's agent session comes from.
@@ -186,6 +229,12 @@ impl Session {
             pacer: Pacer::default(),
             groups_set: HashMap::new(),
             after_turn: false,
+            loading: false,
+            replay: None,
+            offstage: false,
+            written: 0,
+            rewrite: false,
+            turn_ended: false,
         }
     }
 
@@ -203,6 +252,18 @@ impl Session {
         // A group of tool calls the turn ended on closes.
         if !live {
             self.remeasure_tail_group(cx);
+        }
+    }
+
+    /// Starts or ends the agent's load of the session. Only a load shows its line under the
+    /// last row, so that row is measured again.
+    pub(crate) fn set_loading(&mut self, loading: bool, cx: &mut App) {
+        if self.loading == loading {
+            return;
+        }
+        self.loading = loading;
+        if let Some(last) = self.rows.len().checked_sub(1) {
+            self.remeasure(last, cx);
         }
     }
 
@@ -267,6 +328,9 @@ impl Session {
     /// Takes an event from the agent. In a live turn its text is held back to show at an
     /// even pace, and the transcript's other events wait behind it, keeping their order.
     pub(crate) fn apply(&mut self, event: SessionEvent, cx: &mut App) {
+        if self.replay.is_some() && replayed(&event) {
+            return self.land_replayed(event, cx);
+        }
         if !self.live || !in_transcript(&event) || self.updates_shown_tool(&event) {
             return self.land(event, cx);
         }
@@ -379,15 +443,16 @@ impl Session {
                 view.push_str(&piece, cx);
                 view
             });
+            let text = Markdown::new(view, piece);
             let row = if thought {
-                Row::Thought(view)
+                Row::Thought(text)
             } else {
-                Row::Agent(view)
+                Row::Agent(text)
             };
             return self.push(row, cx);
         }
-        if let Some(Row::Agent(view) | Row::Thought(view)) = self.rows.last() {
-            view.update(cx, |view, cx| view.push_str(&piece, cx));
+        if let Some(Row::Agent(text) | Row::Thought(text)) = self.rows.last_mut() {
+            text.push_str(&piece, cx);
             self.remeasure(self.rows.len() - 1, cx);
         }
     }
@@ -395,7 +460,13 @@ impl Session {
     /// An event as it lands in the session, at once.
     fn land(&mut self, event: SessionEvent, cx: &mut App) {
         match event {
-            SessionEvent::Created(id) => self.id = Some(id),
+            SessionEvent::Created(id) => {
+                self.id = Some(id);
+                // A session the agent loads comes after its replay.
+                if matches!(self.origin, Origin::Loaded(_)) {
+                    self.loaded(cx);
+                }
+            }
             SessionEvent::UserText(text) => self.append_user_text(&text, cx),
             SessionEvent::AgentText(text) => self.append_text(false, &text, cx),
             SessionEvent::AgentThought(text) => self.append_text(true, &text, cx),
@@ -482,6 +553,7 @@ impl Session {
             // The turn's last row still comes in as the turn's others did.
             SessionEvent::TurnEnded { stop_reason } => {
                 self.busy = false;
+                self.turn_ended = true;
                 self.pull_requests.turn_ended();
                 self.files.turn_ended();
                 self.after_turn = true;
@@ -493,6 +565,7 @@ impl Session {
             }
             SessionEvent::TurnFailed(message) => {
                 self.busy = false;
+                self.turn_ended = true;
                 self.pull_requests.turn_ended();
                 self.files.turn_ended();
                 self.after_turn = true;
@@ -681,22 +754,19 @@ impl Session {
     /// agent sends between turns.
     fn append_text(&mut self, thought: bool, text: &str, cx: &mut App) {
         let joins = !self.after_turn;
-        match self.rows.last() {
-            Some(Row::Agent(existing)) if !thought && joins => {
-                existing.update(cx, |view, cx| view.push_str(text, cx))
-            }
-            Some(Row::Thought(existing)) if thought && joins => {
-                existing.update(cx, |view, cx| view.push_str(text, cx))
-            }
+        match self.rows.last_mut() {
+            Some(Row::Agent(existing)) if !thought && joins => existing.push_str(text, cx),
+            Some(Row::Thought(existing)) if thought && joins => existing.push_str(text, cx),
             // Agents often open a block with a bare "\n\n" chunk; don't start a row with it.
             _ if text.trim().is_empty() => return,
             _ => {
                 self.after_turn = false;
                 let view = cx.new(|cx| TextViewState::markdown(text, cx));
+                let text = Markdown::new(view, text.to_string());
                 let row = if thought {
-                    Row::Thought(view)
+                    Row::Thought(text)
                 } else {
-                    Row::Agent(view)
+                    Row::Agent(text)
                 };
                 return self.push(row, cx);
             }
@@ -729,6 +799,9 @@ impl Session {
     }
 
     pub(crate) fn push(&mut self, row: Row, cx: &mut App) {
+        if self.offstage {
+            return self.rows.push(row);
+        }
         // A group of tool calls closes once the agent goes on to something else.
         if !matches!(row, Row::Tool(_)) {
             self.remeasure_tail_group(cx);
@@ -743,6 +816,9 @@ impl Session {
     }
 
     fn remeasure(&mut self, ix: usize, cx: &mut App) {
+        if self.offstage {
+            return;
+        }
         self.changed = Instant::now();
         self.scroller
             .update(cx, |scroller, _| scroller.remeasure(ix));
@@ -776,6 +852,16 @@ fn in_transcript(event: &SessionEvent) -> bool {
             | SessionEvent::ContextReport(_)
             | SessionEvent::ContextReadable(_)
     )
+}
+
+/// Events of the agent's replay of a session it loads: those that land in the transcript,
+/// but the end of a turn, which only a prompt has.
+fn replayed(event: &SessionEvent) -> bool {
+    in_transcript(event)
+        && !matches!(
+            event,
+            SessionEvent::TurnEnded { .. } | SessionEvent::TurnFailed(_)
+        )
 }
 
 /// Whether `title` is `prompt` with its whitespace run together, whole or cut short with

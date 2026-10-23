@@ -81,6 +81,18 @@ impl TranscriptScroll {
         self.list.remeasure_items(ix..ix + 1);
     }
 
+    /// The rows from `from` on were replaced by `count` others, as when a loaded session's
+    /// replay takes the place of the rows kept for it. Those before stay measured, so a
+    /// view on them stays put; one at the end stays there.
+    pub(crate) fn replace(&mut self, from: usize, count: usize) {
+        let old = self.list.item_count();
+        self.list.splice(from..old, count);
+        // The row before may now be the last, which has no gap under it.
+        if let Some(before) = from.checked_sub(1) {
+            self.list.remeasure_items(before..from);
+        }
+    }
+
     /// Whether the newest text is out of view, which brings up the button back to it.
     pub(crate) fn scrolled_up(&self) -> bool {
         if switches().follow {
