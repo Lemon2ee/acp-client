@@ -506,7 +506,7 @@ impl ChatView {
         };
         let list = if !parts.is_empty() {
             let size = report.and_then(|report| report.size).unwrap_or(usage.size);
-            let folder = session.folder().unwrap_or(&self.cwd);
+            let folder = session.folder();
             let rows = parts
                 .iter()
                 .zip(swatches)

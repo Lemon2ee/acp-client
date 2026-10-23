@@ -54,29 +54,38 @@ tracing-tracy = { version = "0.11", features = [
     "only-localhost",
 ], optional = true }
 
-# Reads the traffic lights' size and spacing from AppKit, and shows the hidden app and
-# the minimized window for the system-wide shortcut. gpui's macOS layer already builds
-# these crates at these versions, with these features but NSSound and NSUserDefaults,
-# which play the effort meter's sounds and read the system's scrolling and sound settings.
+# Reads the traffic lights' size and spacing from AppKit, shows the hidden app and the
+# minimized window for the system-wide shortcut, and opens the folder panel at the
+# session's folder, which gpui's own `prompt_for_paths` can't. gpui's macOS layer already
+# builds these crates at these versions, with these features but NSSound and
+# NSUserDefaults, which play the effort meter's sounds and read the system's scrolling
+# and sound settings.
 [target.'cfg(target_os = "macos")'.dependencies]
+block2 = "0.6"
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3.2", default-features = false, features = [
     "NSApplication",
     "NSButton",
     "NSControl",
+    "NSOpenPanel",
+    "NSPanel",
     "NSResponder",
+    "NSSavePanel",
     "NSSound",
     "NSView",
     "NSWindow",
+    "block2",
     "objc2-core-foundation",
 ] }
 objc2-foundation = { version = "0.3.2", default-features = false, features = [
     "std",
+    "NSArray",
     "NSData",
     "NSDateFormatter",
     "NSFormatter",
     "NSLocale",
     "NSString",
+    "NSURL",
     "NSUserDefaults",
 ] }
 raw-window-handle = "0.6"

@@ -1,4 +1,4 @@
-//! The plan usage line under the prompt box: how much of each of its plan's limits the
+//! The plan usage line under the prompt box, below the folder's: how much of each of its plan's limits the
 //! login of the session's agent has left, and when each starts over, as the agent pushes
 //! them (`acp_core::Event::RateLimits`). The line is left out while the agent has said
 //! nothing, and for a login without plan limits, such as an API key.
@@ -15,8 +15,6 @@ use gpui_kit::*;
 use crate::chat_view::ChatView;
 use crate::session::Session;
 
-/// Gap between the prompt box and the line.
-pub(super) const USAGE_LINE_GAP: Pixels = px(4.);
 const USAGE_LINE_HEIGHT: Pixels = px(20.);
 /// From the box's left edge, so the first name is level with the model button's mark.
 const USAGE_LINE_INSET: Pixels = px(16.);
@@ -24,8 +22,6 @@ const USAGE_LINE_END_PAD: Pixels = px(6.);
 const USAGE_ITEM_GAP: Pixels = px(14.);
 /// Between a window's name, what is left of it, and when it starts over.
 const USAGE_PART_GAP: Pixels = px(6.);
-/// Below the line, in place of the 12px below the box when there is no line.
-pub(super) const USAGE_LINE_BOTTOM_PAD: Pixels = px(8.);
 
 const FIVE_HOURS: u32 = 5 * 60;
 const ONE_WEEK: u32 = 7 * 24 * 60;
@@ -118,7 +114,6 @@ impl ChatView {
         let tabular = FontFeatures(Arc::new(vec![("tnum".into(), 1)]));
         Some(
             div()
-                .mt(USAGE_LINE_GAP)
                 .h(USAGE_LINE_HEIGHT)
                 .pl(USAGE_LINE_INSET)
                 .pr(USAGE_LINE_END_PAD)

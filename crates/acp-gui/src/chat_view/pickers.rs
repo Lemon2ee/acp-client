@@ -97,9 +97,9 @@ pub(crate) struct MenuLook {
     /// The tab on show, a button whose menu is open, the star's button being pressed.
     pub(crate) pressed: Hsla,
     pub(crate) foreground: Hsla,
-    muted: Hsla,
-    /// A starred model's star.
-    star: Hsla,
+    pub(crate) muted: Hsla,
+    /// A starred model's star, and the dot before the files not committed.
+    pub(crate) star: Hsla,
     /// The effort meter's marks above the level, and those of the button's meter while
     /// it is pointed at.
     meter_off: Hsla,
