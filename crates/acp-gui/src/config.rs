@@ -642,8 +642,8 @@ fn pasted_here(path: &Path) -> bool {
     config_folder().is_some_and(|folder| path.starts_with(folder.join(STUFF_FILES)))
 }
 
-/// Removes the file of an attachment taken off a note before it was stuck, if it is an
-/// image the app saved. A file copied in Finder is the user's, and is left alone.
+/// Removes the file of an attachment that nothing shows any more, if it is an image the
+/// app saved. A file copied in Finder is the user's, and is left alone.
 pub(crate) fn forget_attachment(attachment: &StuffAttachment) {
     let path = attachment.path();
     if pasted_here(path)

@@ -8,7 +8,7 @@
 //! the prompt as well. Anywhere else, or on Esc, it flies back. A card that went into the
 //! chat is used: its place on the board closes and the note is gone, from later runs too,
 //! though what was pasted into it stays for the prompt's tiles or the row it was sent as
-//! until the app quits.
+//! until the app quits, or while a kept session's transcript has that row.
 //!
 //! gpui's drag view is gone once the pointer lets go, so the card's way into the prompt,
 //! onto its sent row or back to the board is drawn by `ChatView` over the whole window.
@@ -625,7 +625,8 @@ impl ChatView {
     /// Takes the card with `id`, let go into the chat at `dropped` after it tore off its
     /// tape at `torn`, off the board and out of the notes kept for later runs. Its place
     /// closes first, unless motion is reduced. What was pasted into it stays on disk until
-    /// the app quits, as the prompt's tiles or the row it was sent as still show it.
+    /// the app quits, as the prompt's tiles or the row it was sent as still show it, and
+    /// after that while a kept session's transcript has the row.
     fn take_off_board(&mut self, id: u64, dropped: Instant, torn: Instant, cx: &mut Context<Self>) {
         let changed = config_folder()
             .ok_or_else(|| std::io::Error::other("there is no config folder"))

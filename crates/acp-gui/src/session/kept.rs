@@ -54,6 +54,16 @@ pub(crate) enum KeptRow {
     },
 }
 
+impl KeptRow {
+    /// What a prompt was sent with, which its row shows as tiles.
+    pub(crate) fn attachments(&self) -> &[StuffAttachment] {
+        match self {
+            KeptRow::User { attachments, .. } => attachments,
+            _ => &[],
+        }
+    }
+}
+
 /// The agent's replay of a session whose kept rows stand in for its transcript.
 pub(super) struct Replay {
     rows: Vec<Row>,
