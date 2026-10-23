@@ -35,6 +35,9 @@ pub(crate) struct ToolCall {
     /// A hash of the content as the agent last sent it, so an update repeating it, as a
     /// permission request and the call's end both do, isn't worked out again.
     sent: Option<u64>,
+    /// That content itself, until the row is kept on disk: what shows can't be read back
+    /// into it. Dropped then, so a session doesn't hold each file it read twice.
+    pub(crate) sent_content: Option<Vec<ToolContent>>,
     /// Lines its edits add and remove, over all its diffs.
     pub(crate) added: usize,
     pub(crate) removed: usize,
@@ -143,6 +146,7 @@ impl ToolCall {
             locations: Vec::new(),
             content: Vec::new(),
             sent: None,
+            sent_content: None,
             added: 0,
             removed: 0,
             // One that arrives finished ran before it was shown, for no time we know.
@@ -232,7 +236,8 @@ impl ToolCall {
             };
             if self.sent != Some(hash) || moved {
                 self.sent = Some(hash);
-                self.set_content(content, cx);
+                self.set_content(&content, cx);
+                self.sent_content = Some(content);
             }
         }
     }
@@ -245,14 +250,14 @@ impl ToolCall {
         (!self.status.finished()).then(|| started.elapsed())
     }
 
-    fn set_content(&mut self, content: Vec<ToolContent>, cx: &mut App) {
+    fn set_content(&mut self, content: &[ToolContent], cx: &mut App) {
         let mut hunks = Hunks::new(&self.locations);
         self.content = content
-            .into_iter()
+            .iter()
             .filter_map(|content| match content {
                 ToolContent::Text(text) => shown_text(text, cx),
                 ToolContent::Diff { path, old, new } => {
-                    Some(Shown::Diff(hunks.diff(path, old.as_deref(), &new)))
+                    Some(Shown::Diff(hunks.diff(path.clone(), old.as_deref(), new)))
                 }
             })
             .collect();
@@ -316,8 +321,8 @@ impl<'a> Hunks<'a> {
 
 /// Text as it shows: one fenced code block as its lines, anything else as markdown.
 /// Blank text shows nothing.
-fn shown_text(text: String, cx: &mut App) -> Option<Shown> {
-    if let Some(body) = fenced(&text) {
+fn shown_text(text: &str, cx: &mut App) -> Option<Shown> {
+    if let Some(body) = fenced(text) {
         let lines = code_lines(body);
         if lines.iter().all(|line| line.text.trim().is_empty()) {
             return None;
@@ -327,8 +332,8 @@ fn shown_text(text: String, cx: &mut App) -> Option<Shown> {
     if text.trim().is_empty() {
         return None;
     }
-    let view = cx.new(|cx| TextViewState::markdown(&text, cx));
-    Some(Shown::Text(view, text.into()))
+    let view = cx.new(|cx| TextViewState::markdown(text, cx));
+    Some(Shown::Text(view, text.to_string().into()))
 }
 
 /// Text as lines of code, with no numbers.

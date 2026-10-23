@@ -58,6 +58,23 @@ impl SessionContext {
         self.kept_at = Some(kept.at);
         self.totals = kept.totals;
     }
+
+    /// What is kept of the last report for later runs, once there is one.
+    pub(crate) fn kept_report(&self) -> Option<KeptReport> {
+        let (report, at) = self.report.as_ref()?;
+        Some(KeptReport {
+            report: report.clone(),
+            at: *at,
+        })
+    }
+
+    /// The report kept from an earlier run, after `restore`. One read after the last count
+    /// kept, which each turn's end makes, came after the last turn: it tells as much as a
+    /// read now would, so none is asked for.
+    pub(crate) fn restore_report(&mut self, kept: KeptReport) {
+        self.fresh = self.kept_at.is_none_or(|counted| kept.at >= counted);
+        self.report = Some((kept.report, kept.at));
+    }
 }
 
 /// A session's context window as kept for later runs: the last count and when it was
@@ -71,13 +88,21 @@ pub(crate) struct KeptContext {
     pub(crate) totals: TurnUsage,
 }
 
+/// What filled a session's context window at its last read, as kept for later runs.
+#[derive(Serialize, Deserialize)]
+pub(crate) struct KeptReport {
+    pub(crate) report: ContextReport,
+    /// In seconds since 1970.
+    pub(crate) at: i64,
+}
+
 /// Now, in seconds since 1970.
 pub(crate) fn now() -> i64 {
     chrono::Utc::now().timestamp()
 }
 
 /// What fills the context window, from `/context`'s Markdown.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct ContextReport {
     /// In the order the report lists them, those holding no tokens left out, except
     /// the free space and the buffer.
@@ -86,7 +111,7 @@ pub(crate) struct ContextReport {
     pub(crate) size: Option<u64>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct Category {
     pub(crate) name: String,
     pub(crate) tokens: u64,
@@ -98,7 +123,8 @@ pub(crate) struct Category {
 
 /// What a category's tokens do. Claude Code also lists tool schemas it loads only when
 /// asked for, as "(deferred)", outside the window; those are left out.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub(crate) enum CategoryKind {
     /// In the window.
     Used,
@@ -107,7 +133,7 @@ pub(crate) enum CategoryKind {
     Free,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct Item {
     pub(crate) name: String,
     pub(crate) tokens: u64,
@@ -155,8 +181,10 @@ impl ContextReport {
                 }
                 continue;
             }
-            if let Some(table) = table.take() {
-                report.take(&table, &heading);
+            if let Some(table) = table.take()
+                && !report.take(&table, &heading)
+            {
+                return Some(report);
             }
             if line.starts_with('#') {
                 heading = line.trim_start_matches('#').trim().to_lowercase();
@@ -168,18 +196,25 @@ impl ContextReport {
             }
         }
         if let Some(table) = table.take() {
+            // A second table of categories ending the text goes unread all the same.
             report.take(&table, &heading);
         }
         (!report.categories.is_empty()).then_some(report)
     }
 
-    /// Takes in one of the report's tables, read under `heading`.
-    fn take(&mut self, table: &Table, heading: &str) {
+    /// Takes in one of the report's tables, read under `heading`. False for a second table
+    /// of categories, which starts the report over: claude-agent-acp 0.94.0 lets
+    /// `/context`'s output through twice when the SDK's copies of it differ at all, so
+    /// the answer can hold the whole report twice.
+    fn take(&mut self, table: &Table, heading: &str) -> bool {
         let tokens_at = table
             .column("tokens")
             .unwrap_or(table.header.len().saturating_sub(1));
         let count = |row: &[String]| row.get(tokens_at).and_then(|cell| tokens(cell));
         if table.column("category") == Some(0) {
+            if !self.categories.is_empty() {
+                return false;
+            }
             for row in &table.rows {
                 let (Some(name), Some(tokens)) = (row.first(), count(row)) else {
                     continue;
@@ -202,7 +237,7 @@ impl ContextReport {
                     items: Vec::new(),
                 });
             }
-            return;
+            return true;
         }
         // The heading names the category the items make up.
         let Some(category) = [
@@ -218,7 +253,7 @@ impl ContextReport {
                 .iter_mut()
                 .find(|category| category.name.eq_ignore_ascii_case(name))
         }) else {
-            return;
+            return true;
         };
         let (server, path, kind) = (
             table.column("server"),
@@ -259,6 +294,7 @@ impl ContextReport {
             let name = format!("{server} · {tools}");
             category.items.push(Item { name, tokens });
         }
+        true
     }
 }
 
@@ -386,6 +422,34 @@ mod tests {
                 }
             ]
         );
+    }
+
+    #[test]
+    fn a_report_sent_twice_is_read_once() {
+        let once = ContextReport::parse(REPORT).unwrap();
+        let twice = ContextReport::parse(&format!("{REPORT}\n{REPORT}")).unwrap();
+        assert_eq!(twice, once);
+    }
+
+    #[test]
+    fn a_kept_report_read_after_the_last_turn_is_fresh() {
+        let kept = |at| KeptReport {
+            report: ContextReport::parse(REPORT).unwrap(),
+            at,
+        };
+        let counted = KeptContext {
+            used: 84_200,
+            size: 200_000,
+            at: 1_000,
+            totals: TurnUsage::default(),
+        };
+        let mut context = SessionContext::default();
+        context.restore(&counted);
+        context.restore_report(kept(1_010));
+        assert!(context.fresh);
+        // A turn ended after it, with no read since.
+        context.restore_report(kept(990));
+        assert!(!context.fresh);
     }
 
     #[test]

@@ -22,7 +22,7 @@ clearly needs splitting. acp-gui is split by what each part keeps or draws:
 | File in `crates/acp-gui/src/` | Holds |
 | --- | --- |
 | `main.rs` | Starting the app: the agents to run, the window, key bindings, actions, the extra icons, profiling. |
-| `config.rs` | What is kept on disk between runs: `AppSettings`, the starred models, each agent's last settings, the kept sessions, the folders sessions were started in, the Stuff board's notes and the images pasted into them. |
+| `config.rs` | What is kept on disk between runs: `AppSettings`, the starred models, each agent's last settings, the kept sessions with each one's transcript and last context report, the folders sessions were started in, the Stuff board's notes and the images pasted into them. |
 | `debug.rs` | `ACP_GUI_DEBUG`: switches that turn a live reply's effects off one by one, and a log of each transcript frame. |
 | `git.rs` | What git says of a session's folder: the branch, a linked worktree, what the branch changed since its base, the files not committed. Runs `git` in two steps (the branch first), and never on macOS while `/usr/bin/git` is only the Command Line Tools' installer. |
 | `hotkey.rs` | The system-wide shortcut that brings the window to the front: what it can't be, holding it with macOS through Carbon, and what a press does. |
@@ -32,6 +32,7 @@ clearly needs splitting. acp-gui is split by what each part keeps or draws:
 | `session/tool_call.rs` | A tool call as its row keeps it: its content made ready to draw once (a command's lines, a file's numbered lines, a diff), how long it ran, and the agent's permission request on it with its answer. |
 | `session/context.rs` | What fills a session's context window: the agent's last count, each turn's tokens added up, and Claude's `/context` report read into categories and their items. |
 | `session/pull_requests.rs` | The pull requests a session opened, found in its tool calls' output, and how each stands (state, checks, reviews, files, diff) as the user's own `gh` tells it. |
+| `session/kept.rs` | A session's rows as kept on disk: the form each is written in, when they are due (the whole after a replay that changed them, a turn's at its end), the kept rows standing in while the agent loads the session, and its replay taking their place, lined up with them. |
 | `session/files.rs` | The PDFs, spreadsheets and tables a session's turns made: its folder watched (FSEvents on macOS) from a prompt until its turn ends, and the full paths its commands name. |
 | `sound.rs` | The effort meter's ticks and knock, made as WAV data and played through NSSound while macOS's interface sounds are on (macOS only; silent elsewhere). |
 | `chrome.rs` | The window around the content: the macOS title bar row, the traffic lights, the blur, the light or dark theme. |
@@ -76,8 +77,8 @@ cargo fmt --all
 - Build output goes to `target.nosync/` (see `.cargo/config.toml`): `~/Documents` syncs to
   iCloud, which skips `.nosync` names. Do not change the target dir.
 - Tests are few, and only of plain functions, which need no window or agent: acp-gui's
-  pacing, tool-call content, effort meter, usage line, git output, folder line and Stuff
-  rules, and acp-core's making of a prompt's content from its files. "Verified" means
+  pacing, tool-call content, effort meter, usage line, git output, folder line, Stuff
+  rules and kept transcripts, and acp-core's making of a prompt's content from its files. "Verified" means
   `cargo build`, `cargo test`, `cargo clippy` and `cargo fmt` are clean, plus a run of the
   affected front end when the change is user-visible.
 - `dist` (workspace `Cargo.toml`) is `release` with fat LTO and one codegen unit: 20.6 MB

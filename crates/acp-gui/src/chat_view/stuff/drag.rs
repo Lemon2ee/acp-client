@@ -7,7 +7,8 @@
 //! transcript, it is sent at once, unless the agent is still replying, when it goes into
 //! the prompt as well. Anywhere else, or on Esc, it flies back. A card that went into the
 //! chat is used: its place on the board closes and the note is gone, from later runs too,
-//! though what was pasted into it stays for the prompt's tiles or the row it was sent as.
+//! though what was pasted into it stays for the prompt's tiles or the row it was sent as
+//! until the app quits.
 //!
 //! gpui's drag view is gone once the pointer lets go, so the card's way into the prompt,
 //! onto its sent row or back to the board is drawn by `ChatView` over the whole window.
@@ -623,14 +624,18 @@ impl ChatView {
 
     /// Takes the card with `id`, let go into the chat at `dropped` after it tore off its
     /// tape at `torn`, off the board and out of the notes kept for later runs. Its place
-    /// closes first, unless motion is reduced. What was pasted into it stays on disk, as
-    /// the prompt's tiles or the row it was sent as still show it.
+    /// closes first, unless motion is reduced. What was pasted into it stays on disk until
+    /// the app quits, as the prompt's tiles or the row it was sent as still show it.
     fn take_off_board(&mut self, id: u64, dropped: Instant, torn: Instant, cx: &mut Context<Self>) {
         let changed = config_folder()
             .ok_or_else(|| std::io::Error::other("there is no config folder"))
             .and_then(|folder| change_stuff(&folder, |notes| notes.retain(|note| note.id != id)));
         if let Err(err) = changed {
             eprintln!("couldn't forget the note for later runs: {err}");
+        }
+        let stuff = &mut self.stuff;
+        if let Some(note) = stuff.notes.iter().find(|note| note.id == id) {
+            stuff.used.extend(note.attachments.iter().cloned());
         }
         if cx.reduce_motion() {
             self.forget_card(id);

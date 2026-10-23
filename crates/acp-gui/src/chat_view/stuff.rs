@@ -102,6 +102,9 @@ pub(crate) struct StuffState {
     _input_events: Subscription,
     /// What has been pasted into the note besides text, until it is stuck.
     pending: Vec<StuffAttachment>,
+    /// What was pasted into the cards used in the chat, which the prompt's tiles and the
+    /// rows they were sent as show until the app quits.
+    used: Vec<StuffAttachment>,
     tile_hover: TileHover,
     _quit: Subscription,
     /// The note last stuck, flying onto the board until its time is up.
@@ -163,11 +166,14 @@ impl StuffState {
             }
         });
         // Like the note's text, what was pasted into it is gone with the app, and so are
-        // the images saved for it.
+        // the images saved for it. So are those of the cards used in the chat, as neither
+        // a prompt's tiles nor a replayed row show them in a later run.
         let quit = cx.on_app_quit(|this, _| {
-            this.stuff
+            let stuff = &mut this.stuff;
+            stuff
                 .pending
                 .drain(..)
+                .chain(stuff.used.drain(..))
                 .for_each(|attachment| forget_attachment(&attachment));
             std::future::ready(())
         });
@@ -176,6 +182,7 @@ impl StuffState {
             input,
             _input_events: input_events,
             pending: Vec::new(),
+            used: Vec::new(),
             tile_hover: TileHover::default(),
             _quit: quit,
             sticking: None,
