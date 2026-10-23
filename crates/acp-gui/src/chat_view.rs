@@ -204,12 +204,15 @@ impl ChatView {
             }
         });
         // Before the prompt's own Enter and the window's Esc, which a permission card
-        // answers to while the prompt is empty (see `card_with_keys`).
+        // answers to while the prompt is empty (see `card_with_keys`). Esc lets go of
+        // sessions picked in the sidebar first: in one interceptor, as gpui runs every
+        // interceptor whichever stops the key.
         let view = cx.entity().downgrade();
         let card_keys = cx.intercept_keystrokes(move |event, window, cx| {
             let taken = view
                 .update(cx, |this, cx| {
-                    this.card_keystroke(&event.keystroke, window, cx)
+                    this.selection_keystroke(&event.keystroke, window, cx)
+                        || this.card_keystroke(&event.keystroke, window, cx)
                 })
                 .unwrap_or_default();
             if taken {
@@ -838,6 +841,7 @@ impl ChatView {
             return;
         }
         self.sessions[ix].archived = archived;
+        self.sidebar.unselect(key);
         self.change_kept(key, |saved| saved.archived = archived);
         if archived {
             if ix == self.active {
@@ -902,6 +906,7 @@ impl ChatView {
         {
             self.finish_rename(false, cx);
         }
+        self.sidebar.unselect(key);
         if ix == self.active {
             let next = self.untitled_on(self.sessions[ix].agent, cx);
             self.show(next, window, cx);
