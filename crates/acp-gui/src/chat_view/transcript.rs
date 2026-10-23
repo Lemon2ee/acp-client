@@ -23,14 +23,17 @@ const WAIT_DELAY: Duration = Duration::from_millis(250);
 impl ChatView {
     /// A row of the active session's transcript. In a live turn a new row comes in as
     /// the menus do, rising the theme's short distance as it fades in, and the last row
-    /// carries the waiting line while the agent has sent nothing new.
+    /// carries the waiting line while the agent has sent nothing new. `keyed` is the
+    /// permission card the prompt's keys answer (see `card_with_keys`), worked out before
+    /// the list lays out its rows.
     pub(crate) fn render_row(
         &mut self,
         ix: usize,
+        keyed: Option<usize>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let row = self.row_content(ix, window, cx);
+        let row = self.row_content(ix, keyed, window, cx);
         let motion = cx.theme().motion_tokens();
         let enter = Enter {
             duration: motion.duration_normal,
@@ -84,6 +87,7 @@ impl ChatView {
     fn row_content(
         &mut self,
         ix: usize,
+        keyed: Option<usize>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -132,7 +136,7 @@ impl ChatView {
                 .text_color(muted)
                 .child(TextView::new(view).selectable(true))
                 .into_any_element(),
-            Row::Tool(_) => self.render_tool_call(ix, window, cx),
+            Row::Tool(_) => self.render_tool_call(ix, keyed, window, cx),
             Row::Notice(text) => row
                 .text_sm()
                 .text_color(muted)

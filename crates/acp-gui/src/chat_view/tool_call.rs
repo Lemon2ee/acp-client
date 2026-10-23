@@ -162,6 +162,7 @@ impl ChatView {
     pub(crate) fn render_tool_call(
         &mut self,
         ix: usize,
+        keyed: Option<usize>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -196,7 +197,7 @@ impl ChatView {
         );
         if !grouped {
             return self
-                .render_call(ix, px(indent), window, cx)
+                .render_call(ix, px(indent), keyed, window, cx)
                 .py(ROW_GAP)
                 .into_any_element();
         }
@@ -219,7 +220,7 @@ impl ChatView {
                 .child(header)
         });
         let call = (reveal > 0. || open).then(|| {
-            let call = self.render_call(ix, px(indent), window, cx);
+            let call = self.render_call(ix, px(indent), keyed, window, cx);
             // A line down from the header's icon, along the calls, to the last one's middle.
             let guide = div()
                 .absolute()
@@ -252,11 +253,13 @@ impl ChatView {
     }
 
     /// One tool call: its row, set in by `indent`, and the box with what it shows, which
-    /// opens and closes with the theme's control spring.
+    /// opens and closes with the theme's control spring. Its permission card shows the
+    /// keys while it is the `keyed` one.
     fn render_call(
         &mut self,
         ix: usize,
         indent: Pixels,
+        keyed: Option<usize>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Div {
@@ -374,7 +377,7 @@ impl ChatView {
                 .children(content);
             reveal_clip((id.clone(), "row"), 1. - asked, side, window, cx)
         });
-        let keyed = call.asking() && self.card_with_keys(window, cx) == Some(ix);
+        let keyed = keyed == Some(ix);
         let card = call.ask.as_ref().filter(|_| asked > 0.).map(|ask| {
             let card = ask_card(
                 call, ask, keyed, key, ix, &id, &folder, look, &mono, window, cx,
@@ -506,7 +509,8 @@ impl ChatView {
     /// The permission card that Enter, Esc, Up and Down answer from the prompt: the
     /// session's first open one, while the prompt holds the keys with nothing written in
     /// it and the newest rows are in view. The card never takes the keys itself, so text
-    /// being written can't answer it, nor can a card out of sight.
+    /// being written can't answer it, nor can a card out of sight. It reads the
+    /// transcript's list, so the rows get it from `render_transcript` rather than ask.
     pub(crate) fn card_with_keys(&self, window: &Window, cx: &App) -> Option<usize> {
         let prompt = self.input.read(cx);
         let session = &self.sessions[self.active];
