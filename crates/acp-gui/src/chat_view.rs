@@ -7,6 +7,7 @@ mod pickers;
 pub(crate) mod scroller;
 mod settings_page;
 mod sidebar;
+mod stuff;
 mod tool_call;
 mod transcript;
 mod usage_line;
@@ -36,6 +37,7 @@ use crate::chat_view::pickers::effort::EffortMeter;
 use crate::chat_view::pickers::model_panel::ModelPanelState;
 use crate::chat_view::settings_page::SettingsPageState;
 use crate::chat_view::sidebar::{ResizeSidebar, SidebarState};
+use crate::chat_view::stuff::StuffState;
 use crate::chat_view::usage_line::{USAGE_LINE_BOTTOM_PAD, UsageLineState};
 use crate::chrome::{
     BLURRED_CHAT_ALPHA, BLURRED_SIDEBAR_ALPHA, OWN_TITLE_BAR, WINDOW_BLUR, apply_appearance,
@@ -109,6 +111,8 @@ pub(crate) struct ChatView {
     blurred: bool,
     sidebar: SidebarState,
     info_panel: InfoPanelState,
+    /// The sidebar's note and board, the same whichever session is on screen.
+    stuff: StuffState,
     model_panel: ModelPanelState,
     /// The light and the focus of the menu below the prompt that is open.
     menu_nav: MenuNav,
@@ -287,6 +291,7 @@ impl ChatView {
             blurred: blur,
             sidebar: SidebarState::default(),
             info_panel: InfoPanelState::default(),
+            stuff: StuffState::new(window, cx),
             model_panel: ModelPanelState::new(window, cx),
             menu_nav: MenuNav::new(cx),
             effort: EffortMeter::new(cx),

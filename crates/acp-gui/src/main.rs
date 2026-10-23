@@ -28,8 +28,8 @@ use crate::chrome::{
 };
 use crate::config::{AppSettings, load_settings};
 
-// The icons `mode_icon`, the settings and the tool calls' kinds use beyond those in the
-// component library's own bundle.
+// The icons `mode_icon`, the settings, the tool calls' kinds and the sidebar's Stuff list
+// use beyond those in the component library's own bundle.
 gpui_kit::assets::icon_assets!(
     ExtraIcons,
     [
@@ -58,7 +58,10 @@ gpui_kit::assets::icon_assets!(
         GitMerge,
         Clock,
         CircleMinus,
-        FileSpreadsheet
+        FileSpreadsheet,
+        MessagesSquare,
+        StickyNote,
+        Pin
     ]
 );
 

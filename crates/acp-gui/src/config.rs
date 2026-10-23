@@ -1,5 +1,6 @@
 //! What the app keeps on disk between runs: its settings, the models the user starred,
-//! the settings each agent last created a session with, and the sessions kept for later.
+//! the settings each agent last created a session with, the sessions kept for later, and
+//! the notes on the Stuff board.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -344,4 +345,64 @@ fn change_settings(
     std::fs::write(&written, serde_json::to_vec_pretty(&settings)?)?;
     std::fs::rename(&written, &path)?;
     Ok(settings)
+}
+
+/// Holds the notes on the Stuff board, newest first, as JSON.
+const STUFF: &str = "stuff.json";
+
+/// A note stuck on the Stuff board.
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct StuffNote {
+    /// When it was stuck, in milliseconds since 1970, made unique within the board, so
+    /// that a change made by one run of the app finds the same note in another's.
+    pub(crate) id: u64,
+    pub(crate) text: String,
+}
+
+/// The file as a whole, so that what is added to it later has a place beside the notes.
+#[derive(Default, Serialize, Deserialize)]
+#[serde(default)]
+struct StuffFile {
+    notes: Vec<StuffNote>,
+}
+
+/// A file that is missing or can't be read gives an empty board. One that can't be read
+/// is said, and left alone until the board changes.
+pub(crate) fn load_stuff() -> Vec<StuffNote> {
+    let Some(folder) = config_folder() else {
+        return Vec::new();
+    };
+    read_stuff(&folder.join(STUFF)).unwrap_or_else(|err| {
+        eprintln!("couldn't read the Stuff board: {err}");
+        Vec::new()
+    })
+}
+
+/// An error other than a missing file is passed on, so notes that couldn't be read
+/// aren't written over.
+fn read_stuff(path: &Path) -> std::io::Result<Vec<StuffNote>> {
+    match std::fs::read(path) {
+        Ok(json) => Ok(serde_json::from_slice::<StuffFile>(&json)?.notes),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(err) => Err(err),
+    }
+}
+
+/// Makes `change` to the notes kept in `folder`. Runs of the app changing them at once
+/// take turns under a lock, and the new file replaces the old one whole.
+pub(crate) fn change_stuff(
+    folder: &Path,
+    change: impl FnOnce(&mut Vec<StuffNote>),
+) -> std::io::Result<()> {
+    std::fs::create_dir_all(folder)?;
+    // Held until the new file is in place.
+    let lock = std::fs::File::create(folder.join(format!("{STUFF}.lock")))?;
+    lock.lock()?;
+    let path = folder.join(STUFF);
+    let mut notes = read_stuff(&path)?;
+    change(&mut notes);
+    let written = folder.join(format!("{STUFF}.new"));
+    // Laid out for reading, as notes are the user's own text.
+    std::fs::write(&written, serde_json::to_vec_pretty(&StuffFile { notes })?)?;
+    std::fs::rename(&written, &path)
 }
