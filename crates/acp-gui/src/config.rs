@@ -8,6 +8,8 @@ use acp_core::{Harness, Setting};
 use gpui_kit::*;
 use serde::{Deserialize, Serialize};
 
+use crate::session::{KeptContext, KeptFile, KeptPullRequest};
+
 /// A model the user starred: its agent's `kept_name` and its id. The agent goes by
 /// name, not index, so the star holds across runs that start the agents in another
 /// order, or start one of them by the `claude` or `codex` argument.
@@ -236,6 +238,16 @@ pub(crate) struct SavedSession {
     /// Missing from files written before titles came from the agent.
     #[serde(default)]
     pub(crate) title_source: TitleSource,
+    /// Its context window as last counted. Missing until the agent has counted, and
+    /// from files written before the info panel.
+    #[serde(default)]
+    pub(crate) context: Option<KeptContext>,
+    /// The pull requests it opened, as they stood when last checked.
+    #[serde(default)]
+    pub(crate) pull_requests: Vec<KeptPullRequest>,
+    /// The files its turns made.
+    #[serde(default)]
+    pub(crate) files: Vec<KeptFile>,
 }
 
 /// Where a session's title came from, which decides whether a title the agent sends

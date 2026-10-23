@@ -6,7 +6,8 @@ use std::process::ExitCode;
 use std::time::{Duration, SystemTime};
 
 use acp_core::{
-    Command, Event, PermissionRequest, RateLimitWindow, Receiver, SessionEvent, SessionKey,
+    Command, ContextUsage, Event, PermissionRequest, RateLimitWindow, Receiver, SessionEvent,
+    SessionKey,
 };
 
 /// The CLI talks to a single session.
@@ -68,6 +69,10 @@ fn main() -> ExitCode {
 /// Prints events until the agent is ready for the next prompt. `false` means it is gone.
 fn pump(events: &Receiver<Event>, lines: &mut impl Iterator<Item = io::Result<String>>) -> bool {
     let mut tools = HashMap::new();
+    // Claude's adapter counts again with each piece of a reply, so only the last count
+    // shows, as the turn ends.
+    let mut context = None;
+    let mut took = None;
     while let Ok(event) = events.recv_blocking() {
         match event {
             Event::Connected { agent } => println!("connected: {agent}"),
@@ -108,8 +113,18 @@ fn pump(events: &Receiver<Event>, lines: &mut impl Iterator<Item = io::Result<St
                     }
                 }
                 SessionEvent::Permission(request) => ask(request, lines),
+                SessionEvent::ContextUsage(usage) => context = Some(usage),
+                SessionEvent::TurnUsage(usage) => took = Some(usage),
                 SessionEvent::TurnEnded { stop_reason } => {
                     println!("\n[turn ended: {stop_reason}]");
+                    if let Some(usage) = took {
+                        let (input, cached, output) =
+                            (usage.input, usage.cached_read, usage.output);
+                        println!("[tokens: {input} in, {cached} cached, {output} out]");
+                    }
+                    if let Some(ContextUsage { used, size }) = context {
+                        println!("[context: {used} of {size} tokens]");
+                    }
                     return true;
                 }
                 SessionEvent::TurnFailed(message) => {
@@ -126,6 +141,8 @@ fn pump(events: &Receiver<Event>, lines: &mut impl Iterator<Item = io::Result<St
                 SessionEvent::Settings(_)
                 | SessionEvent::SettingChanged { .. }
                 | SessionEvent::SettingFailed { .. } => {}
+                // The CLI never asks what fills the context window.
+                SessionEvent::ContextReport(_) | SessionEvent::ContextReadable(_) => {}
             },
             Event::RateLimits(windows) => print_rate_limits(&windows),
             Event::Error(message) => eprintln!("\nerror: {message}"),

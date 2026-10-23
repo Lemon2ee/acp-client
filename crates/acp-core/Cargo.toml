@@ -5,7 +5,9 @@ edition.workspace = true
 publish.workspace = true
 
 [dependencies]
-agent-client-protocol.workspace = true
+# The tokens each turn took come in the prompt's answer, which ACP 3.4 still marks unstable.
+# Codex's adapter sends it, and has no other count of what a session used.
+agent-client-protocol = { workspace = true, features = ["unstable_end_turn_token_usage"] }
 chrono.workspace = true
 futures.workspace = true
 # Lets a front end keep settings between runs.
