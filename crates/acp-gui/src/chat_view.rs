@@ -824,15 +824,20 @@ impl ChatView {
 
     fn send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let text = self.input.read(cx).value().trim().to_string();
-        let session = &self.sessions[self.active];
-        if session.busy || text.is_empty() {
+        if self.sessions[self.active].busy || text.is_empty() {
             return;
         }
+        self.input.update(cx, |input, cx| input.clean(window, cx));
+        self.send_prompt(text, cx);
+    }
+
+    /// Sends `text` as the next prompt of the session on screen, which must take one:
+    /// what was typed in the prompt, or a Stuff card let go over the transcript.
+    fn send_prompt(&mut self, text: String, cx: &mut Context<Self>) {
         // A level picked just before goes first, so the prompt runs at it.
-        let key = session.key;
+        let key = self.sessions[self.active].key;
         self.send_held(key, cx);
         let session = &mut self.sessions[self.active];
-        self.input.update(cx, |input, cx| input.clean(window, cx));
         let first = session.title.is_none();
         session
             .title
@@ -1293,8 +1298,8 @@ impl Render for ChatView {
         // A row along the input box's bottom: the session's model and mode on the left,
         // the send/stop button on the right. Below the box, the plan usage of the
         // session's agent, where it says.
-        let composer = div()
-            .p_3()
+        let composer = self
+            .prompt_drop_zone(div().p_3(), window, cx)
             .when(usage_line.is_some(), |this| this.pb(USAGE_LINE_BOTTOM_PAD))
             .opacity(chat_shown)
             .child(
@@ -1302,13 +1307,10 @@ impl Render for ChatView {
                     .rounded_xl()
                     // The group brightens its border and rings itself while it has
                     // focus. An inset shadow draws its resting border instead, so the
-                    // box looks the same focused or not.
+                    // box looks the same focused or not, and it rings itself while a
+                    // Stuff card is over it.
                     .border_0()
-                    .shadow(vec![
-                        BoxShadow::new(px(0.), px(0.), input_border)
-                            .spread_radius(px(1.))
-                            .inset(),
-                    ])
+                    .shadow(self.prompt_edge(input_border, window, cx))
                     .focus_ring(false)
                     // With the 44px row below it, the box is 129px tall until the
                     // text needs more room, with the text at the top.
@@ -1372,13 +1374,19 @@ impl Render for ChatView {
                     .min_h(px(0.))
                     .flex()
                     .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(0.))
-                            .flex()
-                            .flex_col()
-                            .child(transcript.flex_1().min_h(px(0.)).opacity(chat_shown))
-                            .child(composer),
+                        // A Stuff card let go over the transcript is sent; the info panel
+                        // takes none.
+                        self.chat_drop_zone(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.))
+                                .flex()
+                                .flex_col()
+                                .child(transcript.flex_1().min_h(px(0.)).opacity(chat_shown))
+                                .child(composer),
+                            window,
+                            cx,
+                        ),
                     )
                     .child(panel),
             );
@@ -1420,7 +1428,7 @@ impl Render for ChatView {
                 cx.notify();
             }));
 
-        div()
+        let root = div()
             .size_full()
             .relative()
             .flex()
@@ -1475,7 +1483,9 @@ impl Render for ChatView {
             )
             .child(chat)
             .child(toggle)
-            .child(self.render_info_panel_button(cx).opacity(chat_shown))
+            .child(self.render_info_panel_button(cx).opacity(chat_shown));
+        self.take_stuff_drops(root, cx)
+            .children(self.render_card_drop(window, cx))
             .into_any_element()
     }
 }

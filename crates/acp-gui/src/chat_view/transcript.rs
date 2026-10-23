@@ -96,22 +96,23 @@ impl ChatView {
         let key = session.key;
         let row = div().w_full().px_4().py_1p5();
         match &session.rows[ix] {
-            Row::User(text) => row
-                .flex()
-                .justify_end()
-                .child(
-                    div()
-                        .max_w(relative(0.8))
-                        .px_3()
-                        .py_2()
-                        .rounded_lg()
-                        .bg(bubble)
-                        .child(
-                            SelectableText::new(row_id("user", key, ix), text.clone())
-                                .selection_color(selection),
-                        ),
-                )
-                .into_any_element(),
+            Row::User(text) => {
+                let bubble = div()
+                    .max_w(relative(0.8))
+                    .px_3()
+                    .py_2()
+                    .rounded_lg()
+                    .bg(bubble)
+                    .child(
+                        SelectableText::new(row_id("user", key, ix), text.clone())
+                            .selection_color(selection),
+                    );
+                // A Stuff card sent from the board fills its row in as it lands on it.
+                row.flex()
+                    .justify_end()
+                    .child(self.sent_bubble(key, ix, bubble, cx))
+                    .into_any_element()
+            }
             Row::Agent(view) => row
                 .child(TextView::new(view).selectable(true))
                 .into_any_element(),

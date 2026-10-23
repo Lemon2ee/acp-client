@@ -1,9 +1,13 @@
 //! The Stuff panel, the sidebar's other list: a note in front to write or paste anything
 //! into, and the board behind it that each finished note is stuck onto. It belongs to the
 //! window, not to a session, so switching sessions leaves the note and the board as they
-//! are. A stuck note flies onto the board and turns into its card on the way.
+//! are. A stuck note flies onto the board and turns into its card on the way, and a card
+//! can be dragged into the chat (see `drag`).
 
-use std::cell::Cell;
+mod drag;
+
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::ops::Range;
 use std::rc::Rc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -17,6 +21,7 @@ use gpui_kit::*;
 
 use crate::chat_view::ChatView;
 use crate::chat_view::pickers::{MenuLook, SURFACE_RADIUS};
+use crate::chat_view::stuff::drag::{DragState, StuffDrag, pick_up};
 use crate::config::{StuffNote, change_stuff, config_folder, load_stuff};
 
 /// The text of the note and the cards. Both wrap it at the sidebar's width less 40, so a
@@ -55,6 +60,9 @@ const TAPE_WIDTH: Pixels = px(32.);
 const TAPE_HEIGHT: Pixels = px(10.);
 const TAPE_RADIUS: Pixels = px(2.);
 const TAPE_DROP: Pixels = px(3.);
+/// The place a card in hand leaves on the board: a dashed edge at the text's color, 20%,
+/// with the tape still on it.
+const SLOT_EDGE_ALPHA: f32 = 0.2;
 /// The board's dots: 2px across, one every 12px.
 const DOT_SPACING: Pixels = px(12.);
 const DOT_SIZE: Pixels = px(2.);
@@ -80,6 +88,7 @@ pub(crate) struct StuffState {
     layout: Rc<StuffLayout>,
     /// Back at the top for each note stuck, where its card goes.
     board_scroll: ScrollHandle,
+    drag: DragState,
 }
 
 /// A note stuck onto the board, from where it was in front.
@@ -91,13 +100,13 @@ struct Sticking {
     started: Instant,
 }
 
-/// Where the panel and the note were last laid out, in the window, and how tall the card
-/// a note is flying to is: what the flight starts from and lands on.
+/// Where the panel, the note and each card were last laid out, in the window: what a
+/// note flying onto the board, or a card going back to it, starts from and lands on.
 #[derive(Default)]
 struct StuffLayout {
     panel: Cell<Bounds<Pixels>>,
     note: Cell<Bounds<Pixels>>,
-    card_height: Cell<Option<Pixels>>,
+    cards: RefCell<HashMap<u64, Bounds<Pixels>>>,
 }
 
 /// One frame of a note being stuck: how far along each part is, eased, 0 to 1.
@@ -139,6 +148,7 @@ impl StuffState {
             sticking: None,
             layout: Rc::default(),
             board_scroll: ScrollHandle::new(),
+            drag: DragState::default(),
         }
     }
 
@@ -209,7 +219,6 @@ impl ChatView {
             from: Bounds::new(from.origin - panel.origin, from.size),
             started: cx.background_executor().now(),
         });
-        layout.card_height.set(None);
         self.stuff.board_scroll.set_offset(Point::default());
         self.stuff.notes.insert(0, note.clone());
         self.stuff
@@ -363,23 +372,40 @@ impl ChatView {
 
     /// The board: the stuck notes as cards, newest at the top, scrolling under the note.
     /// The card a note is flying to grows its place from nothing, pushing the others
-    /// down, and shows once the note lands on it.
+    /// down, and shows once the note lands on it. A card can be picked up and dragged
+    /// into the chat, leaving its place behind.
     fn render_board(&self, frame: Option<StickFrame>, cx: &mut Context<Self>) -> Stateful<Div> {
         let look = CardLook::new(cx);
         let muted = cx.theme().muted_foreground;
+        let view = cx.entity().downgrade();
         let cards = self.stuff.notes.iter().map(|note| {
-            let Some(frame) = frame.filter(|frame| frame.id == note.id) else {
-                return look.card(note, look.shadow.clone(), 1.).into_any_element();
-            };
-            let height = self.stuff.layout.card_height.get().unwrap_or_default();
+            let id = note.id;
             let layout = self.stuff.layout.clone();
-            let shadow = mix_shadows(&flattened(&look.shadow), &look.shadow, frame.settled);
+            let flying = frame.filter(|frame| frame.id == id);
+            let (shadow, taped) = match flying {
+                Some(frame) => (
+                    mix_shadows(&flattened(&look.shadow), &look.shadow, frame.settled),
+                    frame.taped,
+                ),
+                None => (look.shadow.clone(), 1.),
+            };
             let card = look
-                .card(note, shadow, frame.taped)
+                .card(note, shadow, taped, self.stuff.drag.hollow(id, cx))
                 .child(measure(move |bounds| {
-                    layout.card_height.set(Some(bounds.size.height))
+                    layout.cards.borrow_mut().insert(id, bounds);
                 }))
-                .when(!frame.landed, |card| card.opacity(0.));
+                .on_drag(StuffDrag::new(id), pick_up(view.clone()));
+            let Some(frame) = flying else {
+                return card.into_any_element();
+            };
+            let height = self
+                .stuff
+                .layout
+                .cards
+                .borrow()
+                .get(&id)
+                .map_or(px(0.), |card| card.size.height);
+            let card = card.when(!frame.landed, |card| card.opacity(0.));
             // Less the gap after it while it has no height, so the cards below move
             // only as it grows.
             div()
@@ -443,7 +469,11 @@ impl ChatView {
             ),
             size(
                 from.size.width - inset * 2.,
-                layout.card_height.get().unwrap_or(from.size.height),
+                layout
+                    .cards
+                    .borrow()
+                    .get(&frame.id)
+                    .map_or(from.size.height, |card| card.size.height),
             ),
         );
         let bounds = from.interpolate(&to, frame.moved);
@@ -508,6 +538,8 @@ struct CardLook {
     background: Hsla,
     tape: Hsla,
     link_line: Hsla,
+    /// The dashed edge of the place a card in hand leaves.
+    slot_edge: Hsla,
     /// At rest on the board.
     shadow: Vec<BoxShadow>,
 }
@@ -533,24 +565,38 @@ impl CardLook {
             background,
             tape,
             link_line,
+            slot_edge: theme.foreground.opacity(SLOT_EDGE_ALPHA),
             shadow: card_shadow(dark),
         }
     }
 
-    /// A card, with `shadow`, its tape `taped` of the way down onto it.
-    fn card(&self, note: &StuffNote, shadow: Vec<BoxShadow>, taped: f32) -> Stateful<Div> {
+    /// A card, with `shadow`, its tape `taped` of the way down onto it. While it is
+    /// `hollow`, it is only its place: a dashed edge and the tape.
+    fn card(
+        &self,
+        note: &StuffNote,
+        shadow: Vec<BoxShadow>,
+        taped: f32,
+        hollow: f32,
+    ) -> Stateful<Div> {
         div()
             .id(("stuff-card", note.id))
             .relative()
             .flex_none()
             .p(CARD_PAD)
             .rounded(CARD_RADIUS)
-            .bg(self.background)
-            .shadow(shadow)
+            .bg(self.background.opacity(1. - hollow))
+            .shadow(dimmed(&shadow, 1. - hollow))
             .text_size(TEXT_SIZE)
             .line_height(LINE_HEIGHT)
             .child(self.tape(taped))
-            .child(card_text(note, self.link_line))
+            .child(
+                card_text(note, self.link_line).when(hollow > 0., |text| text.opacity(1. - hollow)),
+            )
+            // Over the card rather than its own border, which would move its content.
+            .when(hollow > 0., |card| {
+                card.child(dashed_edge(self.slot_edge.opacity(hollow)).rounded(CARD_RADIUS))
+            })
     }
 
     /// The strip of tape across a card's top edge, half above it, `dropped` of the way
@@ -587,6 +633,27 @@ fn flattened(shadow: &[BoxShadow]) -> Vec<BoxShadow> {
             } else {
                 layer.clone()
             }
+        })
+        .collect()
+}
+
+/// A dashed edge just inside its parent, in `color`.
+fn dashed_edge(color: Hsla) -> Div {
+    div()
+        .absolute()
+        .inset_0()
+        .border_1()
+        .border_dashed()
+        .border_color(color)
+}
+
+/// `shadow` with each layer `by` as strong.
+fn dimmed(shadow: &[BoxShadow], by: f32) -> Vec<BoxShadow> {
+    shadow
+        .iter()
+        .map(|layer| BoxShadow {
+            color: layer.color.opacity(by),
+            ..layer.clone()
         })
         .collect()
 }
