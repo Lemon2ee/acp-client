@@ -47,6 +47,8 @@ const EDGE_PUSH: f32 = 600.;
 pub(crate) struct TranscriptScroll {
     /// In tail mode: it follows the end until the user scrolls away from it, and again
     /// once they are back at it. In normal mode with `ACP_GUI_DEBUG=no-follow`.
+    /// The list element borrows it while it lays out the rows, so nothing a row draws may
+    /// read it: that panics with "already mutably borrowed".
     list: ListState,
     /// How far a finger has pushed it past an end, read and written by the wheel.
     edge_push: Rc<Cell<EdgePush>>,
@@ -267,6 +269,9 @@ impl ChatView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
+        // Before the list lays out its rows, which holds its state all the while: a row
+        // that read it, as `card_with_keys` does, would panic.
+        let keyed = self.card_with_keys(window, cx);
         let theme = cx.theme();
         let radius = theme.radius_full();
         let colors = theme.semantic_tokens().colors;
@@ -308,7 +313,7 @@ impl ChatView {
                         row.pb_8()
                     }
                 })
-                .child(this.render_row(ix, window, cx))
+                .child(this.render_row(ix, keyed, window, cx))
                 .into_any_element()
         });
         let rows = list(state.clone(), render_row).size_full().min_h_0();
