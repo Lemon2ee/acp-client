@@ -469,7 +469,8 @@ impl Session {
             // Nothing in the window shows these yet.
             SessionEvent::ContextUsage(_)
             | SessionEvent::TurnUsage(_)
-            | SessionEvent::ContextReport(_) => {}
+            | SessionEvent::ContextReport(_)
+            | SessionEvent::ContextReadable(_) => {}
         }
     }
 
@@ -701,6 +702,7 @@ fn in_transcript(event: &SessionEvent) -> bool {
             | SessionEvent::ContextUsage(_)
             | SessionEvent::TurnUsage(_)
             | SessionEvent::ContextReport(_)
+            | SessionEvent::ContextReadable(_)
     )
 }
 

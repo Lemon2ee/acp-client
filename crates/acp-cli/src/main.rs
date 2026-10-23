@@ -141,8 +141,8 @@ fn pump(events: &Receiver<Event>, lines: &mut impl Iterator<Item = io::Result<St
                 SessionEvent::Settings(_)
                 | SessionEvent::SettingChanged { .. }
                 | SessionEvent::SettingFailed { .. } => {}
-                // The CLI never asks for one.
-                SessionEvent::ContextReport(_) => {}
+                // The CLI never asks what fills the context window.
+                SessionEvent::ContextReport(_) | SessionEvent::ContextReadable(_) => {}
             },
             Event::RateLimits(windows) => print_rate_limits(&windows),
             Event::Error(message) => eprintln!("\nerror: {message}"),

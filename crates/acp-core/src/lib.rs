@@ -165,6 +165,10 @@ pub enum SessionEvent {
     /// `None` when the agent offers no `/context` command, or its answer failed or was
     /// stopped by a prompt.
     ContextReport(Option<String>),
+    /// Whether `ReadContext` can say what fills the window: the agent's list of the
+    /// session's commands has `/context` in it. Comes when that changes, and the agent
+    /// can send a new list at any time; until one comes, it can't.
+    ContextReadable(bool),
     /// The agent refused a `ChangeSetting`, or hadn't answered it by the time a prompt
     /// stopped waiting; the setting keeps its value.
     SettingFailed {
@@ -504,7 +508,9 @@ impl SessionEvents {
         let offers = commands
             .iter()
             .any(|command| command.name == CONTEXT_COMMAND);
-        self.offers_context.store(offers, Ordering::Relaxed);
+        if self.offers_context.swap(offers, Ordering::Relaxed) != offers {
+            self.emit(SessionEvent::ContextReadable(offers));
+        }
     }
 
     fn offers_context(&self) -> bool {
