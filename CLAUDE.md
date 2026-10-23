@@ -22,7 +22,7 @@ clearly needs splitting. acp-gui is split by what each part keeps or draws:
 | File in `crates/acp-gui/src/` | Holds |
 | --- | --- |
 | `main.rs` | Starting the app: the agents to run, the window, key bindings, actions, the extra icons, profiling. |
-| `config.rs` | What is kept on disk between runs: `AppSettings`, the starred models, each agent's last settings, the kept sessions. |
+| `config.rs` | What is kept on disk between runs: `AppSettings`, the starred models, each agent's last settings, the kept sessions, the Stuff board's notes. |
 | `debug.rs` | `ACP_GUI_DEBUG`: switches that turn a live reply's effects off one by one, and a log of each transcript frame. |
 | `hotkey.rs` | The system-wide shortcut that brings the window to the front: what it can't be, holding it with macOS through Carbon, and what a press does. |
 | `launch.rs` | What an app opened from Finder lacks (macOS only): PATH from the user's login shell, so `npx` is found, and the home folder instead of `/` for new sessions. |
@@ -38,7 +38,8 @@ clearly needs splitting. acp-gui is split by what each part keeps or draws:
 | `chat_view/transcript.rs` | How each row of a transcript is drawn. |
 | `chat_view/tool_call.rs` | A tool call's row (icon, title, state, time) and the box it opens to; calls in a row grouped under one header that folds them; the permission card in a call's place, with its keys. |
 | `chat_view/scroller.rs` | The transcript's list: following its newest text, the button back to the newest, and how far a finger may push it past either end. |
-| `chat_view/sidebar.rs` | The session cards, renaming, the delete prompt, the Archived list, the draggable edge. |
+| `chat_view/sidebar.rs` | The Sessions and Stuff tabs, the session cards, renaming, the delete prompt, the Archived list, the draggable edge. |
+| `chat_view/stuff.rs` | The Stuff list: the note in front to write into, and the board of notes stuck from it, the same for every session. |
 | `chat_view/info_panel.rs` | The session info panel at the chat's right, under the title row: its button, the draggable edge, and the Context window section with its bar and categories. |
 | `chat_view/info_panel/pull_requests.rs` | The panel's Pull requests section, when it asks `gh`, and a file's diff in the panel's place. |
 | `chat_view/info_panel/files.rs` | The panel's Files section, and starting and stopping each turn's watch of the session's folder. |
