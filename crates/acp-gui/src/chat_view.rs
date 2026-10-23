@@ -1468,7 +1468,7 @@ impl Render for ChatView {
                     .overflow_hidden()
                     .bg(sidebar)
                     .child(
-                        self.render_sidebar(title_bar, cx)
+                        self.render_sidebar(title_bar, window, cx)
                             .ml(sidebar_width - self.sidebar.width)
                             .opacity(chat_shown),
                     ),

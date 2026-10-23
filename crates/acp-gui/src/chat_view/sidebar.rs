@@ -252,7 +252,12 @@ impl ChatView {
             .into_any_element()
     }
 
-    pub(crate) fn render_sidebar(&self, title_bar: bool, cx: &mut Context<Self>) -> Div {
+    pub(crate) fn render_sidebar(
+        &self,
+        title_bar: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Div {
         let theme = cx.theme();
         let (foreground, hover, muted) = (
             theme.sidebar_foreground,
@@ -395,7 +400,7 @@ impl ChatView {
                         .child(self.settings_row(cx)),
                 ),
                 SidebarTab::Stuff => sidebar
-                    .child(self.render_stuff(cx))
+                    .child(self.render_stuff(window, cx))
                     .child(div().flex_none().p_2().child(self.settings_row(cx))),
             })
     }
