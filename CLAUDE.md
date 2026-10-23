@@ -40,6 +40,7 @@ clearly needs splitting. acp-gui is split by what each part keeps or draws:
 | `chat_view/scroller.rs` | The transcript's list: following its newest text, the button back to the newest, and how far a finger may push it past either end. |
 | `chat_view/sidebar.rs` | The Sessions and Stuff tabs, the session cards, renaming, the delete prompt, the Archived list, the draggable edge. |
 | `chat_view/stuff.rs` | The Stuff list: the note in front to write into, and the board of notes stuck from it, the same for every session. |
+| `chat_view/stuff/drag.rs` | A card dragged into the chat: into the prompt, sent from the transcript (into the prompt while the agent replies) or back; the zones it lights and its way there. |
 | `chat_view/info_panel.rs` | The session info panel at the chat's right, under the title row: its button, the draggable edge, and the Context window section with its bar and categories. |
 | `chat_view/info_panel/pull_requests.rs` | The panel's Pull requests section, when it asks `gh`, and a file's diff in the panel's place. |
 | `chat_view/info_panel/files.rs` | The panel's Files section, and starting and stopping each turn's watch of the session's folder. |
