@@ -202,6 +202,11 @@ impl Session {
         self.live
     }
 
+    /// The session has had a prompt, here or in the transcript loaded for it.
+    pub(crate) fn prompted(&self) -> bool {
+        self.rows.iter().any(|row| matches!(row, Row::User { .. }))
+    }
+
     /// Waiting on the agent in a live turn: nothing has come since the prompt, or since
     /// the last tool call finished.
     pub(crate) fn waiting(&self) -> bool {
