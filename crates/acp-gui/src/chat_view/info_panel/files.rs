@@ -12,8 +12,8 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::{
-    LINE_HEIGHT, PanelLook, ROW_GAP, ROW_PAD, ROW_RADIUS, TEXT_LINE_HEIGHT, TEXT_SIZE, day_or_time,
-    local, section_header,
+    EMPTY_INDENT, LINE_HEIGHT, PanelLook, ROW_GAP, ROW_PAD, ROW_RADIUS, TEXT_LINE_HEIGHT,
+    TEXT_SIZE, day_or_time, local, section_header,
 };
 use crate::chat_view::ChatView;
 use crate::session::{FileKind, MadeFile, Session, watch, watched};
@@ -25,8 +25,6 @@ const ICON_SIZE: Pixels = px(14.);
 const NAME_SIZE: Pixels = px(13.);
 /// A file's second line starts under its name, past its icon.
 const LINE_INDENT: Pixels = px(22.);
-/// "None yet" lines up with the section's name, past its chevron.
-const EMPTY_INDENT: Pixels = px(24.);
 
 impl ChatView {
     /// Watches the session's folder for the files its turn makes, from its prompt on.
