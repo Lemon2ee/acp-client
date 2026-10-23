@@ -22,7 +22,7 @@ use gpui_kit::component::text::{TextViewMotion, TextViewState};
 use gpui_kit::*;
 
 use crate::chat_view::scroller::TranscriptScroll;
-use crate::config::TitleSource;
+use crate::config::{StuffAttachment, TitleSource};
 use crate::debug::switches;
 pub(crate) use context::{
     Category, CategoryKind, ContextReport, KeptContext, SessionContext, now, short_tokens,
@@ -40,7 +40,11 @@ pub(crate) use tool_call::{Answer, Ask, Code, Diff, DiffLine, Shown, ToolCall, f
 const STREAM_FADE_STAGGER: Duration = Duration::from_millis(10);
 
 pub(crate) enum Row {
-    User(String),
+    /// A prompt, with the images and files that went with it from Stuff notes.
+    User {
+        text: String,
+        attachments: Vec<StuffAttachment>,
+    },
     /// Markdown, grown chunk by chunk as the agent streams.
     Agent(Entity<TextViewState>),
     Thought(Entity<TextViewState>),
@@ -57,7 +61,8 @@ pub(crate) struct Session {
     /// ACP has no way to carry one over to another agent.
     pub(crate) agent: usize,
     /// Shown on the session's card and above its transcript: the first line of the first
-    /// prompt, until the agent sends a title for the session or the user renames it.
+    /// prompt, or the name of the first thing sent with it if it had no text, until the
+    /// agent sends a title for the session or the user renames it.
     pub(crate) title: Option<String>,
     pub(crate) title_source: TitleSource,
     pub(crate) rows: Vec<Row>,
@@ -68,6 +73,9 @@ pub(crate) struct Session {
     pub(crate) busy: bool,
     /// Text typed here but not sent, kept while another session is on screen.
     pub(crate) draft: SharedString,
+    /// The images and files from Stuff notes let go on the prompt, sent with its text.
+    /// Kept here whether the session is on screen or not.
+    pub(crate) attachments: Vec<StuffAttachment>,
     /// What the agent lets the user choose for this session, such as its model; none
     /// until the agent has created it.
     pub(crate) settings: Vec<Setting>,
@@ -152,6 +160,7 @@ impl Session {
             scroller: cx.new(|_| TranscriptScroll::new()),
             busy: false,
             draft: SharedString::default(),
+            attachments: Vec::new(),
             settings: Vec::new(),
             created: false,
             asked: HashMap::new(),
@@ -198,7 +207,7 @@ impl Session {
     pub(crate) fn waiting(&self) -> bool {
         self.live
             && match self.rows.last() {
-                Some(Row::User(_)) => true,
+                Some(Row::User { .. }) => true,
                 Some(Row::Tool(call)) => call.status.finished(),
                 _ => false,
             }
@@ -524,7 +533,7 @@ impl Session {
     /// The first line shows already and reads better.
     fn echoes_prompt(&self, title: &str) -> bool {
         let prompt = self.rows.iter().find_map(|row| match row {
-            Row::User(text) => Some(text),
+            Row::User { text, .. } => Some(text),
             _ => None,
         });
         prompt.is_some_and(|prompt| echoes(prompt, title))
@@ -687,8 +696,14 @@ impl Session {
     /// loads, each part of a message after the one before.
     fn append_user_text(&mut self, text: &str, cx: &mut App) {
         match self.rows.last_mut() {
-            Some(Row::User(message)) => message.push_str(text),
-            _ => return self.push(Row::User(text.to_string()), cx),
+            Some(Row::User { text: message, .. }) => message.push_str(text),
+            _ => {
+                let row = Row::User {
+                    text: text.to_string(),
+                    attachments: Vec::new(),
+                };
+                return self.push(row, cx);
+            }
         }
         self.remeasure(self.rows.len() - 1, cx);
     }

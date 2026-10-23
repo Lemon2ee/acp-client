@@ -7,6 +7,7 @@ mod pickers;
 pub(crate) mod scroller;
 mod settings_page;
 mod sidebar;
+mod stuff;
 mod tool_call;
 mod transcript;
 mod usage_line;
@@ -15,8 +16,8 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use acp_core::{
-    AcpAgent, Command, Event as AgentEvent, RateLimitWindow, Sender, SessionEvent, SessionKey,
-    Setting, SettingKind, SettingValue,
+    AcpAgent, Command, Event as AgentEvent, Prompt, RateLimitWindow, Sender, SessionEvent,
+    SessionKey, Setting, SettingKind, SettingValue,
 };
 use gpui_kit::base::input::Copy;
 use gpui_kit::base::{TextSelection, Transition, transition};
@@ -36,14 +37,15 @@ use crate::chat_view::pickers::effort::EffortMeter;
 use crate::chat_view::pickers::model_panel::ModelPanelState;
 use crate::chat_view::settings_page::SettingsPageState;
 use crate::chat_view::sidebar::{ResizeSidebar, SidebarState};
+use crate::chat_view::stuff::{StuffState, TilesOn};
 use crate::chat_view::usage_line::{USAGE_LINE_BOTTOM_PAD, UsageLineState};
 use crate::chrome::{
     BLURRED_CHAT_ALPHA, BLURRED_SIDEBAR_ALPHA, OWN_TITLE_BAR, WINDOW_BLUR, apply_appearance,
     as_title_bar, window_background,
 };
 use crate::config::{
-    AppSettings, SavedSession, change_saved_sessions, config_folder, kept_name, load_last_settings,
-    load_saved_sessions, save_last_settings,
+    AppSettings, SavedSession, StuffAttachment, change_saved_sessions, config_folder, kept_name,
+    load_last_settings, load_saved_sessions, save_last_settings,
 };
 use crate::hotkey::{self, GlobalShortcut};
 use crate::session::{Held, Origin, Row, Session, SessionFiles, SessionPullRequests};
@@ -53,6 +55,9 @@ const PACE_TICK: Duration = Duration::from_millis(16);
 /// How long a held setting waits after its last change before it goes to the agent (see
 /// `ChatView::hold_setting`).
 const HOLD_PAUSE: Duration = Duration::from_millis(450);
+/// The tiles on the prompt sit 12px in from the box's sides and top, where its text is
+/// 17px in.
+const PROMPT_TILES_PAD: Pixels = px(12.);
 
 /// One agent the window drives, and what it keeps ready on it.
 struct AgentSlot {
@@ -109,6 +114,8 @@ pub(crate) struct ChatView {
     blurred: bool,
     sidebar: SidebarState,
     info_panel: InfoPanelState,
+    /// The sidebar's note and board, the same whichever session is on screen.
+    stuff: StuffState,
     model_panel: ModelPanelState,
     /// The light and the focus of the menu below the prompt that is open.
     menu_nav: MenuNav,
@@ -287,6 +294,7 @@ impl ChatView {
             blurred: blur,
             sidebar: SidebarState::default(),
             info_panel: InfoPanelState::default(),
+            stuff: StuffState::new(window, cx),
             model_panel: ModelPanelState::new(window, cx),
             menu_nav: MenuNav::new(cx),
             effort: EffortMeter::new(cx),
@@ -512,8 +520,10 @@ impl ChatView {
             Some(ix) => {
                 // ACP can't move a session to another agent, so it goes. Text typed in
                 // it while another session was on screen goes with the one taking its
-                // place; on screen, that text is still in the input.
+                // place, as do the tiles on its prompt; on screen, that text is still in
+                // the input.
                 session.draft = std::mem::take(&mut self.sessions[ix].draft);
+                session.attachments = std::mem::take(&mut self.sessions[ix].attachments);
                 let old = std::mem::replace(&mut self.sessions[ix], session);
                 let _ = self.agents[old.agent]
                     .commands
@@ -727,6 +737,7 @@ impl ChatView {
         fresh.files = SessionFiles::restore(&session.files.kept());
         let old = std::mem::replace(&mut self.sessions[ix], fresh);
         self.sessions[ix].draft = old.draft;
+        self.sessions[ix].attachments = old.attachments;
         let _ = self.agents[old.agent]
             .commands
             .try_send(Command::CloseSession(old.key));
@@ -819,28 +830,51 @@ impl ChatView {
 
     fn send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let text = self.input.read(cx).value().trim().to_string();
-        let session = &self.sessions[self.active];
-        if session.busy || text.is_empty() {
+        let session = &mut self.sessions[self.active];
+        if session.busy || text.is_empty() && session.attachments.is_empty() {
             return;
         }
+        let attachments = std::mem::take(&mut session.attachments);
+        self.input.update(cx, |input, cx| input.clean(window, cx));
+        self.send_prompt(text, attachments, cx);
+    }
+
+    /// Sends `text`, with `attachments`, as the next prompt of the session on screen,
+    /// which must take one: what is in the prompt, or a Stuff card let go over the
+    /// transcript.
+    fn send_prompt(
+        &mut self,
+        text: String,
+        attachments: Vec<StuffAttachment>,
+        cx: &mut Context<Self>,
+    ) {
         // A level picked just before goes first, so the prompt runs at it.
-        let key = session.key;
+        let key = self.sessions[self.active].key;
         self.send_held(key, cx);
         let session = &mut self.sessions[self.active];
-        self.input.update(cx, |input, cx| input.clean(window, cx));
         let first = session.title.is_none();
         session
             .title
-            .get_or_insert_with(|| text.lines().next().unwrap_or_default().to_string());
+            .get_or_insert_with(|| match text.lines().next() {
+                Some(line) => line.to_string(),
+                None => attachments
+                    .first()
+                    .map(StuffAttachment::name)
+                    .unwrap_or_default(),
+            });
         session.busy = true;
         // What fills the window changes with the turn.
         session.context.fresh = false;
-        session.push(Row::User(text.clone()), cx);
+        let prompt = Prompt {
+            text: text.clone(),
+            attachments: attachments.iter().map(Into::into).collect(),
+        };
+        session.push(Row::User { text, attachments }, cx);
         // Live from after the prompt's own row, which shows at once as it was typed here.
         session.set_live(true, cx);
         let key = session.key;
         // Has the agent create the session first, if it hasn't yet.
-        let prompt = Command::Prompt(key, text);
+        let prompt = Command::Prompt(key, prompt);
         let _ = self.agents[session.agent].commands.try_send(prompt);
         self.watch_files(key, cx);
         // Runs once the turn is over, while the panel shows the window.
@@ -1261,6 +1295,23 @@ impl Render for ChatView {
                 .map(|setting| self.render_mode_picker(session.key, setting, cx)),
         ];
         let usage_line = self.render_usage_line(session, &shown, cx);
+        // What Stuff cards let go on the prompt brought besides their text, above the text.
+        let tiles = (!session.attachments.is_empty()).then(|| {
+            InputGroupAddon::new("prompt-attachments")
+                .align(InputGroupAddonAlignment::BlockStart)
+                .px(PROMPT_TILES_PAD)
+                .pt(PROMPT_TILES_PAD)
+                .pb_0()
+                // Not the addon's muted, medium text and text caret: these are tiles.
+                .text_color(foreground)
+                .font_weight(FontWeight::NORMAL)
+                .cursor_default()
+                .child(
+                    self.removable_tiles(TilesOn::Prompt, window, cx)
+                        .flex_1()
+                        .min_w_0(),
+                )
+        });
         let action = if session.busy {
             InputGroupButton::new("stop")
                 .icon(IconName::Square)
@@ -1288,8 +1339,8 @@ impl Render for ChatView {
         // A row along the input box's bottom: the session's model and mode on the left,
         // the send/stop button on the right. Below the box, the plan usage of the
         // session's agent, where it says.
-        let composer = div()
-            .p_3()
+        let composer = self
+            .prompt_drop_zone(div().p_3(), window, cx)
             .when(usage_line.is_some(), |this| this.pb(USAGE_LINE_BOTTOM_PAD))
             .opacity(chat_shown)
             .child(
@@ -1297,14 +1348,12 @@ impl Render for ChatView {
                     .rounded_xl()
                     // The group brightens its border and rings itself while it has
                     // focus. An inset shadow draws its resting border instead, so the
-                    // box looks the same focused or not.
+                    // box looks the same focused or not, and it rings itself while a
+                    // Stuff card is over it.
                     .border_0()
-                    .shadow(vec![
-                        BoxShadow::new(px(0.), px(0.), input_border)
-                            .spread_radius(px(1.))
-                            .inset(),
-                    ])
+                    .shadow(self.prompt_edge(input_border, window, cx))
                     .focus_ring(false)
+                    .when_some(tiles, |group, tiles| group.addon(tiles))
                     // With the 44px row below it, the box is 129px tall until the
                     // text needs more room, with the text at the top.
                     .input(
@@ -1367,13 +1416,19 @@ impl Render for ChatView {
                     .min_h(px(0.))
                     .flex()
                     .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(0.))
-                            .flex()
-                            .flex_col()
-                            .child(transcript.flex_1().min_h(px(0.)).opacity(chat_shown))
-                            .child(composer),
+                        // A Stuff card let go over the transcript is sent; the info panel
+                        // takes none.
+                        self.chat_drop_zone(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.))
+                                .flex()
+                                .flex_col()
+                                .child(transcript.flex_1().min_h(px(0.)).opacity(chat_shown))
+                                .child(composer),
+                            window,
+                            cx,
+                        ),
                     )
                     .child(panel),
             );
@@ -1415,7 +1470,7 @@ impl Render for ChatView {
                 cx.notify();
             }));
 
-        div()
+        let root = div()
             .size_full()
             .relative()
             .flex()
@@ -1463,14 +1518,16 @@ impl Render for ChatView {
                     .overflow_hidden()
                     .bg(sidebar)
                     .child(
-                        self.render_sidebar(title_bar, cx)
+                        self.render_sidebar(title_bar, window, cx)
                             .ml(sidebar_width - self.sidebar.width)
                             .opacity(chat_shown),
                     ),
             )
             .child(chat)
             .child(toggle)
-            .child(self.render_info_panel_button(cx).opacity(chat_shown))
+            .child(self.render_info_panel_button(cx).opacity(chat_shown));
+        self.take_stuff_drops(root, cx)
+            .children(self.render_card_drop(window, cx))
             .into_any_element()
     }
 }

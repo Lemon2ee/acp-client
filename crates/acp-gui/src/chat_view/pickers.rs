@@ -54,8 +54,10 @@ const PANEL_HEIGHT: Pixels = px(380.);
 const EFFORT_MENU_WIDTH: Pixels = px(196.);
 /// How round the panel and the menus are, and the rows and tabs in them. The rows
 /// sit 4px in from the edge, so their corners follow the surface's.
-const SURFACE_RADIUS: Pixels = px(10.);
+pub(crate) const SURFACE_RADIUS: Pixels = px(10.);
 const ROW_RADIUS: Pixels = px(6.);
+/// How strong the hairline just inside the surface's edge is in dark mode.
+const EDGE_ALPHA: f32 = 0.07;
 const SURFACE_PADDING: Pixels = px(4.);
 /// How far above its button the panel or a menu opens.
 const MENU_OFFSET: Pixels = px(6.);
@@ -85,7 +87,7 @@ const MODEL_ROW_GROUP: &str = "model-panel-row";
 #[derive(Clone, Copy)]
 pub(crate) struct MenuLook {
     dark: bool,
-    surface: Hsla,
+    pub(crate) surface: Hsla,
     /// Behind the panel's column of tabs.
     rail: Hsla,
     /// Between the panel's search box, its list and its switches.
@@ -171,6 +173,21 @@ impl MenuLook {
         ]
     }
 
+    /// The surface's shadow with its dark mode edge as one more, inset, for a copy of the
+    /// surface that turns into something else as it moves: the Stuff note flying onto
+    /// the board, whose cards draw their edge the same way.
+    pub(crate) fn shadow_with_edge(&self) -> Vec<BoxShadow> {
+        let mut shadow = self.shadow();
+        if self.dark {
+            shadow.push(
+                BoxShadow::new(px(0.), px(0.), white().opacity(EDGE_ALPHA))
+                    .spread_radius(px(1.))
+                    .inset(),
+            );
+        }
+        shadow
+    }
+
     /// The surface of the panel or a menu, rounded and lifted off the window.
     pub(crate) fn surface(&self) -> Div {
         div()
@@ -192,7 +209,7 @@ impl MenuLook {
                 .inset_0()
                 .rounded(SURFACE_RADIUS)
                 .border_1()
-                .border_color(white().opacity(0.07))
+                .border_color(white().opacity(EDGE_ALPHA))
         })
     }
 

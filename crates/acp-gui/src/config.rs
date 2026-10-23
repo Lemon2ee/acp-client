@@ -1,5 +1,6 @@
 //! What the app keeps on disk between runs: its settings, the models the user starred,
-//! the settings each agent last created a session with, and the sessions kept for later.
+//! the settings each agent last created a session with, the sessions kept for later, and
+//! the notes on the Stuff board with the images pasted into them.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -344,4 +345,175 @@ fn change_settings(
     std::fs::write(&written, serde_json::to_vec_pretty(&settings)?)?;
     std::fs::rename(&written, &path)?;
     Ok(settings)
+}
+
+/// Holds the notes on the Stuff board, newest first, as JSON.
+const STUFF: &str = "stuff.json";
+
+/// A note stuck on the Stuff board.
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct StuffNote {
+    /// When it was stuck, in milliseconds since 1970, made unique within the board, so
+    /// that a change made by one run of the app finds the same note in another's.
+    pub(crate) id: u64,
+    pub(crate) text: String,
+    /// What was pasted into it besides text, in the order pasted. Written only when there
+    /// is something, so a note of text alone reads as before.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) attachments: Vec<StuffAttachment>,
+}
+
+/// An image or a file pasted into a note. A file copied in Finder is kept where it is, by
+/// its path; an image pasted as data has been saved in `STUFF_FILES` first.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub(crate) enum StuffAttachment {
+    /// Shown as a picture.
+    Image { path: PathBuf, mime: String },
+    /// Shown by its name and size. A folder has no size.
+    File { path: PathBuf, size: Option<u64> },
+}
+
+impl StuffAttachment {
+    /// A file copied in Finder: a picture if its name says it is a PNG, JPEG, GIF or WebP,
+    /// the kinds both gpui and the agents' models take, and any other file by its size.
+    pub(crate) fn copied(path: &Path) -> Self {
+        let extension = path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map(str::to_ascii_lowercase);
+        let mime = match extension.as_deref() {
+            Some("png") => Some("image/png"),
+            Some("jpg" | "jpeg") => Some("image/jpeg"),
+            Some("gif") => Some("image/gif"),
+            Some("webp") => Some("image/webp"),
+            _ => None,
+        };
+        let metadata = std::fs::metadata(path).ok();
+        match mime {
+            Some(mime) if metadata.as_ref().is_some_and(|metadata| metadata.is_file()) => {
+                Self::Image {
+                    path: path.to_path_buf(),
+                    mime: mime.to_string(),
+                }
+            }
+            _ => Self::File {
+                path: path.to_path_buf(),
+                size: metadata
+                    .filter(|metadata| !metadata.is_dir())
+                    .map(|metadata| metadata.len()),
+            },
+        }
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        match self {
+            Self::Image { path, .. } | Self::File { path, .. } => path,
+        }
+    }
+
+    /// The file's own name, or for a pasted image, which has only the name it was saved
+    /// under, what it is.
+    pub(crate) fn name(&self) -> String {
+        if pasted_here(self.path()) {
+            return "Pasted image".to_string();
+        }
+        self.path().file_name().map_or_else(
+            || self.path().display().to_string(),
+            |name| name.to_string_lossy().into_owned(),
+        )
+    }
+}
+
+/// Holds the images pasted into notes as data, each in a file of its own.
+const STUFF_FILES: &str = "stuff";
+
+/// Saves an image pasted as data under a name of its own: the time, moved on while a file
+/// already has it.
+pub(crate) fn save_pasted_image(image: &Image) -> std::io::Result<StuffAttachment> {
+    let folder = config_folder()
+        .ok_or_else(|| std::io::Error::other("there is no config folder"))?
+        .join(STUFF_FILES);
+    std::fs::create_dir_all(&folder)?;
+    let mut name = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |time| time.as_millis());
+    loop {
+        let path = folder.join(format!("{name}.{}", image.format.extension()));
+        match std::fs::File::create_new(&path) {
+            Ok(mut file) => {
+                std::io::Write::write_all(&mut file, &image.bytes)?;
+                return Ok(StuffAttachment::Image {
+                    path,
+                    mime: image.format.mime_type().to_string(),
+                });
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => name += 1,
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+/// Whether `path` is an image saved by `save_pasted_image`, which the app may remove.
+fn pasted_here(path: &Path) -> bool {
+    config_folder().is_some_and(|folder| path.starts_with(folder.join(STUFF_FILES)))
+}
+
+/// Removes the file of an attachment taken off a note before it was stuck, if it is an
+/// image the app saved. A file copied in Finder is the user's, and is left alone.
+pub(crate) fn forget_attachment(attachment: &StuffAttachment) {
+    let path = attachment.path();
+    if pasted_here(path)
+        && let Err(err) = std::fs::remove_file(path)
+    {
+        eprintln!("couldn't remove a pasted image: {err}");
+    }
+}
+
+/// The file as a whole, so that what is added to it later has a place beside the notes.
+#[derive(Default, Serialize, Deserialize)]
+#[serde(default)]
+struct StuffFile {
+    notes: Vec<StuffNote>,
+}
+
+/// A file that is missing or can't be read gives an empty board. One that can't be read
+/// is said, and left alone until the board changes.
+pub(crate) fn load_stuff() -> Vec<StuffNote> {
+    let Some(folder) = config_folder() else {
+        return Vec::new();
+    };
+    read_stuff(&folder.join(STUFF)).unwrap_or_else(|err| {
+        eprintln!("couldn't read the Stuff board: {err}");
+        Vec::new()
+    })
+}
+
+/// An error other than a missing file is passed on, so notes that couldn't be read
+/// aren't written over.
+fn read_stuff(path: &Path) -> std::io::Result<Vec<StuffNote>> {
+    match std::fs::read(path) {
+        Ok(json) => Ok(serde_json::from_slice::<StuffFile>(&json)?.notes),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(err) => Err(err),
+    }
+}
+
+/// Makes `change` to the notes kept in `folder`. Runs of the app changing them at once
+/// take turns under a lock, and the new file replaces the old one whole.
+pub(crate) fn change_stuff(
+    folder: &Path,
+    change: impl FnOnce(&mut Vec<StuffNote>),
+) -> std::io::Result<()> {
+    std::fs::create_dir_all(folder)?;
+    // Held until the new file is in place.
+    let lock = std::fs::File::create(folder.join(format!("{STUFF}.lock")))?;
+    lock.lock()?;
+    let path = folder.join(STUFF);
+    let mut notes = read_stuff(&path)?;
+    change(&mut notes);
+    let written = folder.join(format!("{STUFF}.new"));
+    // Laid out for reading, as notes are the user's own text.
+    std::fs::write(&written, serde_json::to_vec_pretty(&StuffFile { notes })?)?;
+    std::fs::rename(&written, &path)
 }

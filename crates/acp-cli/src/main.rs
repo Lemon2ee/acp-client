@@ -38,7 +38,7 @@ fn main() -> ExitCode {
         }
         if handle
             .commands
-            .send_blocking(Command::Prompt(SESSION, line))
+            .send_blocking(Command::Prompt(SESSION, line.into()))
             .is_err()
         {
             break;

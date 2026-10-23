@@ -8,9 +8,11 @@ use gpui_kit::base::{Easing, SelectableText};
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::shimmer::ShimmerText;
 use gpui_kit::component::text::TextView;
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::chat_view::ChatView;
+use crate::chat_view::stuff::{STRIP_GAP, TileLook};
 use crate::debug::switches;
 use crate::session::{Row, Session, row_id};
 
@@ -96,22 +98,31 @@ impl ChatView {
         let key = session.key;
         let row = div().w_full().px_4().py_1p5();
         match &session.rows[ix] {
-            Row::User(text) => row
-                .flex()
-                .justify_end()
-                .child(
-                    div()
-                        .max_w(relative(0.8))
-                        .px_3()
-                        .py_2()
-                        .rounded_lg()
-                        .bg(bubble)
-                        .child(
-                            SelectableText::new(row_id("user", key, ix), text.clone())
-                                .selection_color(selection),
-                        ),
-                )
-                .into_any_element(),
+            Row::User { text, attachments } => {
+                let bubble = div()
+                    .max_w(relative(0.8))
+                    .px_3()
+                    .py_2()
+                    .rounded_lg()
+                    .bg(bubble);
+                // What went with it from a Stuff note, above its text.
+                let tiles = (!attachments.is_empty()).then(|| {
+                    TileLook::on_bubble(cx)
+                        .strip(attachments)
+                        .when(!text.is_empty(), |tiles| tiles.mb(STRIP_GAP))
+                });
+                let body = div().children(tiles).when(!text.is_empty(), |body| {
+                    body.child(
+                        SelectableText::new(row_id("user", key, ix), text.clone())
+                            .selection_color(selection),
+                    )
+                });
+                // A Stuff card sent from the board fills its row in as it lands on it.
+                row.flex()
+                    .justify_end()
+                    .child(self.sent_bubble(key, ix, bubble, body, cx))
+                    .into_any_element()
+            }
             Row::Agent(view) => row
                 .child(TextView::new(view).selectable(true))
                 .into_any_element(),

@@ -1,5 +1,7 @@
-//! The sidebar of sessions: each session's card with its menu, renaming a session on its
-//! card, asking before deleting one, the Archived list, and dragging the sidebar's edge.
+//! The sidebar: its two lists and the tabs that switch between them, the sessions with
+//! each session's card and its menu, renaming a session on its card, asking before
+//! deleting one, the Archived list, and dragging the sidebar's edge. The other list,
+//! Stuff, is drawn in `stuff.rs`.
 
 use acp_core::SessionKey;
 use gpui_kit::base::HandleEdge;
@@ -20,6 +22,8 @@ use crate::config::TitleSource;
 pub(crate) struct SidebarState {
     /// Shown, rather than slid away by the sidebar button.
     pub(crate) open: bool,
+    /// The list on show.
+    tab: SidebarTab,
     /// The list of archived sessions is open.
     archived_open: bool,
     /// How wide the sidebar is while shown. Dragged at its right edge.
@@ -32,11 +36,20 @@ impl Default for SidebarState {
     fn default() -> Self {
         Self {
             open: true,
+            tab: SidebarTab::Sessions,
             archived_open: false,
             width: SIDEBAR_WIDTH,
             renaming: None,
         }
     }
+}
+
+/// The sidebar's two lists, one on show at a time.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SidebarTab {
+    Sessions,
+    /// The note and the board of things kept for later (see `stuff.rs`).
+    Stuff,
 }
 
 /// A field on a session's sidebar card for changing its name.
@@ -56,6 +69,14 @@ const SIDEBAR_MAX_WIDTH: Pixels = px(480.);
 const NEW_SESSION_CHIP_SIZE: Pixels = px(20.);
 /// The "New session" row, which the square watches to change its fill on hover.
 const NEW_SESSION_GROUP: &str = "new-session";
+/// The tabs above the lists: a 28px track, 8px in from the sidebar's sides like the
+/// cards, holding the two tabs 2px in and 2px apart.
+const TABS_HEIGHT: Pixels = px(28.);
+const TABS_PAD: Pixels = px(2.);
+const TABS_RADIUS: Pixels = px(8.);
+const TAB_RADIUS: Pixels = px(6.);
+const TAB_TEXT_SIZE: Pixels = px(13.);
+const TAB_ICON_SIZE: Pixels = px(14.);
 
 /// What a drag of the sidebar's edge carries. gpui tells drags apart by this type, and
 /// draws it under the pointer: nothing, since the sidebar itself follows the pointer.
@@ -231,7 +252,12 @@ impl ChatView {
             .into_any_element()
     }
 
-    pub(crate) fn render_sidebar(&self, title_bar: bool, cx: &mut Context<Self>) -> Div {
+    pub(crate) fn render_sidebar(
+        &self,
+        title_bar: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Div {
         let theme = cx.theme();
         let (foreground, hover, muted) = (
             theme.sidebar_foreground,
@@ -308,92 +334,198 @@ impl ChatView {
                     .h(self.title_bar_height)
                     .when(title_bar, as_title_bar),
             )
-            .child(
-                div()
-                    .flex_1()
-                    .min_h(px(0.))
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .px_2()
-                    .pb_2()
-                    .child(
-                        // A plain div: the component Button always centers its label.
-                        div()
-                            .id("new-session")
-                            .group(NEW_SESSION_GROUP)
-                            .role(Role::Button)
-                            .aria_label("New session")
-                            .h(px(32.))
-                            // Centers the square over the gear at the foot, which puts
-                            // its left edge 3.5px out from the cards' titles.
-                            .pl(px(8.5))
-                            .pr_3()
-                            .flex()
-                            .items_center()
-                            .gap_1p5()
-                            .rounded_md()
-                            .text_sm()
+            .child(self.render_tabs(cx))
+            .map(|sidebar| match self.sidebar.tab {
+                SidebarTab::Sessions => sidebar.child(
+                    div()
+                        .flex_1()
+                        .min_h(px(0.))
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .p_2()
+                        .child(
+                            // A plain div: the component Button always centers its label.
+                            div()
+                                .id("new-session")
+                                .group(NEW_SESSION_GROUP)
+                                .role(Role::Button)
+                                .aria_label("New session")
+                                .h(px(32.))
+                                // Centers the square over the gear at the foot, which puts
+                                // its left edge 3.5px out from the cards' titles.
+                                .pl(px(8.5))
+                                .pr_3()
+                                .flex()
+                                .items_center()
+                                .gap_1p5()
+                                .rounded_md()
+                                .text_sm()
+                                .cursor_pointer()
+                                .hover(|style| style.bg(hover))
+                                .child(
+                                    div()
+                                        .size(NEW_SESSION_CHIP_SIZE)
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .rounded_md()
+                                        .bg(hover)
+                                        // The row's hover fill is the square's own color, so
+                                        // the square steps toward the text color to stay visible.
+                                        .group_hover(NEW_SESSION_GROUP, move |style| {
+                                            style.bg(chip_hover)
+                                        })
+                                        .child(Icon::new(IconName::Plus).small()),
+                                )
+                                .child("New session")
+                                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                    this.new_session(window, cx)
+                                })),
+                        )
+                        .child(
+                            div()
+                                .id("sessions")
+                                .flex_1()
+                                .min_h(px(0.))
+                                .mt_2()
+                                .flex()
+                                .flex_col()
+                                .gap_0p5()
+                                .overflow_y_scroll()
+                                .children(cards)
+                                .children(archived_list)
+                                .when(self.sidebar.archived_open, |list| list.children(archived)),
+                        )
+                        .child(self.settings_row(cx)),
+                ),
+                SidebarTab::Stuff => sidebar
+                    .child(self.render_stuff(window, cx))
+                    .child(div().flex_none().p_2().child(self.settings_row(cx))),
+            })
+    }
+
+    /// The tabs over the sidebar's two lists, in a track a step off the sidebar's color.
+    fn render_tabs(&self, cx: &mut Context<Self>) -> Stateful<Div> {
+        let theme = cx.theme();
+        let (foreground, muted, sidebar) =
+            (theme.foreground, theme.muted_foreground, theme.sidebar);
+        // #1d1d1d in the dark theme and #ebebeb in the light one. The tab on show is a
+        // step further in dark mode (#2b2b2b), and white with a hairline in light mode.
+        let track = sidebar.blend(foreground.opacity(0.05));
+        let (raised, raised_shadow) = if theme.is_dark() {
+            (sidebar.blend(foreground.opacity(0.11)), Vec::new())
+        } else {
+            (
+                white(),
+                vec![
+                    BoxShadow::new(px(0.), px(0.), black().opacity(0.06)).spread_radius(px(1.)),
+                    BoxShadow::new(px(0.), px(1.), black().opacity(0.08)).blur_radius(px(1.)),
+                ],
+            )
+        };
+        let tab = |tab: SidebarTab, label: &'static str, icon: gpui_kit::assets::IconName| {
+            let shown = self.sidebar.tab == tab;
+            div()
+                .id(label)
+                .role(Role::Tab)
+                .aria_label(label)
+                .aria_selected(shown)
+                .flex_1()
+                .min_w(px(0.))
+                .h_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .gap_1p5()
+                .rounded(TAB_RADIUS)
+                .text_size(TAB_TEXT_SIZE)
+                .child(Icon::new(icon).size(TAB_ICON_SIZE))
+                .child(label)
+                .map(|el| {
+                    if shown {
+                        el.bg(raised)
+                            .shadow(raised_shadow.clone())
+                            .text_color(foreground)
+                            .font_weight(FontWeight::MEDIUM)
+                    } else {
+                        el.text_color(muted)
                             .cursor_pointer()
-                            .hover(|style| style.bg(hover))
-                            .child(
-                                div()
-                                    .size(NEW_SESSION_CHIP_SIZE)
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .rounded_md()
-                                    .bg(hover)
-                                    // The row's hover fill is the square's own color, so
-                                    // the square steps toward the text color to stay visible.
-                                    .group_hover(NEW_SESSION_GROUP, move |style| {
-                                        style.bg(chip_hover)
-                                    })
-                                    .child(Icon::new(IconName::Plus).small()),
-                            )
-                            .child("New session")
-                            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                                this.new_session(window, cx)
-                            })),
-                    )
-                    .child(
-                        div()
-                            .id("sessions")
-                            .flex_1()
-                            .min_h(px(0.))
-                            .mt_2()
-                            .flex()
-                            .flex_col()
-                            .gap_0p5()
-                            .overflow_y_scroll()
-                            .children(cards)
-                            .children(archived_list)
-                            .when(self.sidebar.archived_open, |list| list.children(archived)),
-                    )
-                    .child(
-                        div()
-                            .id("open-settings")
-                            .role(Role::Button)
-                            .aria_label("Settings")
-                            .h(px(32.))
-                            .flex_none()
-                            // The gear nearly fills its 14px box, so the padding is 0.5px
-                            // short of the cards' to line its outline up with their titles.
-                            .pl(px(11.5))
-                            .pr_3()
-                            .flex()
-                            .items_center()
-                            .gap(px(7.))
-                            .rounded_md()
-                            .text_sm()
-                            .cursor_pointer()
-                            .hover(|style| style.bg(hover))
-                            .child(Icon::new(IconName::Settings).small())
-                            .child("Settings")
-                            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                                this.open_settings(window, cx)
-                            })),
-                    ),
+                            .hover(move |style| style.text_color(foreground))
+                            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                                this.show_tab(tab, window, cx)
+                            }))
+                    }
+                })
+        };
+        div()
+            .id("sidebar-tabs")
+            .role(Role::TabList)
+            .aria_label("Sidebar")
+            .flex_none()
+            .mx_2()
+            .h(TABS_HEIGHT)
+            .p(TABS_PAD)
+            .flex()
+            .gap(TABS_PAD)
+            .rounded(TABS_RADIUS)
+            .bg(track)
+            .child(tab(
+                SidebarTab::Sessions,
+                "Sessions",
+                gpui_kit::assets::IconName::MessagesSquare,
+            ))
+            .child(tab(
+                SidebarTab::Stuff,
+                "Stuff",
+                gpui_kit::assets::IconName::StickyNote,
+            ))
+    }
+
+    /// Shows one of the sidebar's lists, and gives the keys to what it is for: the note
+    /// for Stuff, the prompt for the sessions.
+    fn show_tab(&mut self, tab: SidebarTab, window: &mut Window, cx: &mut Context<Self>) {
+        if self.sidebar.tab == tab {
+            return;
+        }
+        self.sidebar.tab = tab;
+        // A name being typed on a session's card keeps what was typed, as it would if
+        // the focus went elsewhere.
+        self.finish_rename(true, cx);
+        match tab {
+            SidebarTab::Stuff => self
+                .stuff
+                .input
+                .update(cx, |input, cx| input.focus(window, cx)),
+            SidebarTab::Sessions => self.input.update(cx, |input, cx| input.focus(window, cx)),
+        }
+        cx.notify();
+    }
+
+    /// The row at the sidebar's foot that opens the settings, under either list.
+    fn settings_row(&self, cx: &mut Context<Self>) -> Stateful<Div> {
+        let hover = cx.theme().secondary;
+        div()
+            .id("open-settings")
+            .role(Role::Button)
+            .aria_label("Settings")
+            .h(px(32.))
+            .flex_none()
+            // The gear nearly fills its 14px box, so the padding is 0.5px short of the
+            // cards' to line its outline up with their titles.
+            .pl(px(11.5))
+            .pr_3()
+            .flex()
+            .items_center()
+            .gap(px(7.))
+            .rounded_md()
+            .text_sm()
+            .cursor_pointer()
+            .hover(|style| style.bg(hover))
+            .child(Icon::new(IconName::Settings).small())
+            .child("Settings")
+            .on_click(
+                cx.listener(|this, _: &ClickEvent, window, cx| this.open_settings(window, cx)),
             )
     }
 
