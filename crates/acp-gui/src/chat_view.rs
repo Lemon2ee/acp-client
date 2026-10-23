@@ -105,6 +105,8 @@ pub(crate) struct ChatView {
     agents: Vec<AgentSlot>,
     /// The folder new sessions start in, until the user picks another for one.
     cwd: PathBuf,
+    /// The folders sessions were started in, newest first, for the folder menu.
+    recent_folders: Vec<PathBuf>,
     /// The window's top row, across the sidebar and the chat. It holds the traffic lights
     /// on macOS, the sidebar button, and the name of the session on screen.
     title_bar_height: Pixels,
@@ -296,6 +298,7 @@ impl ChatView {
             input,
             agents,
             cwd,
+            recent_folders: Vec::new(),
             title_bar_height,
             traffic_lights_end,
             window_blur: blur,
@@ -322,6 +325,7 @@ impl ChatView {
         };
         view.global_shortcut.sync(false, cx);
         view.restore_sessions(cx);
+        view.restore_recent_folders();
         // On the first agent, whatever agent the oldest kept session is on, and even if
         // that agent is already gone, so there is always a session to show.
         let ix = view.untitled_on(0, cx);
@@ -1027,6 +1031,8 @@ impl ChatView {
         // once the agent gives it one.
         if first {
             self.save_session(key);
+            let folder = self.sessions[self.active].folder().to_path_buf();
+            self.remember_folder(folder);
         }
         // The window's first prompt lets the agents that need one make a spare.
         self.make_spares(cx);

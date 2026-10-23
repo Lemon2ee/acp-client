@@ -1,7 +1,8 @@
 //! The line under the prompt box: the folder the session works in, as a button that opens
-//! the system's folder panel until the session's first prompt, and what git says of the
-//! folder (see `crate::git`): its branch, a mark for a linked worktree, what the branch
-//! has changed since it left its base branch, and the files not committed yet.
+//! the folder menu until the session's first prompt, the folders sessions were started in
+//! that the menu lists, and what git says of the folder (see `crate::git`): its branch, a
+//! mark for a linked worktree, what the branch has changed since it left its base branch,
+//! and the files not committed yet.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -17,6 +18,7 @@ use gpui_kit::*;
 use crate::chat_view::ChatView;
 use crate::chat_view::pickers::MenuLook;
 use crate::chat_view::tool_call::ToolLook;
+use crate::config::{change_recent_folders, config_folder, load_recent_folders, put_first};
 use crate::git::{self, Base, Changes, Head};
 use crate::session::{Origin, Session};
 
@@ -35,7 +37,7 @@ const FOLDER_RADIUS: Pixels = px(6.);
 const FOLDER_NAME_MAX: Pixels = px(200.);
 /// How narrow the button gets when the line is short of room, once the branch's name
 /// has given all it can.
-const FOLDER_BUTTON_MIN: Pixels = px(96.);
+pub(super) const FOLDER_BUTTON_MIN: Pixels = px(96.);
 /// What git says, a step smaller than the button.
 const GIT_TEXT_SIZE: Pixels = px(12.);
 const GIT_ICON_SIZE: Pixels = px(14.);
@@ -100,8 +102,13 @@ impl ChatView {
     }
 
     /// Opens the system's folder panel at the folder of the session `key`, and has the
-    /// session work in the folder picked there.
-    fn pick_folder(&mut self, key: SessionKey, window: &mut Window, cx: &mut Context<Self>) {
+    /// session work in the folder picked there, which the folder menu lists from then on.
+    pub(super) fn pick_folder(
+        &mut self,
+        key: SessionKey,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(session) = self.session(key) else {
             return;
         };
@@ -112,10 +119,48 @@ impl ChatView {
                 return;
             };
             let _ = this.update_in(cx, |this, window, cx| {
-                this.set_folder(key, folder, window, cx)
+                this.set_folder(key, folder.clone(), window, cx);
+                this.remember_folder(folder);
             });
         })
         .detach();
+    }
+
+    /// Takes up the folder menu's list from disk, or the first time there is none, starts
+    /// it from the folders of the sessions kept, newest first.
+    pub(super) fn restore_recent_folders(&mut self) {
+        if let Some(folders) = load_recent_folders() {
+            self.recent_folders = folders;
+            return;
+        }
+        let mut kept: Vec<PathBuf> = Vec::new();
+        // The sessions kept are oldest first.
+        for session in self.sessions.iter().rev() {
+            let folder = session.folder();
+            if folder.is_dir() && !kept.iter().any(|known| known == folder) {
+                kept.push(folder.to_path_buf());
+            }
+        }
+        self.change_recent_folders(|folders| *folders = kept.clone());
+    }
+
+    /// Puts `folder` first in the folder menu, here and on disk.
+    pub(super) fn remember_folder(&mut self, folder: PathBuf) {
+        self.change_recent_folders(|folders| put_first(folders, &folder));
+    }
+
+    fn change_recent_folders(&mut self, change: impl Fn(&mut Vec<PathBuf>)) {
+        let changed = config_folder()
+            .ok_or_else(|| std::io::Error::other("there is no config folder"))
+            .and_then(|folder| change_recent_folders(&folder, &change));
+        match changed {
+            Ok(folders) => self.recent_folders = folders,
+            Err(err) => {
+                eprintln!("couldn't save the recent folders: {err}");
+                // The list still changes for this run.
+                change(&mut self.recent_folders);
+            }
+        }
     }
 
     /// The session's folder and what git says of it.
@@ -129,6 +174,12 @@ impl ChatView {
         // Once the agent has the session, it works in its folder for good: ACP has no
         // request to move a session.
         let pickable = session.title.is_none() && matches!(session.origin, Origin::New(_));
+        // Locked, the button looks like plain text, so its tooltip says why it won't open.
+        let tip = if pickable {
+            path.clone()
+        } else {
+            SharedString::from(format!("{path}\nCan't change after the first prompt"))
+        };
         let button = div()
             .id("folder")
             .aria_label(format!("Folder: {path}"))
@@ -145,7 +196,7 @@ impl ChatView {
             .line_height(FOLDER_TEXT_LINE)
             .font_weight(FontWeight::MEDIUM)
             .text_color(look.foreground)
-            .tooltip(move |window, cx| Tooltip::new(path.clone()).build(window, cx))
+            .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
             .child(
                 Icon::new(IconName::Folder)
                     .size(FOLDER_ICON_SIZE)
@@ -164,10 +215,12 @@ impl ChatView {
                     .cursor_pointer()
                     .hover(|style| style.bg(look.hover))
                     .active(|style| style.bg(look.pressed))
-                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                        this.pick_folder(key, window, cx)
-                    }))
             });
+        let button = if pickable {
+            self.render_folder_picker(key, folder, button, cx)
+        } else {
+            button.into_any_element()
+        };
 
         let mut items = Vec::new();
         if let Some(repo) = &session.git {
@@ -330,7 +383,7 @@ pub(super) fn may_change_files(event: &SessionEvent) -> bool {
 }
 
 /// The folder's own name, `~` for the home folder.
-fn folder_name(folder: &Path) -> String {
+pub(super) fn folder_name(folder: &Path) -> String {
     if dirs::home_dir().is_some_and(|home| home == folder) {
         return "~".to_string();
     }
@@ -341,7 +394,7 @@ fn folder_name(folder: &Path) -> String {
 }
 
 /// The folder's whole path, from `~` when it is in the home folder.
-fn tilde(folder: &Path) -> String {
+pub(super) fn tilde(folder: &Path) -> String {
     let home = dirs::home_dir();
     match home
         .as_deref()

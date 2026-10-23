@@ -1,8 +1,10 @@
-//! The buttons below the prompt for the model, the effort and the mode, and what their
-//! menus share: the sizes, `MenuLook`'s colors and shadows, how a menu comes in, how the
-//! keys move through a menu, and how a setting's "default" choice can stand for another.
+//! The buttons below the prompt for the model, the effort and the mode, the folder menu
+//! under the prompt box, and what their menus share: the sizes, `MenuLook`'s colors and
+//! shadows, how a menu comes in, how the keys move through a menu, and how a setting's
+//! "default" choice can stand for another.
 
 pub(crate) mod effort;
+mod folder;
 mod mode;
 pub(crate) mod model_panel;
 

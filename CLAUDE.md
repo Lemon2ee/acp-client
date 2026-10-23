@@ -22,7 +22,7 @@ clearly needs splitting. acp-gui is split by what each part keeps or draws:
 | File in `crates/acp-gui/src/` | Holds |
 | --- | --- |
 | `main.rs` | Starting the app: the agents to run, the window, key bindings, actions, the extra icons, profiling. |
-| `config.rs` | What is kept on disk between runs: `AppSettings`, the starred models, each agent's last settings, the kept sessions with each one's transcript and last context report, the Stuff board's notes and the images pasted into them. |
+| `config.rs` | What is kept on disk between runs: `AppSettings`, the starred models, each agent's last settings, the kept sessions with each one's transcript and last context report, the folders sessions were started in, the Stuff board's notes and the images pasted into them. |
 | `debug.rs` | `ACP_GUI_DEBUG`: switches that turn a live reply's effects off one by one, and a log of each transcript frame. |
 | `git.rs` | What git says of a session's folder: the branch, a linked worktree, what the branch changed since its base, the files not committed. Runs `git` in two steps (the branch first), and never on macOS while `/usr/bin/git` is only the Command Line Tools' installer. |
 | `hotkey.rs` | The system-wide shortcut that brings the window to the front: what it can't be, holding it with macOS through Carbon, and what a press does. |
@@ -48,10 +48,10 @@ clearly needs splitting. acp-gui is split by what each part keeps or draws:
 | `chat_view/info_panel/pull_requests.rs` | The panel's Pull requests section, when it asks `gh`, and a file's diff in the panel's place. |
 | `chat_view/info_panel/files.rs` | The panel's Files section, and starting and stopping each turn's watch of the session's folder. |
 | `chat_view/settings_page.rs` | The settings, which take the window while open. |
-| `chat_view/folder_line.rs` | The line under the prompt box: the session's folder, a button to the system's folder panel (AppKit's, opened at that folder, on macOS) until its first prompt, what git says of the folder, and when git is asked again. |
+| `chat_view/folder_line.rs` | The line under the prompt box: the session's folder, a button to the folder menu until its first prompt, the system's folder panel the menu's last row opens (AppKit's, opened at that folder, on macOS), the recent folders the menu lists, what git says of the folder, and when git is asked again. |
 | `chat_view/usage_line.rs` | The plan usage line below the folder line: which of the agent's limits show, how each reads, and the clock that redraws it when one starts over. |
 | `chat_view/pickers.rs` | What the buttons below the prompt and their menus share: `MenuLook`, sizes, `picker_button`. |
-| `chat_view/pickers/` | One file each for the model panel, the effort meter with its slider, and the mode menu; `effort/wheel.rs` is how the meter reads a scroll (wheel notches, trackpad pixels, momentum, scrolls begun elsewhere). |
+| `chat_view/pickers/` | One file each for the model panel, the effort meter with its slider, the mode menu, and the folder menu under the prompt box; `effort/wheel.rs` is how the meter reads a scroll (wheel notches, trackpad pixels, momentum, scrolls begun elsewhere). |
 
 `ChatView`'s fields stay private: its parts sit under `chat_view/`, and a child module can
 read its parent's private fields. What another module needs is `pub(crate)`, and no more.
