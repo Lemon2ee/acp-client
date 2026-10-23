@@ -239,26 +239,51 @@ impl ChatView {
         self.keep_title(renaming.key);
     }
 
-    /// Asks before deleting the session, as nothing brings it back.
-    fn confirm_delete(&mut self, key: SessionKey, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(title) = self.session(key).and_then(|session| session.title.clone()) else {
-            return;
+    /// Asks before deleting the sessions, as nothing brings them back: one by its name,
+    /// several by their number.
+    fn confirm_delete(
+        &mut self,
+        keys: Vec<SessionKey>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (title, description) = match keys.as_slice() {
+            [] => return,
+            [key] => {
+                let Some(title) = self.session(*key).and_then(|session| session.title.clone())
+                else {
+                    return;
+                };
+                (
+                    format!("Delete “{title}”?"),
+                    "The agent is asked to delete it too. This can't be undone.",
+                )
+            }
+            _ => (
+                format!("Delete {}?", sessions(keys.len())),
+                "The agent is asked to delete them too. This can't be undone.",
+            ),
         };
-        let title = SharedString::from(format!("Delete “{title}”?"));
+        let title = SharedString::from(title);
         let view = cx.entity().downgrade();
         // The dialog gives focus back to what had it as it opened, which is otherwise the
         // menu it was opened from, gone by the time the dialog closes.
         self.input.update(cx, |input, cx| input.focus(window, cx));
         window.open_alert_dialog(cx, move |dialog, _, _| {
-            let view = view.clone();
+            let (view, keys) = (view.clone(), keys.clone());
             dialog
                 .title(title.clone())
-                .description("The agent is asked to delete it too. This can't be undone.")
+                .description(description)
                 .show_cancel(true)
                 .ok_text("Delete")
                 .ok_variant(ButtonVariant::Danger)
                 .on_ok(move |_, window, cx| {
-                    let _ = view.update(cx, |this, cx| this.delete_session(key, window, cx));
+                    let _ = view.update(cx, |this, cx| {
+                        // Each is let go of as it goes, which ends a selection of them.
+                        for &key in &keys {
+                            this.delete_session(key, window, cx);
+                        }
+                    });
                     true
                 })
         });
@@ -438,6 +463,25 @@ impl ChatView {
                     }),
                 ),
             )
+            .child(
+                bar_button(
+                    "delete-selected",
+                    gpui_kit::assets::IconName::Trash,
+                    "Delete…",
+                    cx,
+                )
+                .on_click(
+                    cx.listener(|this, _: &ClickEvent, window, cx| {
+                        this.delete_selected(window, cx)
+                    }),
+                ),
+            )
+    }
+
+    /// Asks before deleting the picked sessions. Cancel keeps them picked.
+    fn delete_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let keys = self.sidebar.selection.keys.clone();
+        self.confirm_delete(keys, window, cx);
     }
 
     /// Moves the picked sessions to Archived, or out of it, all at once. Nothing asks
@@ -536,10 +580,19 @@ impl ChatView {
                 let archive_label = if archived { "Unarchive" } else { "Archive" };
                 // A picked card's menu acts on all those picked.
                 if picked {
-                    let label = format!("{archive_label} {}", sessions(picked_count));
-                    return menu.item(PopupMenuItem::new(label).on_click(move |_, window, cx| {
-                        let _ = archive.update(cx, |this, cx| this.archive_selected(window, cx));
-                    }));
+                    let count = sessions(picked_count);
+                    let label = format!("{archive_label} {count}");
+                    return menu
+                        .item(PopupMenuItem::new(label).on_click(move |_, window, cx| {
+                            let _ =
+                                archive.update(cx, |this, cx| this.archive_selected(window, cx));
+                        }))
+                        .item(PopupMenuItem::new(format!("Delete {count}…")).on_click(
+                            move |_, window, cx| {
+                                let _ =
+                                    delete.update(cx, |this, cx| this.delete_selected(window, cx));
+                            },
+                        ));
                 }
                 menu.item(PopupMenuItem::new("Rename").on_click(move |_, window, cx| {
                     let _ = rename.update(cx, |this, cx| this.start_rename(key, window, cx));
@@ -558,7 +611,8 @@ impl ChatView {
                 )
                 .item(
                     PopupMenuItem::new("Delete…").on_click(move |_, window, cx| {
-                        let _ = delete.update(cx, |this, cx| this.confirm_delete(key, window, cx));
+                        let _ = delete
+                            .update(cx, |this, cx| this.confirm_delete(vec![key], window, cx));
                     }),
                 )
             })
