@@ -216,6 +216,12 @@ impl ChatView {
         if !session.created || !context.readable || context.reading || context.fresh {
             return;
         }
+        // To claude-agent-acp 0.94.0 a read is a turn, and it names a session once, from
+        // its first turn's text: read before the first prompt, the session would be named
+        // after its `/context` report, keep that name, and never be kept for later runs.
+        if !session.prompted() {
+            return;
+        }
         let read = Command::ReadContext(session.key);
         if self.agents[session.agent].commands.try_send(read).is_ok() {
             session.context.reading = true;
