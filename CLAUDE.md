@@ -30,6 +30,7 @@ clearly needs splitting. acp-gui is split by what each part keeps or draws:
 | `session/pacing.rs` | The agent's text in a live turn, held back and shown at an even pace, and where it may stop so half-arrived markdown never shows. |
 | `session/tool_call.rs` | A tool call as its row keeps it: its content made ready to draw once (a command's lines, a file's numbered lines, a diff), how long it ran, and the agent's permission request on it with its answer. |
 | `session/context.rs` | What fills a session's context window: the agent's last count, each turn's tokens added up, and Claude's `/context` report read into categories and their items. |
+| `session/pull_requests.rs` | The pull requests a session opened, found in its tool calls' output, and how each stands (state, checks, reviews, files, diff) as the user's own `gh` tells it. |
 | `sound.rs` | The effort meter's ticks and knock, made as WAV data and played through NSSound while macOS's interface sounds are on (macOS only; silent elsewhere). |
 | `chrome.rs` | The window around the content: the macOS title bar row, the traffic lights, the blur, the light or dark theme. |
 | `chat_view.rs` | `ChatView`: the agents, the sessions and what happens to them, and the window's layout (`Render`). |
@@ -38,6 +39,7 @@ clearly needs splitting. acp-gui is split by what each part keeps or draws:
 | `chat_view/scroller.rs` | The transcript's list: following its newest text, the button back to the newest, and how far a finger may push it past either end. |
 | `chat_view/sidebar.rs` | The session cards, renaming, the delete prompt, the Archived list, the draggable edge. |
 | `chat_view/info_panel.rs` | The session info panel at the chat's right, under the title row: its button, the draggable edge, and the Context window section with its bar and categories. |
+| `chat_view/info_panel/pull_requests.rs` | The panel's Pull requests section, when it asks `gh`, and a file's diff in the panel's place. |
 | `chat_view/settings_page.rs` | The settings, which take the window while open. |
 | `chat_view/usage_line.rs` | The plan usage line under the prompt box: which of the agent's limits show, how each reads, and the clock that redraws it when one starts over. |
 | `chat_view/pickers.rs` | What the buttons below the prompt and their menus share: `MenuLook`, sizes, `picker_button`. |
