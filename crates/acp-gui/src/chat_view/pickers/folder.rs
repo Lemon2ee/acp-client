@@ -7,7 +7,6 @@ use std::rc::Rc;
 
 use acp_core::SessionKey;
 use gpui_kit::assets::IconName;
-use gpui_kit::base::Selectable;
 use gpui_kit::component::Icon;
 use gpui_kit::component::popover::PopoverState;
 use gpui_kit::prelude::FluentBuilder as _;
@@ -17,7 +16,7 @@ use crate::chat_view::ChatView;
 use crate::chat_view::folder_line::{FOLDER_BUTTON_MIN, folder_name, tilde};
 use crate::chat_view::pickers::{
     EFFORT_MENU_WIDTH, LEAD_ICON_SIZE, LIST_ROW_HEIGHT, MENU_LINE_HEIGHT, MenuLook, MenuParts,
-    PickRow, ROW_PAD, check, lead, menu_popover, rise_in,
+    MenuTrigger, PickRow, ROW_PAD, check, lead, menu_popover, rise_in,
 };
 
 /// How wide a folder's name and path may run, each on one line, before an ellipsis.
@@ -160,33 +159,6 @@ fn folder_menu(
     rise_in(surface, "folder-menu-in", window, cx)
 }
 
-/// The folder button as the menu's trigger: gray while the menu is open, as the buttons in
-/// the prompt box are.
-#[derive(IntoElement)]
-struct FolderTrigger {
-    button: Stateful<Div>,
-    open: bool,
-    pressed: Hsla,
-}
-
-impl Selectable for FolderTrigger {
-    fn selected(mut self, selected: bool) -> Self {
-        self.open = selected;
-        self
-    }
-
-    fn is_selected(&self) -> bool {
-        self.open
-    }
-}
-
-impl RenderOnce for FolderTrigger {
-    fn render(self, _: &mut Window, _: &mut App) -> impl IntoElement {
-        let pressed = self.pressed;
-        self.button.when(self.open, |button| button.bg(pressed))
-    }
-}
-
 impl ChatView {
     /// `button`, the folder of the session `key`, as the trigger of a menu of the recent
     /// folders that opens upward over the prompt box, as the mode menu does.
@@ -201,13 +173,8 @@ impl ChatView {
         let nav = self.menu_nav.clone();
         let folders = folder_choices(&self.recent_folders, &self.cwd, current);
         let current = current.to_path_buf();
-        let trigger = FolderTrigger {
-            button,
-            open: false,
-            pressed: MenuLook::new(cx).pressed,
-        };
         menu_popover("folder-menu", &nav, &view)
-            .trigger(trigger)
+            .trigger(MenuTrigger::new(button, cx))
             // The popover's box takes the button's place in the line, so it shrinks as the
             // button did when the line is short of room.
             .trigger_style(

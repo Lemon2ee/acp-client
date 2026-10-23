@@ -1,8 +1,9 @@
-//! What git says of a session's folder, for the line under the prompt box: the branch,
-//! whether the folder is in a linked worktree, how far the branch has gone from its base
-//! branch, and the files not committed yet. Read by running `git` in two steps, the
-//! branch first as it is quick, then what needs `git diff` and `git status`, which can
-//! take seconds in a large repository.
+//! What git says of a session's folder, for the line under the prompt box: the branch and
+//! the others it could switch to, whether the folder is in a linked worktree, how far the
+//! branch has gone from its base branch, and the files not committed yet. Read by running
+//! `git` in two steps, the branches first as they are quick, then what needs `git diff`
+//! and `git status`, which can take seconds in a large repository. Also switches the
+//! folder to another branch.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -12,6 +13,9 @@ use std::sync::OnceLock;
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Repo {
     pub(crate) head: Head,
+    /// The local branches the folder can switch to, the newest commit first, with the one
+    /// checked out here (see `switchable`).
+    pub(crate) branches: Vec<String>,
     /// The main worktree's folder, when the folder is in a linked worktree of it.
     pub(crate) worktree_of: Option<PathBuf>,
     /// What `read_changes` found; None until it has.
@@ -52,8 +56,9 @@ pub(crate) enum Base {
     },
 }
 
-/// Whether the folder is in a repository, and its branch: None outside one, and when git
-/// isn't installed. A folder inside a repository counts, as git looks up from it.
+/// Whether the folder is in a repository, its branch and the branches it could switch to:
+/// None outside one, and when git isn't installed. A folder inside a repository counts,
+/// as git looks up from it.
 pub(crate) fn read_head(folder: &Path) -> Option<Repo> {
     let dirs = git(
         folder,
@@ -78,10 +83,60 @@ pub(crate) fn read_head(folder: &Path) -> Option<Repo> {
                 .into(),
         ),
     };
+    let refs = git(
+        folder,
+        &[
+            "for-each-ref",
+            "--sort=-committerdate",
+            "--format=%(refname:short)%00%(worktreepath)",
+            "refs/heads",
+        ],
+    );
+    let branches = refs.map_or_else(Vec::new, |refs| switchable(&refs, &head));
     Some(Repo {
         head,
+        branches,
         worktree_of,
         changes: None,
+    })
+}
+
+/// The branches in `for-each-ref` output, a name, a NUL and the worktree it is checked out
+/// in a line: those checked out nowhere, and `head`, which is checked out here. git won't
+/// check a branch out in two worktrees at once.
+fn switchable(refs: &str, head: &Head) -> Vec<String> {
+    refs.lines()
+        .filter_map(|line| {
+            let (name, worktree) = line.split_once('\0').unwrap_or((line, ""));
+            let here = matches!(head, Head::Branch(branch) if branch == name);
+            (!name.is_empty() && (worktree.is_empty() || here)).then(|| name.to_string())
+        })
+        .collect()
+}
+
+/// Checks out `branch` in the folder, as `git switch` does: changes not committed come
+/// along, unless the switch would overwrite them, when git refuses. Err with what git
+/// said, for the user to read.
+pub(crate) fn switch(folder: &Path, branch: &str) -> Result<(), String> {
+    if !installed() {
+        return Err("git isn't installed".into());
+    }
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(folder)
+        .args(["switch", "--quiet", branch])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .output()
+        .map_err(|err| err.to_string())?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let said = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    Err(if said.is_empty() {
+        format!("git switch failed ({})", output.status)
+    } else {
+        said
     })
 }
 
@@ -234,6 +289,15 @@ mod tests {
         let status = " M src/main.rs\nM  Cargo.toml\nR  old.rs -> new.rs\n?? notes/\n?? a.txt\n";
         assert_eq!(count_status(status), (3, 2));
         assert_eq!(count_status(""), (0, 0));
+    }
+
+    #[test]
+    fn branches_checked_out_elsewhere_are_left_out() {
+        let refs = "feat/menu\0\nmain\0/repo\nfix/panel\0/repo/.claude/worktrees/panel\nold\0\n";
+        let head = Head::Branch("main".into());
+        assert_eq!(switchable(refs, &head), ["feat/menu", "main", "old"]);
+        let detached = Head::Detached("1a2b3c4".into());
+        assert_eq!(switchable(refs, &detached), ["feat/menu", "old"]);
     }
 
     #[test]

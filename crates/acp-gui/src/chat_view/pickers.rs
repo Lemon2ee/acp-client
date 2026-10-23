@@ -1,8 +1,9 @@
-//! The buttons below the prompt for the model, the effort and the mode, the folder menu
-//! under the prompt box, and what their menus share: the sizes, `MenuLook`'s colors and
-//! shadows, how a menu comes in, how the keys move through a menu, and how a setting's
-//! "default" choice can stand for another.
+//! The buttons below the prompt for the model, the effort and the mode, the folder and
+//! branch menus under the prompt box, and what their menus share: the sizes, `MenuLook`'s
+//! colors and shadows, how a menu comes in, how the keys move through a menu, and how a
+//! setting's "default" choice can stand for another.
 
+mod branch;
 pub(crate) mod effort;
 mod folder;
 mod mode;
@@ -11,6 +12,7 @@ pub(crate) mod model_panel;
 use std::rc::Rc;
 
 use acp_core::{Harness, SessionKey, Setting, SettingChoice, SettingKind, SettingValue};
+use gpui_kit::base::Selectable;
 use gpui_kit::base::actions::{Confirm, SelectDown, SelectUp};
 use gpui_kit::component::button::{ButtonCustomVariant, ButtonVariants as _};
 use gpui_kit::component::input::InputGroupButton;
@@ -418,6 +420,43 @@ fn menu_popover(id: &'static str, nav: &MenuNav, view: &WeakEntity<ChatView>) ->
                 let _ = view.update(cx, |this, cx| this.highlight_menu_row(None, cx));
             }
         })
+}
+
+/// One of the line's buttons under the prompt box, the folder or the branch, as its menu's
+/// trigger: gray while the menu is open, as the buttons in the prompt box are.
+#[derive(IntoElement)]
+struct MenuTrigger {
+    button: Stateful<Div>,
+    open: bool,
+    pressed: Hsla,
+}
+
+impl MenuTrigger {
+    fn new(button: Stateful<Div>, cx: &App) -> Self {
+        Self {
+            button,
+            open: false,
+            pressed: MenuLook::new(cx).pressed,
+        }
+    }
+}
+
+impl Selectable for MenuTrigger {
+    fn selected(mut self, selected: bool) -> Self {
+        self.open = selected;
+        self
+    }
+
+    fn is_selected(&self) -> bool {
+        self.open
+    }
+}
+
+impl RenderOnce for MenuTrigger {
+    fn render(self, _: &mut Window, _: &mut App) -> impl IntoElement {
+        let pressed = self.pressed;
+        self.button.when(self.open, |button| button.bg(pressed))
+    }
 }
 
 /// What the parts of an open menu below the prompt share: its look, its light, and what

@@ -1,8 +1,9 @@
 //! The line under the prompt box: the folder the session works in, as a button that opens
 //! the folder menu until the session's first prompt, the folders sessions were started in
-//! that the menu lists, and what git says of the folder (see `crate::git`): its branch, a
-//! mark for a linked worktree, what the branch has changed since it left its base branch,
-//! and the files not committed yet.
+//! that the menu lists, and what git says of the folder (see `crate::git`): its branch, as
+//! a button that opens the branch menu while the agent isn't replying, a mark for a linked
+//! worktree, what the branch has changed since it left its base branch, and the files not
+//! committed yet.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -48,6 +49,9 @@ const GIT_ITEM_GAP: Pixels = px(14.);
 const GIT_PART_GAP: Pixels = px(6.);
 const BRANCH_NAME_MAX: Pixels = px(240.);
 const BRANCH_NAME_MIN: Pixels = px(40.);
+/// Inside the branch, a button for its menu, around its icon and name. The gaps either side
+/// give it back, so the branch sits where it would bare.
+const BRANCH_PAD: Pixels = px(6.);
 /// The dot before the count of files not committed.
 const DIRTY_DOT_SIZE: Pixels = px(6.);
 /// How long the agent's events must have stopped changing files before git is asked
@@ -222,14 +226,16 @@ impl ChatView {
             button.into_any_element()
         };
 
+        let mut branch = None;
         let mut items = Vec::new();
         if let Some(repo) = &session.git {
-            let branch = match &repo.head {
+            let (current, detached) = match &repo.head {
+                Head::Branch(name) => (Some(name.as_str()), false),
+                Head::Detached(_) => (None, true),
+            };
+            let shown = match &repo.head {
                 Head::Branch(name) => item("git-branch", IconName::GitBranch, &look)
-                    // Gives way first when the line is short of room, down to 40px.
-                    .flex_shrink(1000.)
-                    .min_w(GIT_ICON_SIZE + GIT_PART_GAP + BRANCH_NAME_MIN)
-                    .max_w(GIT_ICON_SIZE + GIT_PART_GAP + BRANCH_NAME_MAX)
+                    .aria_label(format!("Branch: {name}"))
                     .child(
                         div()
                             .min_w(px(0.))
@@ -238,11 +244,31 @@ impl ChatView {
                             .child(name.clone()),
                     ),
                 Head::Detached(hash) => item("git-branch", IconName::GitCommitHorizontal, &look)
-                    .flex_none()
+                    .aria_label(format!("Detached at {hash}"))
                     .child(div().text_color(look.foreground).child(hash.clone()))
                     .child("detached"),
-            };
-            items.push(branch);
+            }
+            .h_full()
+            .px(BRANCH_PAD)
+            .rounded(FOLDER_RADIUS);
+            // Not while the agent works: the switch would change the files under it.
+            let switchable = !session.busy
+                && repo
+                    .branches
+                    .iter()
+                    .any(|name| Some(name.as_str()) != current);
+            branch = Some(if switchable {
+                let shown = shown
+                    .role(Role::Button)
+                    .min_w(px(0.))
+                    .cursor_pointer()
+                    .hover(|style| style.bg(look.hover))
+                    .active(|style| style.bg(look.pressed));
+                let place = branch_place(StyleRefinement::default().flex(), detached);
+                self.render_branch_picker(key, &repo.branches, current, shown, place, cx)
+            } else {
+                branch_place(shown, detached).into_any_element()
+            });
             if let Some(main) = &repo.worktree_of {
                 let tip = SharedString::from(format!("Worktree of {}", tilde(main)));
                 items.push(
@@ -267,11 +293,74 @@ impl ChatView {
             .overflow_hidden()
             .whitespace_nowrap()
             .child(button)
+            .children(branch)
             .children(items.into_iter().enumerate().map(|(ix, item)| {
-                let gap = if ix == 0 { GIT_FIRST_GAP } else { GIT_ITEM_GAP };
+                // The branch's padding comes out of the gap after it as well.
+                let gap = if ix == 0 {
+                    GIT_ITEM_GAP - BRANCH_PAD
+                } else {
+                    GIT_ITEM_GAP
+                };
                 item.ml(gap)
             }))
     }
+
+    /// Switches the folder of the session `key` to `branch`, then has git asked again about
+    /// every session in that folder. What git says when it refuses, such as changes not
+    /// committed that the switch would overwrite, goes in the session's transcript.
+    pub(super) fn switch_branch(
+        &mut self,
+        key: SessionKey,
+        branch: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(session) = self.session(key) else {
+            return;
+        };
+        if session.busy {
+            return;
+        }
+        let folder = session.folder().to_path_buf();
+        cx.spawn(async move |this, cx| {
+            let (switching, to) = (folder.clone(), branch.clone());
+            let switched = cx
+                .background_spawn(async move { git::switch(&switching, &to) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if let Err(said) = switched
+                    && let Some(session) = this.session_mut(key)
+                {
+                    session.push_error(format!("Couldn't switch to {branch}: {said}"), cx);
+                }
+                let shown: Vec<SessionKey> = this
+                    .sessions
+                    .iter()
+                    .filter(|session| session.folder() == folder)
+                    .map(|session| session.key)
+                    .collect();
+                for key in shown {
+                    this.read_git(key, Duration::ZERO, cx);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+}
+
+/// Where the branch sits in the line: after the folder button, less its own padding, and
+/// giving way first when the line is short of room, down to 40px of its name. A detached
+/// commit's short hash never gives way. Laid on the branch itself, or on the menu's box
+/// around it.
+fn branch_place<S: Styled>(this: S, detached: bool) -> S {
+    let this = this.ml(GIT_FIRST_GAP - BRANCH_PAD).h_full();
+    if detached {
+        return this.flex_none();
+    }
+    let around = GIT_ICON_SIZE + GIT_PART_GAP + BRANCH_PAD * 2.;
+    this.flex_shrink(1000.)
+        .min_w(around + BRANCH_NAME_MIN)
+        .max_w(around + BRANCH_NAME_MAX)
 }
 
 /// The branch's changes since it left its base, or that it has none to compare with.
