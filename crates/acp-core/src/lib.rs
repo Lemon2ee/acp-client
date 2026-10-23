@@ -235,8 +235,9 @@ pub struct TurnUsage {
 }
 
 /// Where a tool call stands. Shown as ACP names it: `Pending`, `InProgress`, `Completed`,
-/// `Failed`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// `Failed`. This and the other parts of a tool call are serializable so a front end can
+/// keep a transcript between runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ToolStatus {
     Pending,
     InProgress,
@@ -272,7 +273,7 @@ impl From<ToolCallStatus> for ToolStatus {
 
 /// What a tool call does, as the agent sorts it, for a front end to pick its icon and
 /// how to show it. Named as ACP names them.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ToolKind {
     Read,
     Edit,
@@ -305,7 +306,7 @@ impl From<ProtocolToolKind> for ToolKind {
 }
 
 /// Something a tool call shows: what it produced, or the change it makes to a file.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ToolContent {
     /// Markdown. Claude's adapter sends a command's output and a file it read as a fenced
     /// code block, the file's lines numbered.
@@ -322,7 +323,7 @@ pub enum ToolContent {
 }
 
 /// A file a tool call works on, and the line it works at where the agent says.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolLocation {
     pub path: PathBuf,
     pub line: Option<u32>,

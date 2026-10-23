@@ -97,7 +97,8 @@ const ITEM_INDENT: Pixels = px(22.);
 const BAR_HEIGHT: Pixels = px(6.);
 const BAR_GAP: Pixels = px(2.);
 const SEGMENT_MIN_WIDTH: Pixels = px(2.);
-/// What a list being counted again shows at, under its old numbers.
+/// What a list being counted again shows at, under its old numbers, and one kept from the
+/// last run while the agent loads the session.
 const STALE_OPACITY: f32 = 0.45;
 
 /// The panel button's icon: a window outline with a line down near its right side.
@@ -501,7 +502,10 @@ impl ChatView {
                 .flex()
                 .flex_col()
                 .children(rows)
-                .when(context.reading, |list| list.opacity(STALE_OPACITY))
+                // Being read again, or kept from the last run while the agent loads it.
+                .when(context.reading || session.loading, |list| {
+                    list.opacity(STALE_OPACITY)
+                })
         } else if !context.readable {
             let totals = context.totals;
             let rows = [
