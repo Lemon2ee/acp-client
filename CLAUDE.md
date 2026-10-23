@@ -40,7 +40,7 @@ clearly needs splitting. acp-gui is split by what each part keeps or draws:
 | `chat_view/transcript.rs` | How each row of a transcript is drawn. |
 | `chat_view/tool_call.rs` | A tool call's row (icon, title, state, time) and the box it opens to; calls in a row grouped under one header that folds them; the permission card in a call's place, with its keys. |
 | `chat_view/scroller.rs` | The transcript's list: following its newest text, the button back to the newest, and how far a finger may push it past either end. |
-| `chat_view/sidebar.rs` | The Sessions and Stuff tabs, the session cards, renaming, the delete prompt, the Archived list, the draggable edge. |
+| `chat_view/sidebar.rs` | The Sessions and Stuff tabs, the session cards, renaming, the delete prompt, picking several cards (⌘-click, ⇧-click, a card's Select) in one list at a time and the bar that archives or deletes them, the Archived list, the draggable edge. |
 | `chat_view/stuff.rs` | The Stuff list: the note in front to write into, and the board of notes stuck from it, the same for every session. |
 | `chat_view/stuff/attachments.rs` | Images and files pasted into a note: taken from the clipboard, drawn as tiles on the note, its card, the prompt a card is let go on and the row it is sent as, taken off the note or the prompt with their ×. |
 | `chat_view/stuff/drag.rs` | A card dragged into the chat: pulled at by its tape until the tape tears in two, then into the prompt, sent from the transcript (into the prompt while the agent replies) or back; the zones it lights and its way there; once in the chat, its place on the board closing and the note gone. |
@@ -77,8 +77,8 @@ cargo fmt --all
 - Build output goes to `target.nosync/` (see `.cargo/config.toml`): `~/Documents` syncs to
   iCloud, which skips `.nosync` names. Do not change the target dir.
 - Tests are few, and only of plain functions, which need no window or agent: acp-gui's
-  pacing, tool-call content, effort meter, usage line, git output, folder line, Stuff
-  rules and kept transcripts, and acp-core's making of a prompt's content from its files. "Verified" means
+  pacing, tool-call content, effort meter, usage line, git output, folder line, sidebar
+  selection, Stuff rules and kept transcripts, and acp-core's making of a prompt's content from its files. "Verified" means
   `cargo build`, `cargo test`, `cargo clippy` and `cargo fmt` are clean, plus a run of the
   affected front end when the change is user-visible.
 - `dist` (workspace `Cargo.toml`) is `release` with fat LTO and one codegen unit: 20.6 MB
