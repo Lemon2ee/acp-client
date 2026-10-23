@@ -15,8 +15,8 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::{
-    BODY_BOTTOM, BODY_LEFT, BODY_RIGHT, CHEVRON_SIZE, LINE_HEIGHT, PanelLook, ROW_GAP, ROW_PAD,
-    ROW_RADIUS, TEXT_LINE_HEIGHT, TEXT_SIZE, chevron, section_header,
+    BODY_BOTTOM, BODY_LEFT, BODY_RIGHT, CHEVRON_SIZE, EMPTY_INDENT, LINE_HEIGHT, PanelLook,
+    ROW_GAP, ROW_PAD, ROW_RADIUS, TEXT_LINE_HEIGHT, TEXT_SIZE, chevron, section_header,
 };
 use crate::chat_view::ChatView;
 use crate::chat_view::tool_call::{CODE_LINE_HEIGHT, CODE_SIZE, ToolLook, diff_line, frame};
@@ -35,8 +35,6 @@ const LINE_INDENT: Pixels = px(22.);
 /// Its files sit in a little further, and the note on gh further still.
 const FILE_INDENT: Pixels = px(28.);
 const NOTE_INDENT: Pixels = px(28.);
-/// "None yet" lines up with the section's name, past its chevron.
-const EMPTY_INDENT: Pixels = px(24.);
 /// Between the numbers of lines added and removed.
 const COUNTS_GAP: Pixels = px(4.);
 /// The diff's own header: the back button, the file's name and its counts.

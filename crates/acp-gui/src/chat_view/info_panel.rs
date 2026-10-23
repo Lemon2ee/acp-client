@@ -1,7 +1,7 @@
 //! The session's info panel, right of the transcript and under the title row, with its
 //! button at the title row's right end; its left edge drags its width. It shows the pull
 //! requests the session opened (see `pull_requests`), the files it made (see `files`),
-//! and the session's context window: how full it is and, opened, what fills it.
+//! and the session's context window: how full it is and what fills it.
 
 mod files;
 mod pull_requests;
@@ -29,8 +29,6 @@ pub(crate) struct InfoPanelState {
     pub(crate) width: Pixels,
     /// The Context window section is unfolded.
     context_section: bool,
-    /// The context window's block is opened to what fills it.
-    context_detail: bool,
     /// The category opened to what makes it up, by name.
     category: Option<String>,
     /// The Pull requests section is unfolded.
@@ -51,7 +49,6 @@ impl Default for InfoPanelState {
             open: true,
             width: PANEL_WIDTH,
             context_section: true,
-            context_detail: false,
             category: None,
             pr_section: true,
             files_section: true,
@@ -80,6 +77,9 @@ const HEADER_HEIGHT: Pixels = px(28.);
 /// Every line of a section's list is this tall, so their rhythm stays even.
 const LINE_HEIGHT: Pixels = px(24.);
 const ROW_PAD: Pixels = px(6.);
+/// A section's line saying it has nothing yet lines up with the section's name, past its
+/// chevron.
+const EMPTY_INDENT: Pixels = px(24.);
 const ROW_RADIUS: Pixels = px(6.);
 /// Between a row's swatch, its name and its numbers.
 const ROW_GAP: Pixels = px(8.);
@@ -340,7 +340,7 @@ impl ChatView {
     }
 
     /// The Context window section: its header, then the count over a bar of the window,
-    /// which opens to what fills it.
+    /// and what fills it below. Unfolded, it shows all of that, with no second fold.
     fn render_context_section(
         &self,
         session: &Session,
@@ -369,18 +369,19 @@ impl ChatView {
             return section;
         }
         let Some(usage) = context.usage else {
+            // As tall as the other sections' "None yet" on one line, and free to wrap in a
+            // narrow panel.
             return section.child(
                 div()
-                    .pt(px(2.))
-                    .px(ROW_PAD)
-                    .pb(px(6.))
+                    .py((LINE_HEIGHT - TEXT_LINE_HEIGHT) / 2.)
+                    .pl(EMPTY_INDENT)
+                    .pr(ROW_PAD)
                     .text_size(TEXT_SIZE)
                     .line_height(TEXT_LINE_HEIGHT)
                     .text_color(look.faint)
                     .child("Shows after the agent's first reply"),
             );
         };
-        let detail = panel.context_detail;
         let report = context.report.as_ref().map(|(report, _)| report);
         // Used, then kept for compacting, then free, as the bar runs.
         let mut parts: Vec<&Category> = report
@@ -405,9 +406,9 @@ impl ChatView {
                 CategoryKind::Free => Swatch::Empty,
             })
             .collect();
-        // Opened, the bar is the report's own; closed, it is the latest count, with the
-        // report's part kept for compacting.
-        let bar: Vec<(u64, Swatch)> = if detail && !parts.is_empty() {
+        // The report's own bar, split as the list below it is; until there is one, the
+        // latest count.
+        let bar: Vec<(u64, Swatch)> = if !parts.is_empty() {
             parts
                 .iter()
                 .zip(&swatches)
@@ -429,13 +430,6 @@ impl ChatView {
             of.push_str(&format!(" · as of {}", day_or_time(at)));
         }
         let block = div()
-            .id("info-context")
-            .role(Role::Button)
-            .aria_label(if detail {
-                "Hide what fills the context window"
-            } else {
-                "Show what fills the context window"
-            })
             .w_full()
             .px(ROW_PAD)
             .pt(px(6.))
@@ -443,9 +437,6 @@ impl ChatView {
             .flex()
             .flex_col()
             .gap(px(8.))
-            .rounded(ROW_RADIUS)
-            .cursor_pointer()
-            .hover(move |style| style.bg(look.hover))
             .child(
                 div()
                     .flex()
@@ -461,18 +452,10 @@ impl ChatView {
                             .truncate()
                             .text_color(look.muted)
                             .child(of),
-                    )
-                    .child(chevron(detail, look)),
+                    ),
             )
-            .child(context_bar(&bar, look))
-            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                this.info_panel.context_detail = !this.info_panel.context_detail;
-                cx.notify();
-            }));
+            .child(context_bar(&bar, look));
         let section = section.child(block);
-        if !detail {
-            return section;
-        }
         let footer = if context.reading {
             let text = if session.busy {
                 "Counting when this turn ends…"
