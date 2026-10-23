@@ -1,6 +1,9 @@
 //! The session's info panel, right of the transcript and under the title row, with its
-//! button at the title row's right end; its left edge drags its width. For now it shows
-//! the session's context window: how full it is and, opened, what fills it.
+//! button at the title row's right end; its left edge drags its width. It shows the pull
+//! requests the session opened (see `pull_requests`), and the session's context window:
+//! how full it is and, opened, what fills it.
+
+mod pull_requests;
 
 use std::path::Path;
 
@@ -13,6 +16,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::chat_view::ChatView;
+use crate::chat_view::info_panel::pull_requests::DiffView;
 use crate::config::harness_of;
 use crate::session::{Category, CategoryKind, Session, short_tokens};
 
@@ -28,6 +32,14 @@ pub(crate) struct InfoPanelState {
     context_detail: bool,
     /// The category opened to what makes it up, by name.
     category: Option<String>,
+    /// The Pull requests section is unfolded.
+    pr_section: bool,
+    /// The pull request opened to its files, by its address.
+    pr_open: Option<String>,
+    /// The file whose diff takes the panel's place, in place of its list.
+    diff: Option<DiffView>,
+    /// Asks gh about the open pull requests on screen every so often.
+    pr_clock: Option<Task<()>>,
 }
 
 impl Default for InfoPanelState {
@@ -38,6 +50,10 @@ impl Default for InfoPanelState {
             context_section: true,
             context_detail: false,
             category: None,
+            pr_section: true,
+            pr_open: None,
+            diff: None,
+            pr_clock: None,
         }
     }
 }
@@ -102,6 +118,16 @@ struct PanelLook {
     muted: Hsla,
     faint: Hsla,
     hover: Hsla,
+    /// A pull request's state, and its checks: passed in `open`'s green, failed in
+    /// `closed`'s red, running in `running`'s amber.
+    open: Hsla,
+    draft: Hsla,
+    merged: Hsla,
+    closed: Hsla,
+    running: Hsla,
+    /// The lines a change adds and removes.
+    added: Hsla,
+    removed: Hsla,
     /// The bar's part in use while it isn't split into categories.
     used: Hsla,
     /// The bar's free part, and the outline of its part kept for compacting.
@@ -121,6 +147,13 @@ impl PanelLook {
                 muted: theme.muted_foreground,
                 faint: color(0x8f8f8f),
                 hover: white().opacity(0.07),
+                open: color(0x4ade80),
+                draft: theme.muted_foreground,
+                merged: color(0xa78bfa),
+                closed: color(0xf87171),
+                running: color(0xf5b83d),
+                added: color(0x4ade80),
+                removed: color(0xf87171),
                 used: color(0xd4d4d4),
                 track: white().opacity(0.12),
                 hatch: white().opacity(0.30),
@@ -135,6 +168,13 @@ impl PanelLook {
                 muted: theme.muted_foreground,
                 faint: color(0x737373),
                 hover: black().opacity(0.05),
+                open: color(0x15803d),
+                draft: theme.muted_foreground,
+                merged: color(0x7c3aed),
+                closed: color(0xb91c1c),
+                running: color(0xb07800),
+                added: color(0x15803d),
+                removed: color(0xb91c1c),
                 used: color(0x404040),
                 track: black().opacity(0.10),
                 hatch: black().opacity(0.26),
@@ -212,6 +252,7 @@ impl ChatView {
             .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                 this.info_panel.open = !this.info_panel.open;
                 this.read_context_if_shown();
+                this.recheck_pull_requests(cx);
                 cx.notify();
             }))
     }
@@ -227,6 +268,23 @@ impl ChatView {
         let width = self.info_panel.width;
         let session = &self.sessions[self.active];
         let look = PanelLook::new(cx);
+        let body = match self.render_diff_view(session, look, cx) {
+            Some(diff) => diff,
+            None => div()
+                .id("info-panel")
+                .flex_1()
+                .min_h(px(0.))
+                .overflow_y_scroll()
+                .pl(BODY_LEFT)
+                .pr(BODY_RIGHT)
+                .pb(BODY_BOTTOM)
+                .flex()
+                .flex_col()
+                .gap(SECTION_GAP)
+                .child(self.render_pr_section(session, look, cx))
+                .child(self.render_context_section(session, look, cx))
+                .into_any_element(),
+        };
         div()
             .flex_none()
             .h_full()
@@ -240,20 +298,7 @@ impl ChatView {
                     .flex()
                     .flex_col()
                     .child(self.info_panel_edge(cx))
-                    .child(
-                        div()
-                            .id("info-panel")
-                            .flex_1()
-                            .min_h(px(0.))
-                            .overflow_y_scroll()
-                            .pl(BODY_LEFT)
-                            .pr(BODY_RIGHT)
-                            .pb(BODY_BOTTOM)
-                            .flex()
-                            .flex_col()
-                            .gap(SECTION_GAP)
-                            .child(self.render_context_section(session, look, cx)),
-                    ),
+                    .child(body),
             )
     }
 

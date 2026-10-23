@@ -4,6 +4,7 @@
 
 mod context;
 mod pacing;
+mod pull_requests;
 mod tool_call;
 
 use std::collections::HashMap;
@@ -26,6 +27,10 @@ pub(crate) use context::{
     Category, CategoryKind, ContextReport, KeptContext, SessionContext, now, short_tokens,
 };
 use pacing::Pacer;
+pub(crate) use pull_requests::{
+    ChecksState, GhProblem, KeptPullRequest, PrState, PrStatus, PullRequest, SessionPullRequests,
+    file_diffs, read_diff, view,
+};
 pub(crate) use tool_call::{Answer, Ask, Code, Diff, DiffLine, Shown, ToolCall, folded_text};
 
 /// How much later each word of a streamed piece starts fading in than the one before,
@@ -81,6 +86,8 @@ pub(crate) struct Session {
     pub(crate) archived: bool,
     /// Its context window, for the info panel.
     pub(crate) context: SessionContext,
+    /// The pull requests its tool calls opened, for the info panel.
+    pub(crate) pull_requests: SessionPullRequests,
     /// A turn prompted here is running, so the agent's text arrives as it is written: it
     /// fades in and new rows come in with motion. A loaded session's replay shows at once.
     live: bool,
@@ -149,6 +156,7 @@ impl Session {
             origin: Origin::New,
             archived: false,
             context: SessionContext::default(),
+            pull_requests: SessionPullRequests::default(),
             live: false,
             entering: HashMap::new(),
             changed: Instant::now(),
@@ -371,6 +379,7 @@ impl Session {
                 content,
                 locations,
             } => {
+                self.pull_requests.note(&title, &content);
                 let mut call = ToolCall::new(id, title, kind, status, self.live);
                 call.update(None, None, None, Some(content), Some(locations), cx);
                 self.push(Row::Tool(call), cx)
@@ -383,6 +392,15 @@ impl Session {
                 content,
                 locations,
             } => {
+                if let Some(content) = &content {
+                    let shown = title.clone().or_else(|| {
+                        self.tool_call_row(&id).and_then(|ix| match &self.rows[ix] {
+                            Row::Tool(call) => Some(call.title.clone()),
+                            _ => None,
+                        })
+                    });
+                    self.pull_requests.note(&shown.unwrap_or_default(), content);
+                }
                 // A call the agent never sent comes first in a permission request; acp-core
                 // sends its fields as an update just before.
                 let ix = self.tool_call_row(&id).unwrap_or_else(|| {
@@ -433,6 +451,7 @@ impl Session {
             // The turn's last row still comes in as the turn's others did.
             SessionEvent::TurnEnded { stop_reason } => {
                 self.busy = false;
+                self.pull_requests.turn_ended();
                 self.after_turn = true;
                 self.cancel_open_permissions(cx);
                 if stop_reason != "EndTurn" {
@@ -442,6 +461,7 @@ impl Session {
             }
             SessionEvent::TurnFailed(message) => {
                 self.busy = false;
+                self.pull_requests.turn_ended();
                 self.after_turn = true;
                 self.cancel_open_permissions(cx);
                 self.push(Row::Error(message), cx);

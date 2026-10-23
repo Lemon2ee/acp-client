@@ -459,6 +459,84 @@ fn diff(path: PathBuf, old: &str, new: &str, start: Option<(usize, usize)>) -> D
             }
         }
     }
+    finish(path, lines, start.is_some(), added, removed)
+}
+
+/// A file's part of a unified diff as `git diff` writes it, from its first `@@` line on:
+/// numbered from where each hunk starts, with the unchanged lines before and between
+/// hunks folded. The patch doesn't say how many lines follow its last hunk, so none
+/// fold there.
+pub(crate) fn patch_diff(path: PathBuf, patch: &[&str]) -> Diff {
+    let mut lines = Vec::new();
+    let (mut added, mut removed) = (0, 0);
+    // The next line of each text; none until the first hunk says where it starts.
+    let mut next: Option<(usize, usize)> = None;
+    for line in patch {
+        if let Some((old_start, new_start)) = hunk_start(line) {
+            let shown = next.map_or(1, |(old, _)| old);
+            let skipped = old_start.saturating_sub(shown);
+            if skipped > 0 {
+                lines.push(DiffLine::Folded(skipped));
+            }
+            next = Some((old_start, new_start));
+            continue;
+        }
+        let Some((old, new)) = next.as_mut() else {
+            continue;
+        };
+        // Some tools trim the space off an empty unchanged line.
+        let (change, text) = match line.split_at_checked(1) {
+            Some(("+", text)) => (ChangeTag::Insert, text),
+            Some(("-", text)) => (ChangeTag::Delete, text),
+            Some((" ", text)) => (ChangeTag::Equal, text),
+            // "\ No newline at end of file", about the line before.
+            Some(("\\", _)) => continue,
+            _ if line.is_empty() => (ChangeTag::Equal, ""),
+            _ => continue,
+        };
+        let number = match change {
+            ChangeTag::Insert => {
+                added += 1;
+                *new += 1;
+                *new - 1
+            }
+            ChangeTag::Delete => {
+                removed += 1;
+                *old += 1;
+                *old - 1
+            }
+            ChangeTag::Equal => {
+                *old += 1;
+                *new += 1;
+                *new - 1
+            }
+        };
+        lines.push(DiffLine::Line {
+            change,
+            number: number.to_string().into(),
+            text: text.trim_end_matches('\r').replace('\t', TAB).into(),
+        });
+    }
+    finish(path, lines, true, added, removed)
+}
+
+/// Where a hunk starts in the old text and the new one, from its `@@ -12,7 +12,9 @@`.
+fn hunk_start(line: &str) -> Option<(usize, usize)> {
+    let rest = line.strip_prefix("@@ -")?;
+    let (old, rest) = rest.split_once(" +")?;
+    let (new, _) = rest.split_once(" @@")?;
+    let start = |range: &str| range.split(',').next()?.parse().ok();
+    Some((start(old)?, start(new)?))
+}
+
+/// The diff of `lines`, with what copying it gives and the line that draws widest.
+fn finish(
+    path: PathBuf,
+    lines: Vec<DiffLine>,
+    numbered: bool,
+    added: usize,
+    removed: usize,
+) -> Diff {
     let copy = lines
         .iter()
         .map(|line| match line {
@@ -467,7 +545,7 @@ fn diff(path: PathBuf, old: &str, new: &str, start: Option<(usize, usize)>) -> D
         })
         .collect::<Vec<_>>()
         .join("\n");
-    let columns = SIGN_CHARS + if start.is_some() { NUMBER_CHARS } else { 0 };
+    let columns = SIGN_CHARS + if numbered { NUMBER_CHARS } else { 0 };
     let widest = widest(lines.iter().map(|line| match line {
         DiffLine::Line { text, .. } => text.chars().count() + columns,
         DiffLine::Folded(count) => folded_text(*count).chars().count(),
@@ -476,7 +554,7 @@ fn diff(path: PathBuf, old: &str, new: &str, start: Option<(usize, usize)>) -> D
         path,
         lines: lines.into(),
         widest,
-        numbered: start.is_some(),
+        numbered,
         added,
         removed,
         copy: copy.into(),

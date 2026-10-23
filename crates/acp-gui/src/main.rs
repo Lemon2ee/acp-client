@@ -51,7 +51,13 @@ gpui_kit::assets::icon_assets!(
         ToggleRight,
         Wrench,
         Layers,
-        CheckCheck
+        CheckCheck,
+        GitPullRequest,
+        GitPullRequestDraft,
+        GitPullRequestClosed,
+        GitMerge,
+        Clock,
+        CircleMinus
     ]
 );
 

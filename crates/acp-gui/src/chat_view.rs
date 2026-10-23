@@ -46,7 +46,7 @@ use crate::config::{
     load_saved_sessions, save_last_settings,
 };
 use crate::hotkey::{self, GlobalShortcut};
-use crate::session::{Held, Origin, Row, Session};
+use crate::session::{Held, Origin, Row, Session, SessionPullRequests};
 
 /// How often text held back in a live turn shows its next piece: about once a frame.
 const PACE_TICK: Duration = Duration::from_millis(16);
@@ -335,6 +335,7 @@ impl ChatView {
             if let Some(kept) = &saved.context {
                 session.context.restore(kept);
             }
+            session.pull_requests = SessionPullRequests::restore(&saved.pull_requests);
             self.sessions.push(session);
         }
     }
@@ -380,6 +381,7 @@ impl ChatView {
             archived: session.archived,
             title_source: session.title_source,
             context: session.context.kept(),
+            pull_requests: session.pull_requests.kept(),
         };
         let changed = config_folder()
             .ok_or_else(|| std::io::Error::other("there is no config folder"))
@@ -587,6 +589,7 @@ impl ChatView {
         }
         self.input.update(cx, |input, cx| input.focus(window, cx));
         self.read_context_if_shown();
+        self.recheck_pull_requests(cx);
         cx.notify();
     }
 
@@ -612,6 +615,17 @@ impl ChatView {
             return;
         };
         self.change_kept(key, |saved| saved.context = Some(kept));
+    }
+
+    /// Keeps the pull requests the session opened, as they now stand, for later runs.
+    fn keep_pull_requests(&self, key: SessionKey) {
+        let Some(kept) = self
+            .session(key)
+            .map(|session| session.pull_requests.kept())
+        else {
+            return;
+        };
+        self.change_kept(key, |saved| saved.pull_requests = kept);
     }
 
     /// Makes `change` to the session as kept for later runs, if it is kept already.
@@ -697,6 +711,7 @@ impl ChatView {
         if let Some(kept) = session.context.kept() {
             fresh.context.restore(&kept);
         }
+        fresh.pull_requests = SessionPullRequests::restore(&session.pull_requests.kept());
         let old = std::mem::replace(&mut self.sessions[ix], fresh);
         self.sessions[ix].draft = old.draft;
         let _ = self.agents[old.agent]
@@ -1034,6 +1049,7 @@ impl ChatView {
                 }
                 // The agent may just have said it can read the window, or answered a read.
                 self.read_context_if_shown();
+                self.note_pull_requests(cx);
             }
             AgentEvent::RateLimits(windows) => self.set_rate_limits(agent, windows, cx),
             // Connection-wide failures show in the session on screen when it is the
@@ -1093,12 +1109,17 @@ impl ChatView {
                 last = now;
                 let holding = this.update(cx, |this, cx| {
                     let (mut holding, mut changed) = (false, false);
+                    let mut landed = false;
                     for (ix, session) in this.sessions.iter_mut().enumerate() {
                         let paced = session.pace(dt, cx);
                         holding |= paced.holds;
+                        landed |= paced.landed;
                         // Text shown off screen draws nothing; a landed event may change
                         // what the window shows of the session anywhere, as its busy state.
                         changed |= paced.landed || paced.shown && ix == this.active;
+                    }
+                    if landed {
+                        this.note_pull_requests(cx);
                     }
                     if !holding {
                         this.pacing = None;

@@ -55,8 +55,8 @@ const BOX_RADIUS: Pixels = px(8.);
 const BOX_HEADER_HEIGHT: Pixels = px(28.);
 const BOX_TEXT_SIZE: Pixels = px(14.);
 const BOX_TEXT_LINE_HEIGHT: Pixels = px(21.);
-const CODE_SIZE: Pixels = px(12.);
-const CODE_LINE_HEIGHT: Pixels = px(18.);
+pub(super) const CODE_SIZE: Pixels = px(12.);
+pub(super) const CODE_LINE_HEIGHT: Pixels = px(18.);
 const CODE_PAD: Pixels = px(10.);
 const NUMBER_WIDTH: Pixels = px(28.);
 const SIGN_WIDTH: Pixels = px(12.);
@@ -90,7 +90,7 @@ const BOX_GROUP: &str = "tool-call-box";
 
 /// The colors of the tool calls' rows and boxes, quieter than the agent's text.
 #[derive(Clone, Copy)]
-struct ToolLook {
+pub(super) struct ToolLook {
     /// The title and the icon.
     muted: Hsla,
     /// The title and the icon under the pointer.
@@ -108,13 +108,13 @@ struct ToolLook {
     /// The box's fill, its edge and its text.
     code: Hsla,
     line: Hsla,
-    code_text: Hsla,
+    pub(super) code_text: Hsla,
     /// Behind the copy button where it floats over the box's text.
     card: Hsla,
 }
 
 impl ToolLook {
-    fn new(cx: &App) -> Self {
+    pub(super) fn new(cx: &App) -> Self {
         let color = |hex: u32| Hsla::from(rgb(hex));
         if cx.theme().is_dark() {
             Self {
@@ -1222,7 +1222,7 @@ fn line_range(code: &Code) -> Option<String> {
 }
 
 /// The frame every box shares: the code fill inside a hairline, rounded.
-fn frame(look: ToolLook) -> Div {
+pub(super) fn frame(look: ToolLook) -> Div {
     div()
         .relative()
         .group(BOX_GROUP)
@@ -1365,46 +1365,52 @@ fn diff_box(
             id,
             diff.lines.clone(),
             diff.widest,
-            move |line, look| match line {
-                DiffLine::Line {
-                    change,
-                    number,
-                    text,
-                } => {
-                    let (bg, sign, sign_color) = match change {
-                        ChangeTag::Insert => (Some(look.added_bg), "+", look.added),
-                        ChangeTag::Delete => (Some(look.removed_bg), "−", look.removed),
-                        ChangeTag::Equal => (None, "", look.muted),
-                    };
-                    h_flex()
-                        .px(CODE_PAD)
-                        .whitespace_nowrap()
-                        .when_some(bg, |row, bg| row.bg(bg))
-                        .when(numbered, |row| row.child(number_cell(number.clone(), look)))
-                        .child(
-                            div()
-                                .w(SIGN_WIDTH)
-                                .flex_none()
-                                .text_color(sign_color)
-                                .child(sign),
-                        )
-                        .child(text.clone())
-                        .into_any_element()
-                }
-                DiffLine::Folded(count) => h_flex()
-                    .px(CODE_PAD)
-                    .whitespace_nowrap()
-                    .bg(look.hover)
-                    .text_color(look.muted)
-                    .child(folded_text(*count))
-                    .into_any_element(),
-            },
+            move |line, look| diff_line(line, numbered, look),
             look,
             mono,
             window,
             cx,
         ))
         .children(copy)
+}
+
+/// A line of a diff: an added one green, a removed one red, each with its number when
+/// the diff has them, or a run of unchanged lines folded into one.
+pub(super) fn diff_line(line: &DiffLine, numbered: bool, look: ToolLook) -> AnyElement {
+    match line {
+        DiffLine::Line {
+            change,
+            number,
+            text,
+        } => {
+            let (bg, sign, sign_color) = match change {
+                ChangeTag::Insert => (Some(look.added_bg), "+", look.added),
+                ChangeTag::Delete => (Some(look.removed_bg), "−", look.removed),
+                ChangeTag::Equal => (None, "", look.muted),
+            };
+            h_flex()
+                .px(CODE_PAD)
+                .whitespace_nowrap()
+                .when_some(bg, |row, bg| row.bg(bg))
+                .when(numbered, |row| row.child(number_cell(number.clone(), look)))
+                .child(
+                    div()
+                        .w(SIGN_WIDTH)
+                        .flex_none()
+                        .text_color(sign_color)
+                        .child(sign),
+                )
+                .child(text.clone())
+                .into_any_element()
+        }
+        DiffLine::Folded(count) => h_flex()
+            .px(CODE_PAD)
+            .whitespace_nowrap()
+            .bg(look.hover)
+            .text_color(look.muted)
+            .child(folded_text(*count))
+            .into_any_element(),
+    }
 }
 
 fn number_cell(number: SharedString, look: ToolLook) -> Div {
