@@ -569,8 +569,8 @@ impl ChatView {
 
     /// Has the session `key`, which has no prompt yet, work in `folder`. One the agent has
     /// created, or is creating as a spare, gives way to one the agent will create there,
-    /// as ACP can't move a session: the text typed in it and the settings changed in it
-    /// go with it.
+    /// as ACP can't move a session: the text typed in it, the tiles on its prompt and the
+    /// settings changed in it go with it.
     fn set_folder(
         &mut self,
         key: SessionKey,
@@ -615,6 +615,9 @@ impl ChatView {
         let mut fresh = self.create_session(agent, folder, cx);
         let fresh_key = fresh.key;
         fresh.draft = std::mem::take(&mut self.sessions[ix].draft);
+        // A card let go on the prompt is off the board, so its tiles are all that is left
+        // of it.
+        fresh.attachments = std::mem::take(&mut self.sessions[ix].attachments);
         let old = std::mem::replace(&mut self.sessions[ix], fresh);
         let _ = self.agents[agent]
             .commands
