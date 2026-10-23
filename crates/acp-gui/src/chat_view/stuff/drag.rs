@@ -1,10 +1,13 @@
-//! A card dragged off the Stuff board into the chat. Let go over the prompt box, its text
-//! goes into the prompt after what is there, and what was pasted into it onto the
-//! prompt's row of tiles, not sent. Let go over the transcript, it is sent at once,
-//! unless the agent is still replying, when it goes into the prompt as well. Anywhere
-//! else, or on Esc, it flies back. A card that went into the chat is used: its place on
-//! the board closes and the note is gone, from later runs too, though what was pasted
-//! into it stays for the prompt's tiles or the row it was sent as.
+//! A card dragged off the Stuff board into the chat. It comes away by its tape: picked
+//! up, it follows only part of the pointer as the tape stretches, until the tape tears in
+//! two and the card catches up, the tape's left half staying on the board and its right
+//! half going with the card. Let go before that, it settles back under the tape and goes
+//! nowhere. Let go over the prompt box, its text goes into the prompt after what is there,
+//! and what was pasted into it onto the prompt's row of tiles, not sent. Let go over the
+//! transcript, it is sent at once, unless the agent is still replying, when it goes into
+//! the prompt as well. Anywhere else, or on Esc, it flies back. A card that went into the
+//! chat is used: its place on the board closes and the note is gone, from later runs too,
+//! though what was pasted into it stays for the prompt's tiles or the row it was sent as.
 //!
 //! gpui's drag view is gone once the pointer lets go, so the card's way into the prompt,
 //! onto its sent row or back to the board is drawn by `ChatView` over the whole window.
@@ -23,11 +26,17 @@ use crate::chat_view::ChatView;
 use crate::chat_view::pickers::MenuLook;
 use crate::chat_view::stuff::attachments::TileHover;
 use crate::chat_view::stuff::{
-    CARD_PAD, CARD_RADIUS, CardLook, LINE_HEIGHT, SLOT_EDGE_ALPHA, TEXT_SIZE, dashed_edge, measure,
-    mix_shadows,
+    CARD_PAD, CARD_RADIUS, CardLook, Half, LINE_HEIGHT, SLOT_EDGE_ALPHA, TEXT_SIZE, card_shadow,
+    dashed_edge, measure, mix_shadows,
 };
 use crate::config::{StuffNote, change_stuff, config_folder};
 
+/// A card in hand is held by its tape, following 35% of the pointer, until the pointer has
+/// gone 16px from where the drag began. Then the tape tears, and the card catches up with
+/// the pointer over the fast duration as it lifts, while the tape's halves come loose over
+/// the normal one.
+const PULL: f32 = 0.35;
+const TEAR_AT: Pixels = px(16.);
 /// A card let go of fades from 120ms, over 160ms, as it reaches its place.
 const FADE_AFTER: Duration = Duration::from_millis(120);
 const FADE: Duration = Duration::from_millis(160);
@@ -94,6 +103,85 @@ struct Held {
     /// Where on the card the pointer holds it.
     grab: Point<Pixels>,
     size: Size<Pixels>,
+    pull: Rc<Pull>,
+}
+
+/// How a card in hand is coming off its tape, shared with what gpui draws under the
+/// pointer.
+struct Pull {
+    /// Where the pointer was as the drag began, in the window.
+    start: Point<Pixels>,
+    torn: Cell<Option<Torn>>,
+}
+
+/// A card torn off its tape.
+#[derive(Clone, Copy)]
+struct Torn {
+    at: Instant,
+    /// How far behind the pointer the card was as it tore.
+    behind: Point<Pixels>,
+}
+
+impl Pull {
+    /// How far from its place a card still on its tape is, with the pointer at `pointer`.
+    fn pulled(&self, pointer: Point<Pixels>) -> Point<Pixels> {
+        (pointer - self.start) * PULL
+    }
+
+    fn torn(&self) -> bool {
+        self.torn.get().is_some()
+    }
+
+    /// Tears the card off its tape, at `now`, if the pointer at `pointer` has gone far
+    /// enough. Whether it tore just now.
+    fn tear(&self, pointer: Point<Pixels>, now: Instant) -> bool {
+        let travel = pointer - self.start;
+        if self.torn() || px(travel.magnitude() as f32) < TEAR_AT {
+            return false;
+        }
+        self.torn.set(Some(Torn {
+            at: now,
+            behind: self.pulled(pointer) - travel,
+        }));
+        true
+    }
+
+    /// How far behind the pointer at `pointer` the card is drawn at `now`.
+    fn behind(&self, pointer: Point<Pixels>, now: Instant, cx: &App) -> Point<Pixels> {
+        match self.torn.get() {
+            Some(torn) => torn.behind * (1. - torn.caught(now, cx)),
+            None => self.pulled(pointer) - (pointer - self.start),
+        }
+    }
+}
+
+impl Torn {
+    /// How far the card has caught up with the pointer, and lifted, eased, 0 to 1.
+    fn caught(&self, now: Instant, cx: &App) -> f32 {
+        if cx.reduce_motion() {
+            return 1.;
+        }
+        let motion = cx.theme().motion_tokens();
+        let elapsed = now.saturating_duration_since(self.at);
+        part(
+            elapsed,
+            Duration::ZERO,
+            motion.duration_fast,
+            &motion.easing_enter,
+        )
+    }
+}
+
+/// How far the halves of a tape torn at `torn` have come loose at `now`, eased, 0 to 1.
+fn loose(torn: Instant, now: Instant, cx: &App) -> f32 {
+    let motion = cx.theme().motion_tokens();
+    let elapsed = now.saturating_duration_since(torn);
+    part(
+        elapsed,
+        Duration::ZERO,
+        motion.duration_normal,
+        &motion.easing_enter,
+    )
 }
 
 /// A card let go of, on its way to `to` from where it was let go, in the window.
@@ -102,12 +190,28 @@ struct Dropped {
     to: DropTo,
     from: Bounds<Pixels>,
     started: Instant,
+    /// When it tore off its tape; never, if it was let go before and settles back under it.
+    torn: Option<Instant>,
 }
 
-/// A card that went into the chat, let go of at `dropped`.
+/// A card that went into the chat, let go of at `dropped`, torn off its tape at `torn`.
 struct Leaving {
     id: u64,
     dropped: Instant,
+    torn: Instant,
+}
+
+/// What a card's place on the board shows.
+#[derive(Clone, Copy)]
+pub(super) enum Slot {
+    /// The card.
+    Card,
+    /// Nothing: the card is pulled at by its tape, or settling back under it, and drawn
+    /// over the window with its tape.
+    Away,
+    /// Just its place, a dashed edge, with its tape whole, or once torn the tape's left half
+    /// `loose` of the way to coming loose.
+    Hollow { loose: Option<f32> },
 }
 
 /// How far the place a used card left on the board has gone, eased, 0 to 1.
@@ -156,6 +260,8 @@ struct DropFrame {
     faded: f32,
     /// The sent row filling in under the card.
     filled: f32,
+    /// The halves of its torn tape coming loose, then joining again as it lands back.
+    loose: f32,
     /// Past 300ms: the prompt's ring letting go.
     settling: bool,
 }
@@ -171,16 +277,39 @@ impl DragState {
         self.over.filter(|_| self.dragging(cx))
     }
 
-    /// Whether the card with `id` on the board is just its place: while it is in hand, on
-    /// its way back, or gone into the chat.
-    pub(super) fn hollow(&self, id: u64, cx: &App) -> bool {
-        let held = self.dragging(cx) && self.held.as_ref().is_some_and(|held| held.note.id == id);
+    /// What the place of the card with `id` on the board shows: the card, or less while
+    /// it is in hand, on its way back, or gone into the chat.
+    pub(super) fn slot(&self, id: u64, cx: &App) -> Slot {
+        let now = cx.background_executor().now();
+        let held = self.held.as_ref().filter(|held| held.note.id == id);
+        if let Some(held) = held.filter(|_| self.dragging(cx)) {
+            return match held.pull.torn.get() {
+                None => Slot::Away,
+                // Taken off the board at once, as it comes away without a tear.
+                Some(_) if cx.reduce_motion() => Slot::Hollow { loose: None },
+                Some(torn) => Slot::Hollow {
+                    loose: Some(loose(torn.at, now, cx)),
+                },
+            };
+        }
         let dropped = self
             .dropped
             .as_ref()
-            .is_some_and(|dropped| dropped.note.id == id)
-            && self.drop_frame(cx).is_some();
-        held || dropped || self.leaving.iter().any(|leaving| leaving.id == id)
+            .filter(|dropped| dropped.note.id == id);
+        if let Some((dropped, frame)) = dropped.zip(self.drop_frame(cx)) {
+            return match dropped.torn {
+                None => Slot::Away,
+                Some(_) => Slot::Hollow {
+                    loose: Some(frame.loose),
+                },
+            };
+        }
+        match self.leaving.iter().find(|leaving| leaving.id == id) {
+            Some(leaving) => Slot::Hollow {
+                loose: Some(loose(leaving.torn, now, cx)),
+            },
+            None => Slot::Card,
+        }
     }
 
     /// How far the place of the card with `id` has closed, if the card went into the chat.
@@ -207,16 +336,29 @@ impl DragState {
         })
     }
 
-    /// Whether a place on the board is closing, which takes a frame each frame.
-    pub(super) fn any_closing(&self) -> bool {
-        !self.leaving.is_empty()
+    /// Whether a place on the board is changing by itself, closing or with its tape coming
+    /// loose, and so drawn again each frame.
+    pub(super) fn moving(&self, cx: &App) -> bool {
+        let now = cx.background_executor().now();
+        let loosening = self
+            .held
+            .as_ref()
+            .and_then(|held| held.pull.torn.get())
+            .is_some_and(|torn| loose(torn.at, now, cx) < 1.);
+        loosening || !self.leaving.is_empty()
     }
 
     fn drop_frame(&self, cx: &App) -> Option<DropFrame> {
         let dropped = self.dropped.as_ref()?;
         let motion = cx.theme().motion_tokens();
-        let (normal, slow) = (motion.duration_normal, motion.duration_slow);
+        let (fast, normal, slow) = (
+            motion.duration_fast,
+            motion.duration_normal,
+            motion.duration_slow,
+        );
         let total = match dropped.to {
+            // Back under its tape.
+            DropTo::Back if dropped.torn.is_none() => fast,
             DropTo::Back => slow,
             DropTo::Prompt => SETTLE_AFTER + slow,
             // Once its row has filled in.
@@ -230,14 +372,22 @@ impl DragState {
             return None;
         }
         let back = matches!(dropped.to, DropTo::Back);
+        let moved = match dropped.torn {
+            Some(_) => part(elapsed, Duration::ZERO, slow, &motion.easing_move),
+            None => part(elapsed, Duration::ZERO, fast, &motion.easing_enter),
+        };
+        let now = cx.background_executor().now();
+        let loose = dropped.torn.map_or(0., |torn| loose(torn, now, cx));
         Some(DropFrame {
-            moved: part(elapsed, Duration::ZERO, slow, &motion.easing_move),
+            moved,
             faded: if back {
                 0.
             } else {
                 part(elapsed, FADE_AFTER, FADE, &motion.easing_enter)
             },
             filled: part(elapsed, FADE_AFTER, normal, &motion.easing_enter),
+            // Straight again as it lands, where the halves join.
+            loose: if back { loose * (1. - moved) } else { loose },
             settling: elapsed >= SETTLE_AFTER,
         })
     }
@@ -250,45 +400,82 @@ fn part(elapsed: Duration, after: Duration, length: Duration, easing: &Easing) -
     easing.sample(into.min(1.))
 }
 
-/// What gpui draws under the pointer while a card is in hand: the card, lifting off the
-/// board onto the menus' surface over the fast duration.
+/// What gpui draws under the pointer while a card is in hand. On its tape, the card is
+/// drawn behind the pointer where the pull has it. Torn off, it catches up and lifts off
+/// the board onto the menus' surface, with the tape's right half on it.
 pub(super) struct CardInHand {
     note: StuffNote,
     width: Pixels,
-    picked: Instant,
+    pull: Rc<Pull>,
 }
 
 impl Render for CardInHand {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let motion = cx.theme().motion_tokens();
-        let elapsed = cx
-            .background_executor()
-            .now()
-            .saturating_duration_since(self.picked);
-        let progress = elapsed.as_secs_f32() / motion.duration_fast.as_secs_f32();
-        let lifted = if cx.reduce_motion() || progress >= 1. {
-            1.
-        } else {
-            window.request_animation_frame();
-            motion.easing_enter.sample(progress)
+        let pointer = window.mouse_position();
+        let now = cx.background_executor().now();
+        let behind = self.pull.behind(pointer, now, cx);
+        // gpui puts the view's corner where the pointer holds the card, so the card is
+        // moved back from it.
+        let Some(torn) = self.pull.torn.get() else {
+            let pulled = self.pull.pulled(pointer);
+            return div().child(
+                pulled_card(&self.note, self.width, pulled, cx)
+                    .left(behind.x)
+                    .top(behind.y),
+            );
         };
+        let caught = torn.caught(now, cx);
+        let loose = loose(torn.at, now, cx);
+        if caught < 1. || loose < 1. {
+            window.request_animation_frame();
+        }
         let look = MenuLook::new(cx);
         let card = CardLook::new(cx);
-        div()
-            .w(self.width)
-            .p(CARD_PAD)
-            .rounded(CARD_RADIUS)
-            .bg(card.background.interpolate(&look.surface, lifted))
-            .shadow(mix_shadows(
-                &card.shadow,
-                &in_hand_shadow(cx.theme().is_dark()),
-                lifted,
-            ))
-            .text_color(cx.theme().foreground)
-            .text_size(TEXT_SIZE)
-            .line_height(LINE_HEIGHT)
-            .child(card.body(&self.note))
+        let dark = cx.theme().is_dark();
+        div().child(
+            div()
+                .relative()
+                .left(behind.x)
+                .top(behind.y)
+                .w(self.width)
+                .p(CARD_PAD)
+                .rounded(CARD_RADIUS)
+                .bg(card.background.interpolate(&look.surface, caught))
+                .shadow(mix_shadows(
+                    &pulled_shadow(dark, 1.),
+                    &in_hand_shadow(dark),
+                    caught,
+                ))
+                .text_color(cx.theme().foreground)
+                .text_size(TEXT_SIZE)
+                .line_height(LINE_HEIGHT)
+                .child(card.body(&self.note))
+                // Taken off at once, its tape stays whole on the board.
+                .when(!cx.reduce_motion(), |card_in_hand| {
+                    card_in_hand.child(card.torn_tape(Half::Right, loose))
+                }),
+        )
     }
+}
+
+/// A card pulled `by` from its place while its tape still holds it: the tape stretched
+/// from where it holds the board to where it holds the card, and the card's shadow up a
+/// little with the pull.
+fn pulled_card(note: &StuffNote, width: Pixels, by: Point<Pixels>, cx: &App) -> Div {
+    let card = CardLook::new(cx);
+    let pull = (px(by.magnitude() as f32) / (TEAR_AT * PULL)).min(1.);
+    div()
+        .relative()
+        .w(width)
+        .p(CARD_PAD)
+        .rounded(CARD_RADIUS)
+        .bg(card.background)
+        .shadow(pulled_shadow(cx.theme().is_dark(), pull))
+        .text_color(cx.theme().foreground)
+        .text_size(TEXT_SIZE)
+        .line_height(LINE_HEIGHT)
+        .child(card.stretched_tape(by))
+        .child(card.body(note))
 }
 
 /// Makes a card's drag view as it is picked up, and keeps which card it is, where the
@@ -297,37 +484,46 @@ pub(super) fn pick_up(
     view: WeakEntity<ChatView>,
 ) -> impl Fn(&StuffDrag, Point<Pixels>, &mut Window, &mut App) -> Entity<CardInHand> + 'static {
     move |drag, grab, _, cx| {
-        let picked = cx.background_executor().now();
+        // With reduce motion, it comes away at once, as if torn as it was picked up.
+        let torn = cx.reduce_motion().then(|| Torn {
+            at: cx.background_executor().now(),
+            behind: Point::default(),
+        });
         let held = view
             .update(cx, |this, cx| {
                 let stuff = &mut this.stuff;
                 let note = stuff.notes.iter().find(|note| note.id == drag.id)?.clone();
-                let size = stuff.layout.cards.borrow().get(&note.id)?.size;
+                let card = *stuff.layout.cards.borrow().get(&note.id)?;
+                let pull = Rc::new(Pull {
+                    start: card.origin + grab,
+                    torn: Cell::new(torn),
+                });
                 stuff.drag.over = None;
                 stuff.drag.held = Some(Held {
                     note: note.clone(),
                     grab,
-                    size,
+                    size: card.size,
+                    pull: pull.clone(),
                 });
                 cx.notify();
-                Some((note, size.width))
+                Some((note, card.size.width, pull))
             })
             .ok()
             .flatten();
         // A card gone from the board meanwhile is held as nothing, and lands nowhere.
-        let (note, width) = held.unwrap_or_else(|| {
+        let (note, width, pull) = held.unwrap_or_else(|| {
             let note = StuffNote {
                 id: drag.id,
                 text: String::new(),
                 attachments: Vec::new(),
             };
-            (note, px(0.))
+            let pull = Pull {
+                start: Point::default(),
+                torn: Cell::new(torn),
+            };
+            (note, px(0.), Rc::new(pull))
         });
-        cx.new(|_| CardInHand {
-            note,
-            width,
-            picked,
-        })
+        cx.new(|_| CardInHand { note, width, pull })
     }
 }
 
@@ -349,9 +545,16 @@ impl ChatView {
     }
 
     fn drag_over(&mut self, at: Point<Pixels>, cx: &mut Context<Self>) {
+        let now = cx.background_executor().now();
         let zone = self.zone_at(at);
         let drag = &mut self.stuff.drag;
-        if zone != drag.over {
+        let Some(held) = &drag.held else {
+            return;
+        };
+        let tore = held.pull.tear(at, now);
+        // On its tape, it is over nothing yet.
+        let zone = zone.filter(|_| held.pull.torn());
+        if zone != drag.over || tore {
             drag.over = zone;
             drag.last = zone.or(drag.last);
             cx.notify();
@@ -359,7 +562,8 @@ impl ChatView {
     }
 
     /// The card in hand let go at `at`, over `zone`: into the prompt, sent, or back. Into
-    /// the chat, it is taken off the board.
+    /// the chat, it is taken off the board. Let go before it tore off its tape, it goes
+    /// back under it wherever it is.
     fn let_go(
         &mut self,
         at: Point<Pixels>,
@@ -370,7 +574,9 @@ impl ChatView {
         let Some(held) = self.stuff.drag.held.take() else {
             return;
         };
-        let to = match zone {
+        let now = cx.background_executor().now();
+        let torn = held.pull.torn.get().map(|torn| torn.at);
+        let to = match zone.filter(|_| torn.is_some()) {
             Some(Zone::Prompt { .. }) => {
                 let key = self.sessions[self.active].key;
                 let note = held.note.clone();
@@ -399,24 +605,27 @@ impl ChatView {
             None => DropTo::Back,
         };
         self.stuff.drag.zones.sent.set(None);
-        let (id, started) = (held.note.id, cx.background_executor().now());
+        let id = held.note.id;
+        // From where it is drawn, which may still be catching up with the pointer.
+        let corner = at - held.grab + held.pull.behind(at, now, cx);
         self.stuff.drag.dropped = (!cx.reduce_motion()).then(|| Dropped {
-            from: Bounds::new(at - held.grab, held.size),
+            from: Bounds::new(corner, held.size),
             note: held.note,
             to,
-            started,
+            started: now,
+            torn,
         });
         if !matches!(to, DropTo::Back) {
-            self.take_off_board(id, started, cx);
+            self.take_off_board(id, now, torn.unwrap_or(now), cx);
         }
         cx.notify();
     }
 
-    /// Takes the card with `id`, let go into the chat at `dropped`, off the board and out
-    /// of the notes kept for later runs. Its place closes first, unless motion is reduced.
-    /// What was pasted into it stays on disk, as the prompt's tiles or the row it was sent
-    /// as still show it.
-    fn take_off_board(&mut self, id: u64, dropped: Instant, cx: &mut Context<Self>) {
+    /// Takes the card with `id`, let go into the chat at `dropped` after it tore off its
+    /// tape at `torn`, off the board and out of the notes kept for later runs. Its place
+    /// closes first, unless motion is reduced. What was pasted into it stays on disk, as
+    /// the prompt's tiles or the row it was sent as still show it.
+    fn take_off_board(&mut self, id: u64, dropped: Instant, torn: Instant, cx: &mut Context<Self>) {
         let changed = config_folder()
             .ok_or_else(|| std::io::Error::other("there is no config folder"))
             .and_then(|folder| change_stuff(&folder, |notes| notes.retain(|note| note.id != id)));
@@ -427,7 +636,7 @@ impl ChatView {
             self.forget_card(id);
             return;
         }
-        self.stuff.drag.leaving.push(Leaving { id, dropped });
+        self.stuff.drag.leaving.push(Leaving { id, dropped, torn });
         let closed = SETTLE_AFTER + cx.theme().motion_tokens().duration_slow;
         cx.spawn(async move |this, cx| {
             cx.background_executor().timer(closed).await;
@@ -555,6 +764,15 @@ impl ChatView {
         let to = Bounds::new(corner.unwrap_or(from.origin), from.size);
         let bounds = from.interpolate(&to, frame.moved);
         let origin = bounds.origin - drag.zones.root.get().origin;
+        if dropped.torn.is_none() {
+            let by = bounds.origin - to.origin;
+            return Some(
+                pulled_card(&dropped.note, bounds.size.width, by, cx)
+                    .absolute()
+                    .left(origin.x)
+                    .top(origin.y),
+            );
+        }
         let look = MenuLook::new(cx);
         let card = CardLook::new(cx);
         let lifted = in_hand_shadow(cx.theme().is_dark());
@@ -579,7 +797,8 @@ impl ChatView {
                 .text_size(TEXT_SIZE)
                 .line_height(LINE_HEIGHT)
                 .opacity(1. - frame.faded)
-                .child(card.body(&dropped.note)),
+                .child(card.body(&dropped.note))
+                .child(card.torn_tape(Half::Right, frame.loose)),
         )
     }
 
@@ -800,6 +1019,20 @@ fn pill(text: &'static str, cx: &App) -> Div {
         .text_size(PILL_TEXT_SIZE)
         .whitespace_nowrap()
         .child(text)
+}
+
+/// A card's resting shadow as it is pulled at, `pull` of the way to tearing off: the wider
+/// of its soft shadows grows to 8px down and as wide, 4px (dark) or 6px (light) in, and
+/// darker, as it starts to come up.
+fn pulled_shadow(dark: bool, pull: f32) -> Vec<BoxShadow> {
+    let mut shadow = card_shadow(dark);
+    let (spread, alpha) = if dark { (3., 0.15) } else { (5., 0.08) };
+    let far = &mut shadow[1];
+    far.offset.y = px(2. + 6. * pull);
+    far.blur_radius = px(2. + 6. * pull);
+    far.spread_radius = px(-1. - spread * pull);
+    far.color.a += alpha * pull;
+    shadow
 }
 
 /// A card in hand: higher off the board than the menus, with the same ring, two wider
