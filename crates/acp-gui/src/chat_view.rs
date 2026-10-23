@@ -47,11 +47,12 @@ use crate::chrome::{
 };
 use crate::config::{
     AppSettings, SavedSession, StuffAttachment, append_transcript, change_saved_sessions,
-    config_folder, forget_transcript, kept_name, load_last_settings, load_report,
-    load_saved_sessions, load_transcript, save_last_settings, save_report, write_transcript,
+    config_folder, forget_attachment, forget_transcript, kept_name, load_last_settings,
+    load_report, load_saved_sessions, load_transcript, save_last_settings, save_report,
+    write_transcript,
 };
 use crate::hotkey::{self, GlobalShortcut};
-use crate::session::{Held, Origin, Row, Session, SessionFiles, SessionPullRequests};
+use crate::session::{Held, KeptRow, Origin, Row, Session, SessionFiles, SessionPullRequests};
 
 /// How often text held back in a live turn shows its next piece: about once a frame.
 const PACE_TICK: Duration = Duration::from_millis(16);
@@ -766,14 +767,18 @@ impl ChatView {
                 continue;
             };
             let mut written = Ok(());
-            if let Some(rows) = whole {
-                written = write_transcript(agent, id, &rows);
+            if let Some(rows) = &whole {
+                written = write_transcript(agent, id, rows);
             }
-            if let Some(rows) = added {
-                written = written.and_then(|()| append_transcript(agent, id, &rows));
+            if let Some(rows) = &added {
+                written = written.and_then(|()| append_transcript(agent, id, rows));
             }
-            if let Err(err) = written {
-                eprintln!("couldn't keep the transcript for later runs: {err}");
+            match written {
+                Ok(()) => whole
+                    .iter()
+                    .chain(&added)
+                    .for_each(|rows| self.stuff.sent_and_kept(rows)),
+                Err(err) => eprintln!("couldn't keep the transcript for later runs: {err}"),
             }
         }
     }
@@ -919,6 +924,12 @@ impl ChatView {
         };
         let _ = slot.commands.try_send(command);
         if let (Some(id), Some(agent)) = (session.id, kept_name(&slot.name)) {
+            // The images pasted into the cards its prompts were sent with are shown nowhere
+            // else, as a card used in the chat is off the board.
+            load_transcript(agent, &id)
+                .iter()
+                .flat_map(KeptRow::attachments)
+                .for_each(forget_attachment);
             forget_transcript(agent, &id);
             let changed = config_folder()
                 .ok_or_else(|| std::io::Error::other("there is no config folder"))

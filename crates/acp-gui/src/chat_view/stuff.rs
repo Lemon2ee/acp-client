@@ -28,6 +28,7 @@ use crate::chat_view::stuff::drag::{DragState, Slot, StuffDrag, pick_up};
 use crate::config::{
     StuffAttachment, StuffNote, change_stuff, config_folder, forget_attachment, load_stuff,
 };
+use crate::session::KeptRow;
 pub(crate) use attachments::{STRIP_GAP, TileLook, TilesOn};
 
 /// The text of the note and the cards. Both wrap it at the sidebar's width less 40, so a
@@ -103,7 +104,8 @@ pub(crate) struct StuffState {
     /// What has been pasted into the note besides text, until it is stuck.
     pending: Vec<StuffAttachment>,
     /// What was pasted into the cards used in the chat, which the prompt's tiles and the
-    /// rows they were sent as show until the app quits.
+    /// rows they were sent as show until the app quits, or for later runs once a kept
+    /// session's transcript has the row.
     used: Vec<StuffAttachment>,
     tile_hover: TileHover,
     _quit: Subscription,
@@ -166,8 +168,9 @@ impl StuffState {
             }
         });
         // Like the note's text, what was pasted into it is gone with the app, and so are
-        // the images saved for it. So are those of the cards used in the chat, as neither
-        // a prompt's tiles nor a replayed row show them in a later run.
+        // the images saved for it. So are those of the cards used in the chat that no kept
+        // transcript has: a prompt's tiles, which aren't kept, or a prompt sent in a session
+        // that isn't kept or whose turn hadn't ended, which only the agent's replay shows.
         let quit = cx.on_app_quit(|this, _| {
             let stuff = &mut this.stuff;
             stuff
@@ -236,6 +239,14 @@ impl StuffState {
             .map_or(0, |time| time.as_millis() as u64);
         let newest = self.notes.iter().map(|note| note.id).max().unwrap_or(0);
         now.max(newest + 1)
+    }
+
+    /// Leaves what the prompts among `rows` were sent with to their session, now that its
+    /// transcript keeps them for later runs: they go when the session is deleted.
+    pub(crate) fn sent_and_kept(&mut self, rows: &[KeptRow]) {
+        let sent = rows.iter().flat_map(KeptRow::attachments);
+        self.used
+            .retain(|used| !sent.clone().any(|sent| sent.path() == used.path()));
     }
 }
 
