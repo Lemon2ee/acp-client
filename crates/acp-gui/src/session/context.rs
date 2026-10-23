@@ -155,8 +155,10 @@ impl ContextReport {
                 }
                 continue;
             }
-            if let Some(table) = table.take() {
-                report.take(&table, &heading);
+            if let Some(table) = table.take()
+                && !report.take(&table, &heading)
+            {
+                return Some(report);
             }
             if line.starts_with('#') {
                 heading = line.trim_start_matches('#').trim().to_lowercase();
@@ -168,18 +170,25 @@ impl ContextReport {
             }
         }
         if let Some(table) = table.take() {
+            // A second table of categories ending the text goes unread all the same.
             report.take(&table, &heading);
         }
         (!report.categories.is_empty()).then_some(report)
     }
 
-    /// Takes in one of the report's tables, read under `heading`.
-    fn take(&mut self, table: &Table, heading: &str) {
+    /// Takes in one of the report's tables, read under `heading`. False for a second table
+    /// of categories, which starts the report over: claude-agent-acp 0.94.0 lets
+    /// `/context`'s output through twice when the SDK's copies of it differ at all, so
+    /// the answer can hold the whole report twice.
+    fn take(&mut self, table: &Table, heading: &str) -> bool {
         let tokens_at = table
             .column("tokens")
             .unwrap_or(table.header.len().saturating_sub(1));
         let count = |row: &[String]| row.get(tokens_at).and_then(|cell| tokens(cell));
         if table.column("category") == Some(0) {
+            if !self.categories.is_empty() {
+                return false;
+            }
             for row in &table.rows {
                 let (Some(name), Some(tokens)) = (row.first(), count(row)) else {
                     continue;
@@ -202,7 +211,7 @@ impl ContextReport {
                     items: Vec::new(),
                 });
             }
-            return;
+            return true;
         }
         // The heading names the category the items make up.
         let Some(category) = [
@@ -218,7 +227,7 @@ impl ContextReport {
                 .iter_mut()
                 .find(|category| category.name.eq_ignore_ascii_case(name))
         }) else {
-            return;
+            return true;
         };
         let (server, path, kind) = (
             table.column("server"),
@@ -259,6 +268,7 @@ impl ContextReport {
             let name = format!("{server} · {tools}");
             category.items.push(Item { name, tokens });
         }
+        true
     }
 }
 
@@ -386,6 +396,13 @@ mod tests {
                 }
             ]
         );
+    }
+
+    #[test]
+    fn a_report_sent_twice_is_read_once() {
+        let once = ContextReport::parse(REPORT).unwrap();
+        let twice = ContextReport::parse(&format!("{REPORT}\n{REPORT}")).unwrap();
+        assert_eq!(twice, once);
     }
 
     #[test]
