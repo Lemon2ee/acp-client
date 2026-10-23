@@ -28,12 +28,16 @@ const FOLDER_CHECK_GAP: Pixels = px(8.);
 /// Above and below the line between the folders and the row that adds one.
 const SEPARATOR_GAP: Pixels = px(4.);
 
-/// The folders the menu lists: the recent ones, after the session's own when it isn't
-/// one of them, so the folder in use always shows with its check.
-fn folder_choices(recent: &[PathBuf], current: &Path) -> Vec<PathBuf> {
-    let mut folders = Vec::with_capacity(recent.len() + 1);
-    if !recent.iter().any(|folder| folder == current) {
-        folders.push(current.to_path_buf());
+/// The folders the menu lists: the recent ones, after the folder new sessions start in
+/// and the session's own where they aren't among them. A folder only becomes recent with
+/// a prompt sent in it, so the one new sessions start in would leave the list as soon as
+/// the session moved away from it.
+fn folder_choices(recent: &[PathBuf], start: &Path, current: &Path) -> Vec<PathBuf> {
+    let mut folders: Vec<PathBuf> = Vec::with_capacity(recent.len() + 2);
+    for folder in [start, current] {
+        if !recent.iter().chain(&folders).any(|listed| listed == folder) {
+            folders.push(folder.to_path_buf());
+        }
     }
     folders.extend_from_slice(recent);
     folders
@@ -195,7 +199,7 @@ impl ChatView {
     ) -> AnyElement {
         let view = cx.entity().downgrade();
         let nav = self.menu_nav.clone();
-        let folders = folder_choices(&self.recent_folders, current);
+        let folders = folder_choices(&self.recent_folders, &self.cwd, current);
         let current = current.to_path_buf();
         let trigger = FolderTrigger {
             button,
@@ -234,12 +238,22 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     #[test]
-    fn the_folder_in_use_is_always_listed_once() {
+    fn the_start_folder_and_the_one_in_use_are_always_listed_once() {
         let recent = ["/a", "/b"].map(PathBuf::from);
-        assert_eq!(folder_choices(&recent, Path::new("/b")), recent);
+        let (a, b, home) = (Path::new("/a"), Path::new("/b"), Path::new("/home"));
+        assert_eq!(folder_choices(&recent, a, b), recent);
         assert_eq!(
-            folder_choices(&recent, Path::new("/home")),
+            folder_choices(&recent, home, home),
             ["/home", "/a", "/b"].map(PathBuf::from)
+        );
+        // Moved from the start folder to a recent one, the start folder stays where it was.
+        assert_eq!(
+            folder_choices(&recent, home, b),
+            ["/home", "/a", "/b"].map(PathBuf::from)
+        );
+        assert_eq!(
+            folder_choices(&recent, home, Path::new("/c")),
+            ["/home", "/c", "/a", "/b"].map(PathBuf::from)
         );
     }
 }
